@@ -149,10 +149,15 @@
       }
 
       /* Settings tabs */
-      #settings-tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--glass-border); overflow-x: auto; }
+      #settings-tabs {
+        display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+        border-bottom: 1px solid var(--glass-border); overflow-x: auto;
+        min-height: 36px; /* ensure visible row height across browsers */
+      }
       #settings-tabs .tab {
-        padding: 6px 12px; border-radius: 8px; border: 1px solid transparent; background: transparent;
-        color: rgba(255,255,255,0.7); cursor: pointer; font-size: 12px; font-weight: 600;
+        appearance: none; -webkit-appearance: none; display: inline-block;
+        padding: 6px 12px; border-radius: 999px; border: 1px solid transparent; background: transparent;
+        color: rgba(255,255,255,0.85); cursor: pointer; font-size: 12px; font-weight: 700;
         transition: all 0.2s ease; white-space: nowrap;
       }
       #settings-tabs .tab:hover { background: rgba(255,255,255,0.1); color: #fff; }
