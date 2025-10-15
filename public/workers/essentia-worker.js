@@ -24,9 +24,42 @@ async function ensureModule() {
   STATE.loading = true;
   try {
     const module = await import('https://cdn.jsdelivr.net/npm/essentia.js@0.1.0/dist/essentia-wasm.web.js');
-    const factory = module.default || module;
-    STATE.module = await factory();
-    STATE.essentia = STATE.module;
+    // The Essentia ESM export shape can vary across versions/builds.
+    // Try common candidates: default export as factory, nested default, or named factories.
+    const candidates = [
+      module?.default,
+      module?.default?.default,
+      module?.EssentiaWASM,
+      module?.EssentiaModule,
+      module?.createEssentiaModule,
+      module,
+    ];
+
+    let instance = null;
+    for (const cand of candidates) {
+      if (typeof cand === 'function') {
+        try {
+          instance = await cand();
+          break;
+        } catch (_) {
+          // try next candidate
+        }
+      }
+    }
+    // Some builds may export a ready-made instance object
+    if (!instance && module && typeof module === 'object') {
+      const obj = module?.default && typeof module.default === 'object' ? module.default : module;
+      if (obj && Object.keys(obj).length) {
+        instance = obj;
+      }
+    }
+
+    if (!instance) {
+      throw new TypeError('Unsupported Essentia module export shape');
+    }
+
+    STATE.module = instance;
+    STATE.essentia = instance;
     STATE.ready = true;
     postReady();
   } catch (err) {

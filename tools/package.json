@@ -1,0 +1,16 @@
+{
+  "name": "reactive-osc-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebSocket → OSC bridge for TouchDesigner integration",
+  "license": "MIT",
+  "scripts": {
+    "start": "node osc-bridge.js"
+  },
+  "dependencies": {
+    "osc": "^2.4.3",
+    "ws": "^8.18.0"
+  }
+}
+
+

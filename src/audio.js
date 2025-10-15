@@ -14,7 +14,14 @@ async function getBeatDetectorGuess() {
   for (const url of candidates) {
     try {
       const mod = await import(/* @vite-ignore */ url);
-      const fn = mod?.guess || mod?.default?.guess;
+      // Support different export shapes across CDNs:
+      // 1) named export: { guess }
+      // 2) default export is the function itself
+      // 3) default export object with .guess
+      let fn = null;
+      if (typeof mod?.guess === 'function') fn = mod.guess;
+      else if (typeof mod?.default === 'function') fn = mod.default;
+      else if (mod?.default && typeof mod.default.guess === 'function') fn = mod.default.guess;
       if (typeof fn === 'function') {
         _guessBpmFn = fn;
         return _guessBpmFn;
@@ -44,12 +51,34 @@ export class AudioEngine {
     this.fluxHistory = [];
     this.fluxWindow = 43; // ~0.5s at 86 fps of analyser pulls (approx)
     this.sensitivity = 1.0; // beat threshold multiplier
-    this.smoothing = 0.6; // EMA smoothing for RMS/bands
-    this.bandSplit = { low: 200, mid: 2000 }; // Hz
-    this.beatCooldownMs = 250;
+    this.smoothing = 0.55; // EMA smoothing for RMS/bands (rave tuned)
+    this.bandSplit = { sub: 90, low: 180, mid: 2500 }; // Hz (rave tuned)
+    this.beatCooldownMs = 350;
     this._lastBeatMs = -99999;
 
     this.levels = { rms: 0, rmsEMA: 0, bands: { bass: 0, mid: 0, treble: 0 }, bandsEMA: { bass: 0, mid: 0, treble: 0 }, centroid: 0, centroidEMA: 0 };
+
+    // Per-band adaptive envelopes for punchy yet stable visual mapping
+    this.bandEnv = { sub: 0, bass: 0, mid: 0, treble: 0 };
+    this.bandPeak = { sub: 0.2, bass: 0.2, mid: 0.2, treble: 0.2 }; // rolling maxima for AGC
+    this.envAttack = 0.7;   // 0..1 per-frame attack (rise) speed
+    this.envRelease = 0.12; // 0..1 per-frame release (fall) speed
+    this.bandAGCDecay = 0.995; // decay factor for rolling maxima
+    this.bandAGCEnabled = true;
+
+    // Drop/build detection state
+    this.dropEnabled = false;
+    this.dropFluxThresh = 1.4; // z-flux threshold to consider build
+    this.dropBassThresh = 0.55; // bass env threshold near drop
+    this.dropCentroidSlopeThresh = 0.02; // negative slope magnitude
+    this.dropMinBeats = 4;
+    this.dropCooldownMs = 4000;
+    this._buildBeats = 0;
+    this._buildLevel = 0; // EMA of positive z-flux
+    this._centroidPrev = 0;
+    this._centroidSlopeEma = 0;
+    this._centroidSlopeAlpha = 0.6; // EMA factor
+    this._lastDropMs = -99999;
 
     this.timeDataFloat = null;
 
@@ -126,16 +155,13 @@ export class AudioEngine {
     this._lastQuantizeMs = 0;
     this._tapMultiplier = 1;
 
-    // Webcam (optional visual input)
-    this.webcam = {
-      stream: null,
-      video: null,
-      texture: null,
-      width: 0,
-      height: 0,
-      mirror: true,
-      ready: false,
-    };
+    // Rolling live-audio buffer (for BPM recalc on live sources)
+    this._liveBufferSec = 20; // keep ~20s of recent audio
+    this._liveBuffer = null; // Float32Array ring buffer (mono)
+    this._liveBufferWrite = 0;
+    this._liveBufferFilled = 0;
+
+    // Webcam feature removed
   }
 
   async ensureContext() {
@@ -153,6 +179,12 @@ export class AudioEngine {
         if (!window.__reactiveCtxs.includes(this.ctx)) window.__reactiveCtxs.push(this.ctx);
       } catch(_) {}
     }
+    // Try to resume context on user gestures; harmless if already running
+    try {
+      if (this.ctx && this.ctx.state !== 'running') {
+        await this.ctx.resume();
+      }
+    } catch(_) {}
     if (!this.gainNode) {
       this.gainNode = this.ctx.createGain();
       this.gainNode.gain.value = 1.0;
@@ -172,6 +204,8 @@ export class AudioEngine {
     }
 
     await this._maybeInitWorklet();
+    // Ensure live ring buffer exists once we know actual sampleRate
+    this._ensureLiveBuffer();
   }
 
   async getInputDevices() {
@@ -182,6 +216,10 @@ export class AudioEngine {
   async startMic(deviceId) {
     await this.ensureContext();
     this.stop();
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      this._showToast('Mic requires a secure origin (https or http://localhost).');
+      throw new Error('getUserMedia unavailable');
+    }
     const constraints = { audio: { deviceId: deviceId ? { exact: deviceId } : undefined, echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
     this._useStream(stream);
@@ -191,10 +229,68 @@ export class AudioEngine {
   async startSystemAudio() {
     await this.ensureContext();
     this.stop();
-    // Chrome: allow audio capture via display media
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 1 }, audio: true });
-    this._useStream(stream);
-    return stream;
+    const isMac = (() => {
+      try {
+        const ua = navigator.userAgent || '';
+        const plat = navigator.platform || '';
+        return /Mac/i.test(ua) || /Mac/i.test(plat);
+      } catch (_) { return false; }
+    })();
+    try {
+      const md = (typeof navigator !== 'undefined') ? navigator.mediaDevices : null;
+      const rawGetDisplay = (md && md.getDisplayMedia) || (typeof navigator !== 'undefined' ? navigator.getDisplayMedia : null);
+      // Debug info to aid environment diagnosis without breaking UX
+      try { console.info('DisplayMedia support:', { hasMediaDevices: !!md, hasGetDisplayMedia: !!(md && md.getDisplayMedia), hasLegacyGetDisplayMedia: !!(navigator && navigator.getDisplayMedia), protocol: location.protocol, host: location.hostname }); } catch(_) {}
+      if (!rawGetDisplay) {
+        const ua = (navigator.userAgent || '').toLowerCase();
+        const isChromium = ua.includes('chrome') || ua.includes('edg') || ua.includes('brave');
+        const hostOk = (location.protocol === 'https:') || (location.hostname === 'localhost') || (location.hostname === '127.0.0.1');
+        const hint = !isChromium ? 'Open in Chrome and try "Tab (Chrome)".' : (!hostOk ? 'Use https or http://localhost.' : '');
+        this._showToast(`System/Tab capture unavailable. ${hint}`.trim());
+        throw new Error('getDisplayMedia unavailable');
+      }
+      // Chrome tab/window/screen capture. On macOS, this usually only provides tab audio.
+      const stream = await (rawGetDisplay.call ? rawGetDisplay.call(md || navigator, { video: { frameRate: 1 }, audio: true }) : rawGetDisplay({ video: { frameRate: 1 }, audio: true }));
+      const hasAudio = !!(stream && typeof stream.getAudioTracks === 'function' && stream.getAudioTracks().length);
+      if (!hasAudio) {
+        try { for (const t of stream.getTracks()) t.stop(); } catch (_) {}
+        const msg = isMac
+          ? 'No audio captured. In Chrome, pick a "Chrome Tab" and enable "Share tab audio". For full Mac audio, use BlackHole and select it as Mic.'
+          : 'No audio captured. Choose a tab with audio and enable audio sharing.';
+        this._showToast(msg);
+        const err = new Error('No audio track captured from display media');
+        try { err.__reactiveNotified = true; } catch(_) {}
+        throw err;
+      }
+      this._useStream(stream);
+      return stream;
+    } catch (e) {
+      // Provide targeted guidance
+      try {
+        const name = e?.name || e?.code || '';
+        const msg = String(e?.message || '').toLowerCase();
+        let notified = false;
+        if (name === 'NotAllowedError' || name === 'SecurityError') {
+          if (isMac) {
+            this._showToast('Allow Screen Recording for Chrome: System Settings → Privacy & Security → Screen Recording.');
+          } else {
+            this._showToast('Capture permission denied. Allow screen + audio capture in your browser.');
+          }
+          notified = true;
+        } else if (name === 'NotFoundError') {
+          this._showToast('No capture sources available. Try selecting a specific tab with audio.');
+          notified = true;
+        } else if (name === 'OverconstrainedError') {
+          this._showToast('System audio unsupported with current constraints. Use Chrome tab audio or BlackHole.');
+          notified = true;
+        } else if (!name && msg.includes('audio') && msg.includes('not')) {
+          this._showToast('No audio track captured. Choose Chrome Tab and enable "Share tab audio".');
+          notified = true;
+        }
+        if (notified) { try { e.__reactiveNotified = true; } catch (_) {} }
+      } catch (_) {}
+      throw e;
+    }
   }
 
   async loadFile(file) {
@@ -232,59 +328,7 @@ export class AudioEngine {
     // Don't clear BPM immediately; allow UI to still show last known value
   }
 
-  // Webcam API (visual only; independent of audio graph)
-  async startWebcam(constraints = { video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'user' }, audio: false }) {
-    // Reuse stream if already running
-    if (this.webcam.stream) return this.webcam.texture;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      const video = document.createElement('video');
-      video.autoplay = true; video.playsInline = true; video.muted = true; video.style.display = 'none';
-      video.srcObject = stream;
-      await new Promise((res) => {
-        const onReady = () => { res(); };
-        video.addEventListener('loadedmetadata', onReady, { once: true });
-        video.addEventListener('loadeddata', onReady, { once: true });
-      });
-      document.body.appendChild(video);
-      const texture = new (await import('three')).VideoTexture(video);
-      texture.minFilter = (await import('three')).LinearFilter;
-      texture.magFilter = (await import('three')).LinearFilter;
-      texture.generateMipmaps = false;
-      this.webcam.stream = stream;
-      this.webcam.video = video;
-      this.webcam.texture = texture;
-      this.webcam.width = video.videoWidth || 320;
-      this.webcam.height = video.videoHeight || 240;
-      this.webcam.ready = true;
-      return texture;
-    } catch (e) {
-      console.warn('Webcam start failed', e);
-      throw e;
-    }
-  }
-
-  stopWebcam() {
-    if (this.webcam.video) {
-      try { this.webcam.video.pause(); } catch(_) {}
-      try { this.webcam.video.srcObject = null; } catch(_) {}
-      try { document.body.removeChild(this.webcam.video); } catch(_) {}
-      this.webcam.video = null;
-    }
-    if (this.webcam.stream) {
-      try { for (const t of this.webcam.stream.getTracks()) t.stop(); } catch(_) {}
-      this.webcam.stream = null;
-    }
-    if (this.webcam.texture) {
-      try { this.webcam.texture.dispose(); } catch(_) {}
-      this.webcam.texture = null;
-    }
-    this.webcam.ready = false;
-  }
-
-  getWebcamTexture() { return this.webcam.texture || null; }
-  isWebcamReady() { return !!this.webcam.ready; }
-  setWebcamMirror(v) { this.webcam.mirror = !!v; }
+  // Webcam feature removed: startWebcam/stopWebcam et al removed
 
   _useStream(stream) {
     if (this.activeStream) {
@@ -313,12 +357,47 @@ export class AudioEngine {
     this._meydaSmoothing = this._clamp(v, 0.1, 0.9);
   }
   setBandSplit(lowHz, midHz) { this.bandSplit.low = lowHz; this.bandSplit.mid = midHz; }
+  setSubHz(hz) { this.bandSplit.sub = Math.max(20, Math.min(200, hz)); }
   setBeatCooldown(ms) { this.beatCooldownMs = ms; }
+  setEnvAttack(v) { this.envAttack = this._clamp(v, 0.0, 1.0); }
+  setEnvRelease(v) { this.envRelease = this._clamp(v, 0.0, 1.0); }
+  setBandAgcEnabled(v) { this.bandAGCEnabled = !!v; }
+  setBandAgcDecay(v) { this.bandAGCDecay = this._clamp(v, 0.90, 0.9999); }
+  setDropEnabled(v) { this.dropEnabled = !!v; }
+  setDropFluxThresh(v) { this.dropFluxThresh = this._clamp(v, 0.2, 5); }
+  setDropBassThresh(v) { this.dropBassThresh = this._clamp(v, 0.1, 1.0); }
+  setDropCentroidSlopeThresh(v) { this.dropCentroidSlopeThresh = this._clamp(v, 0.005, 0.2); }
+  setDropMinBeats(v) { this.dropMinBeats = Math.max(1, Math.floor(v)); }
+  setDropCooldownMs(v) { this.dropCooldownMs = Math.max(500, Math.floor(v)); }
 
   // Tempo assist API
-  setTempoAssistEnabled(v) { this.tempoAssistEnabled = !!v; if (this.tempoAssistEnabled && this.bpmEstimate) { this._lastTempoMs = performance.now(); } }
+  setTempoAssistEnabled(v) {
+    this.tempoAssistEnabled = !!v;
+    const now = performance.now();
+    if (this.tempoAssistEnabled) {
+      if (this.bpmEstimate && this.bpmEstimate > 0) {
+        this.tempoIntervalMs = 60000 / this.bpmEstimate;
+        this._lastTempoMs = now;
+        this._lastQuantizeMs = now; // align grid phase when enabling
+      }
+    }
+  }
   getBpm() { return this.bpmEstimate || 0; }
-  async recalcBpm() { if (this._lastAudioBuffer) { await this._estimateBpmFromBuffer(this._lastAudioBuffer); } }
+  async recalcBpm() {
+    if (this._lastAudioBuffer) {
+      await this._estimateBpmFromBuffer(this._lastAudioBuffer);
+      // Also compute/refresh beat grid via Essentia to backfill BPM if guess failed
+      try { this._runEssentiaAnalysis(this._lastAudioBuffer); } catch(_) {}
+      return;
+    }
+    const live = this._buildLiveAudioBuffer(12);
+    if (live) {
+      await this._estimateBpmFromBuffer(live);
+      try { this._runEssentiaAnalysis(live); } catch(_) {}
+    } else {
+      try { this._showToast('Need a few seconds of live audio before recalculating BPM.'); } catch(_) {}
+    }
+  }
 
   // Tap tempo API
   tapBeat() {
@@ -364,7 +443,10 @@ export class AudioEngine {
   }
 
   nudgeQuantizePhase(deltaMs) {
-    if (!deltaMs || !this.tapQuantizeEnabled) return;
+    if (!deltaMs) return;
+    const gridActive = (this.tapQuantizeEnabled && this.tapTempoIntervalMs > 0)
+      || (this.tempoAssistEnabled && this.tempoIntervalMs > 0);
+    if (!gridActive) return;
     this._lastQuantizeMs += deltaMs;
   }
 
@@ -448,6 +530,8 @@ export class AudioEngine {
 
     if (frameArray) {
       this._enqueueAubioFrame(frameArray, frameId);
+      // Append to rolling live buffer for later BPM estimation
+      this._appendToLiveBuffer(frameArray);
     }
   }
 
@@ -470,15 +554,144 @@ export class AudioEngine {
     try {
       const guess = await getBeatDetectorGuess();
       const result = await guess(buffer);
-      const bpm = (typeof result?.bpm === 'number' && isFinite(result.bpm)) ? Math.round(result.bpm) : null;
+      // Support both number and { bpm } shapes from web-audio-beat-detector
+      let bpmVal = null;
+      if (typeof result === 'number' && isFinite(result)) {
+        bpmVal = result;
+      } else if (result && typeof result.bpm === 'number' && isFinite(result.bpm)) {
+        bpmVal = result.bpm;
+      }
+      const bpm = bpmVal ? Math.round(bpmVal) : null;
       if (bpm && bpm > 30 && bpm < 300) {
         this.bpmEstimate = bpm;
         this.tempoIntervalMs = 60000 / bpm;
         this._lastTempoMs = performance.now();
+        return bpm;
       }
     } catch (e) {
       // Estimation may fail for very short/quiet files; ignore
     }
+
+    // Fallback: run lightweight native estimator on the provided buffer
+    try {
+      const nativeBpm = this._estimateBpmNativeFromBuffer(buffer);
+      if (nativeBpm && nativeBpm > 30 && nativeBpm < 300) {
+        const bpm = Math.round(nativeBpm);
+        this.bpmEstimate = bpm;
+        this.tempoIntervalMs = 60000 / bpm;
+        this._lastTempoMs = performance.now();
+        return bpm;
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  // Minimal, dependency-free BPM estimator using energy-onset autocorrelation.
+  _estimateBpmNativeFromBuffer(buffer) {
+    if (!buffer) return 0;
+    const sr = buffer.sampleRate || this.sampleRate || 44100;
+    const hop = 512; // ~11.6ms @ 44.1k
+    const size = 1024;
+    const mono = this._extractMonoBuffer(buffer);
+    if (!mono || mono.length < size * 4) return 0;
+
+    // Build positive-onset envelope from log-energy differences
+    const frames = Math.floor((mono.length - size) / hop);
+    const onset = new Float32Array(frames);
+    let prev = 0;
+    for (let i = 0; i < frames; i++) {
+      const off = i * hop;
+      let e = 0;
+      for (let j = 0; j < size; j++) {
+        const v = mono[off + j]; e += v * v;
+      }
+      const loge = Math.log(1e-9 + e);
+      const d = loge - prev; prev = loge;
+      onset[i] = d > 0 ? d : 0;
+    }
+    // Normalize and remove DC
+    let mean = 0; for (let i = 0; i < onset.length; i++) mean += onset[i]; mean /= Math.max(1, onset.length);
+    for (let i = 0; i < onset.length; i++) onset[i] = Math.max(0, onset[i] - mean);
+    let maxv = 0; for (let i = 0; i < onset.length; i++) maxv = Math.max(maxv, onset[i]);
+    if (maxv > 0) { for (let i = 0; i < onset.length; i++) onset[i] /= maxv; }
+
+    const fps = sr / hop; // envelope frames per second
+    const minBpm = 60, maxBpm = 200;
+    const minLag = Math.max(1, Math.round(fps * 60 / maxBpm));
+    const maxLag = Math.min(onset.length - 1, Math.round(fps * 60 / minBpm));
+    if (maxLag <= minLag + 1) return 0;
+
+    // Autocorrelation in BPM search window
+    let bestLag = 0; let bestScore = 0;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      let acc = 0;
+      for (let i = lag; i < onset.length; i++) acc += onset[i] * onset[i - lag];
+      // Penalize likely double/half tempos by checking harmonic lags
+      const half = lag >> 1; const dbl = lag << 1;
+      if (half >= minLag) acc *= 1.0 - 0.1 * (onset[half] || 0);
+      if (dbl <= maxLag) acc *= 1.0 - 0.05 * (onset[dbl] || 0);
+      if (acc > bestScore) { bestScore = acc; bestLag = lag; }
+    }
+    if (bestLag <= 0) return 0;
+    let bpm = 60 * fps / bestLag;
+    // Snap to musically plausible octave (prefer 80..180)
+    while (bpm < 80) bpm *= 2;
+    while (bpm > 180) bpm *= 0.5;
+    return bpm;
+  }
+
+  _ensureLiveBuffer() {
+    const sr = this.sampleRate || 44100;
+    const desiredLength = Math.max(1, Math.floor(sr * this._liveBufferSec));
+    if (!this._liveBuffer || this._liveBuffer.length !== desiredLength) {
+      this._liveBuffer = new Float32Array(desiredLength);
+      this._liveBufferWrite = 0;
+      this._liveBufferFilled = 0;
+    }
+  }
+
+  _appendToLiveBuffer(samples) {
+    if (!samples || !samples.length) return;
+    this._ensureLiveBuffer();
+    const buf = this._liveBuffer;
+    const N = buf.length;
+    let w = this._liveBufferWrite;
+    for (let i = 0; i < samples.length; i++) {
+      buf[w++] = samples[i];
+      if (w >= N) w = 0;
+    }
+    this._liveBufferWrite = w;
+    this._liveBufferFilled = Math.min(N, this._liveBufferFilled + samples.length);
+  }
+
+  _buildLiveAudioBuffer(seconds = 12) {
+    if (!this.ctx || !this._liveBuffer || !this._liveBufferFilled) return null;
+    const sr = this.sampleRate || 44100;
+    const want = Math.max(0, Math.floor(seconds * sr));
+    const N = Math.min(want, this._liveBufferFilled);
+    if (N < sr * 4) { // need at least ~4s to get a stable guess
+      return null;
+    }
+    const out = new Float32Array(N);
+    const ring = this._liveBuffer;
+    const R = ring.length;
+    let start = this._liveBufferWrite - N;
+    while (start < 0) start += R;
+    const firstLen = Math.min(N, R - start);
+    out.set(ring.subarray(start, start + firstLen), 0);
+    const remaining = N - firstLen;
+    if (remaining > 0) {
+      out.set(ring.subarray(0, remaining), firstLen);
+    }
+    const audioBuf = this.ctx.createBuffer(1, N, sr);
+    try {
+      audioBuf.copyToChannel(out, 0, 0);
+    } catch (_) {
+      const ch0 = audioBuf.getChannelData(0);
+      ch0.set(out);
+    }
+    return audioBuf;
   }
 
   _ensureMeydaLoaded() {
@@ -673,10 +886,10 @@ export class AudioEngine {
       return;
     }
     if (data.type === 'error') {
+      // Keep console details for developers, but show a concise toast to users
       console.warn('Essentia worker error', data.error);
       try {
-        const msg = typeof data.error?.message === 'string' ? data.error.message : 'Beat grid unavailable (worker load failed)';
-        this._showToast(msg);
+        this._showToast('Beat grid unavailable (analysis module failed). Playback continues.');
       } catch(_) {}
       return;
     }
@@ -769,6 +982,14 @@ export class AudioEngine {
       updatedAt: performance.now(),
       duration: result.duration || 0,
     };
+
+    // Also propagate BPM estimate from analysis so UI updates even if guess() failed.
+    const bpm = typeof result.bpm === 'number' && isFinite(result.bpm) ? Math.round(result.bpm) : 0;
+    if (bpm > 30 && bpm < 300) {
+      this.bpmEstimate = bpm;
+      this.tempoIntervalMs = 60000 / bpm;
+      this._lastTempoMs = performance.now();
+    }
   }
 
   quantizeToGrid(timeSeconds, grid = this.beatGrid) {
@@ -864,6 +1085,11 @@ export class AudioEngine {
       this._enqueueAubioFrame(aubioCandidate, frameId);
     }
 
+    // If worklet is unavailable, still accumulate a best-effort live buffer
+    if (!this.workletEnabled && bufferForAnalysis) {
+      this._appendToLiveBuffer(bufferForAnalysis);
+    }
+
     if (!result) return this.meydaFeatures;
 
     const mfccRaw = Array.isArray(result.mfcc) ? result.mfcc.slice(0, 13) : [];
@@ -926,15 +1152,40 @@ export class AudioEngine {
   _computeBands(freqData) {
     // freqData 0..255, linear bins up to Nyquist
     const sr = this.sampleRate; const binHz = sr / 2 / freqData.length; // freq per bin
-    let bass = 0, mid = 0, treble = 0; let bC = 0, mC = 0, tC = 0;
+    let sub = 0, bass = 0, mid = 0, treble = 0; let sC = 0, bC = 0, mC = 0, tC = 0;
+    const subHz = Math.max(20, Math.min(this.bandSplit.sub || 90, (this.bandSplit.low || 180) - 5));
     for (let i = 0; i < freqData.length; i++) {
       const f = i * binHz; const v = freqData[i] / 255;
-      if (f < this.bandSplit.low) { bass += v; bC++; }
+      if (f < subHz) { sub += v; sC++; }
+      else if (f < this.bandSplit.low) { bass += v; bC++; }
       else if (f < this.bandSplit.mid) { mid += v; mC++; }
       else { treble += v; tC++; }
     }
-    bass = bC ? bass / bC : 0; mid = mC ? mid / mC : 0; treble = tC ? treble / tC : 0;
-    return { bass, mid, treble };
+    sub = sC ? sub / sC : 0; bass = bC ? bass / bC : 0; mid = mC ? mid / mC : 0; treble = tC ? treble / tC : 0;
+
+    // Adaptive gain control (rolling peak) for rave music dynamics
+    if (this.bandAGCEnabled) {
+      this.bandPeak.sub = Math.max(this.bandPeak.sub * this.bandAGCDecay, sub);
+      this.bandPeak.bass = Math.max(this.bandPeak.bass * this.bandAGCDecay, bass);
+      this.bandPeak.mid = Math.max(this.bandPeak.mid * this.bandAGCDecay, mid);
+      this.bandPeak.treble = Math.max(this.bandPeak.treble * this.bandAGCDecay, treble);
+    }
+
+    // Normalize by current peaks to get 0..1 responsiveness across tracks
+    const ns = this.bandAGCEnabled && this.bandPeak.sub > 1e-6 ? this._clamp(sub / this.bandPeak.sub, 0, 1) : this._clamp(sub, 0, 1);
+    const nb = this.bandAGCEnabled && this.bandPeak.bass > 1e-6 ? this._clamp(bass / this.bandPeak.bass, 0, 1) : this._clamp(bass, 0, 1);
+    const nm = this.bandAGCEnabled && this.bandPeak.mid > 1e-6 ? this._clamp(mid / this.bandPeak.mid, 0, 1) : this._clamp(mid, 0, 1);
+    const nt = this.bandAGCEnabled && this.bandPeak.treble > 1e-6 ? this._clamp(treble / this.bandPeak.treble, 0, 1) : this._clamp(treble, 0, 1);
+
+    // Attack/Release envelope for each band to keep motion musical
+    const attack = this.envAttack; const release = this.envRelease;
+    const stepEnv = (env, val) => (val > env) ? (env + (val - env) * attack) : (env + (val - env) * release);
+    this.bandEnv.sub = stepEnv(this.bandEnv.sub, ns);
+    this.bandEnv.bass = stepEnv(this.bandEnv.bass, nb);
+    this.bandEnv.mid = stepEnv(this.bandEnv.mid, nm);
+    this.bandEnv.treble = stepEnv(this.bandEnv.treble, nt);
+
+    return { sub, bass, mid, treble, norm: { sub: ns, bass: nb, mid: nm, treble: nt }, env: { ...this.bandEnv } };
   }
 
   _computeCentroid(freqData) {
@@ -1041,17 +1292,57 @@ export class AudioEngine {
 
     const meyda = this._maybeRunMeyda(now);
 
+    // Build/Drop detection (beat-aware)
+    let drop = false;
+    let isBuilding = false;
+    let buildLevel = this._buildLevel;
+    let centroidSlope = this._centroidSlopeEma;
+    if (this.dropEnabled) {
+      const z = this._workletFeatures && this._workletFeatures.fluxStd > 0
+        ? (flux - this._workletFeatures.fluxMean) / Math.max(1e-3, this._workletFeatures.fluxStd)
+        : 0;
+      const posZ = Math.max(0, z);
+      buildLevel = buildLevel * 0.8 + posZ * 0.2;
+      const cDelta = centroid.norm - (this._centroidPrev || centroid.norm);
+      this._centroidPrev = centroid.norm;
+      centroidSlope = centroidSlope * (1 - this._centroidSlopeAlpha) + cDelta * this._centroidSlopeAlpha;
+
+      if (beat || quantBeat) {
+        if (posZ > this.dropFluxThresh) {
+          this._buildBeats += 1; isBuilding = true;
+        } else {
+          this._buildBeats = Math.max(0, this._buildBeats - 1);
+          isBuilding = this._buildBeats > 0;
+        }
+
+        const nowMs = performance.now();
+        const canDrop = (nowMs - this._lastDropMs) > this.dropCooldownMs;
+        if (canDrop && this._buildBeats >= this.dropMinBeats) {
+          if (centroidSlope < -this.dropCentroidSlopeThresh && (bands.env?.bass ?? 0) > this.dropBassThresh) {
+            drop = true; this._lastDropMs = nowMs; this._buildBeats = 0; isBuilding = false;
+          }
+        }
+      }
+      this._buildLevel = buildLevel; this._centroidSlopeEma = centroidSlope;
+    }
+
     return {
       rms: rms,
       rmsNorm: Math.min(1, rms * 2.0),
       bands,
       bandsEMA: this.levels.bandsEMA,
+      bandEnv: bands.env,
+      bandNorm: bands.norm,
       centroidHz: centroid.hz,
       centroidNorm: centroid.norm,
       flux,
       fluxMean: this.workletEnabled ? this._workletFeatures.fluxMean : flux,
       fluxStd: this.workletEnabled ? this._workletFeatures.fluxStd : 0,
       beat,
+      drop,
+      isBuilding,
+      buildLevel,
+      lastDropMs: this._lastDropMs,
       bpm: this.bpmEstimate || 0,
       tapBpm: this.tapBpm || 0,
       mfcc: meyda.mfcc,

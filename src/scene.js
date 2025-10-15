@@ -1,10 +1,14 @@
 import * as THREE from 'three';
 import CameraControls from 'camera-controls';
-import { EffectComposer, RenderPass, EffectPass, BloomEffect } from 'postprocessing';
+import { EffectComposer, RenderPass, EffectPass, BloomEffect, ChromaticAberrationEffect } from 'postprocessing';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
-import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
+import { createEyeLayer, createCornea, updateEyeUniforms } from './eye.js';
+import { createDispersionLayer } from './dispersion.js';
 
 CameraControls.install({ THREE });
+
+// Hard-disable the experimental eye feature (remove center overlay completely)
+const EYE_FEATURE_ENABLED = false;
 
 export const themes = {
   nebula: {
@@ -32,7 +36,7 @@ export const themes = {
 
 const pointMaterialShader = {
   vertexShader: `
-    attribute float size; attribute vec3 randomDir; attribute vec3 morphPosition; varying vec3 vColor; varying float vDistance; varying float vMouseEffect; varying vec2 vUv; uniform float time; uniform vec2 uMouse; uniform float uExplode; uniform float uReactiveScale; uniform float uMorph; uniform float uVideoDepth;
+    attribute float size; attribute vec3 randomDir; varying vec3 vColor; varying float vDistance; varying float vMouseEffect; uniform float time; uniform vec2 uMouse; uniform float uExplode; uniform float uReactiveScale;
     vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
     vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
     vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
@@ -50,16 +54,12 @@ const pointMaterialShader = {
       vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0); m = m * m; return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
     }
     void main() {
-      vColor = color; vUv = uv;
-      // Explosion wobble on base sphere position (kept subtle so morph grid stays coherent)
+      vColor = color;
+      // Explosion wobble on base sphere position
       float explodeAmount = uExplode * 35.0;
       float turbulence = snoise(position * 0.4 + randomDir * 2.0 + time * 0.8) * 10.0 * uExplode;
       vec3 explodedPos = position + randomDir * (explodeAmount + turbulence);
-      vec3 basePos = mix(position, explodedPos, uExplode);
-
-      // Morph between sphere and precomputed grid (morphPosition)
-      vec3 morphPos = morphPosition;
-      vec3 morphed = mix(basePos, morphPos, clamp(uMorph, 0.0, 1.0));
+      vec3 morphed = mix(position, explodedPos, uExplode);
 
       // Organic noise displacement (reduced as we morph into the grid so image stays readable)
       vec4 projectedVertex = projectionMatrix * modelViewMatrix * vec4(morphed, 1.0);
@@ -69,8 +69,6 @@ const pointMaterialShader = {
       vMouseEffect = mouseEffect;
       float noiseFrequency = 0.4;
       float noiseAmplitude = (0.8 + mouseEffect * 3.5) * (1.0 - uExplode);
-      // Reduce noise as morph increases so the webcam image remains stable
-      noiseAmplitude *= (1.0 - 0.7 * clamp(uMorph, 0.0, 1.0));
       noiseAmplitude *= (1.0 + uReactiveScale);
       vec3 noiseInput = morphed * noiseFrequency + time * 0.5;
       vec3 displacement = vec3(
@@ -78,8 +76,7 @@ const pointMaterialShader = {
         snoise(noiseInput + vec3(10.0)),
         snoise(noiseInput + vec3(20.0))
       );
-      // Optional extra depth offset knob for grid state (kept small for readability)
-      vec3 finalPos = morphed + displacement * noiseAmplitude + vec3(0.0, 0.0, uVideoDepth * clamp(uMorph, 0.0, 1.0));
+      vec3 finalPos = morphed + displacement * noiseAmplitude;
       float pulse = sin(time + length(position)) * 0.1 + 1.0;
       vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
       vDistance = -mvPosition.z;
@@ -88,25 +85,38 @@ const pointMaterialShader = {
     }
   `,
   fragmentShader: `
-    varying vec3 vColor; varying float vMouseEffect; varying vec2 vUv; uniform float time; uniform float uExplode; uniform float uReactiveBright; uniform sampler2D uVideo; uniform float uVideoEnabled; uniform float uMorph; uniform float uMirror;
+    varying vec3 vColor; varying float vMouseEffect; uniform float time; uniform float uExplode; uniform float uReactiveBright;
     float rand(vec2 co){ return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453); }
     void main() {
       vec2 cxy = 2.0 * gl_PointCoord - 1.0; float r = dot(cxy, cxy); if (r > 1.0) discard;
       float glow = exp(-r * 3.5) + vMouseEffect * 0.5; float twinkle = rand(gl_PointCoord + time) * 0.5 + 0.5;
       vec3 explosionColor = vec3(2.0, 3.0, 3.5);
       vec3 baseCol = mix(vColor, explosionColor, uExplode * 0.8) * (1.0 + uExplode * 6.0);
-      // Sample webcam when enabled and morphed; mirror if requested
-      vec3 camCol = baseCol;
-      if (uVideoEnabled > 0.5 && uMorph > 0.0) {
-        vec2 tuv = vUv; if (uMirror > 0.5) { tuv.x = 1.0 - tuv.x; }
-        camCol = texture2D(uVideo, tuv).rgb;
-      }
-      vec3 mixedColor = mix(baseCol, camCol, clamp(uMorph, 0.0, 1.0));
-      vec3 finalColor = mixedColor * (1.1 + sin(time * 0.8) * 0.2 + vMouseEffect * 0.5) * glow * twinkle; finalColor *= (1.0 + uReactiveBright);
+      vec3 finalColor = baseCol * (1.1 + sin(time * 0.8) * 0.2 + vMouseEffect * 0.5) * glow * twinkle; finalColor *= (1.0 + uReactiveBright);
       gl_FragColor = vec4(finalColor, smoothstep(0.0, 1.0, glow));
     }
   `,
 };
+
+function createGlowTexture(size = 256) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  const half = size / 2;
+  const gradient = ctx.createRadialGradient(half, half, 0, half, half, half);
+  gradient.addColorStop(0.0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.2, 'rgba(255,220,255,0.85)');
+  gradient.addColorStop(0.45, 'rgba(255,120,255,0.35)');
+  gradient.addColorStop(1.0, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearMipMapLinearFilter;
+  texture.encoding = THREE.sRGBEncoding;
+  return texture;
+}
 
 const starShader = {
   vertexShader: `
@@ -134,12 +144,6 @@ function createPointShaderMaterial(mouse) {
       uExplode: { value: 0.0 },
       uReactiveScale: { value: 0.0 },
       uReactiveBright: { value: 0.0 },
-      // Morph/webcam defaults
-      uMorph: { value: 0.0 },
-      uVideo: { value: null },
-      uVideoEnabled: { value: 0.0 },
-      uVideoDepth: { value: 0.0 },
-      uMirror: { value: 1.0 },
     },
     vertexShader: pointMaterialShader.vertexShader,
     fragmentShader: pointMaterialShader.fragmentShader,
@@ -150,8 +154,6 @@ function createPointShaderMaterial(mouse) {
 function createSpiralSphere(radius, particleCount, mouse) {
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(particleCount * 3);
-  const morphPositions = new Float32Array(particleCount * 3);
-  const uvs = new Float32Array(particleCount * 2);
   const colors = new Float32Array(particleCount * 3);
   const sizes = new Float32Array(particleCount);
   const randomDirs = new Float32Array(particleCount * 3).fill(0);
@@ -161,29 +163,15 @@ function createSpiralSphere(radius, particleCount, mouse) {
     positions[i3 + 1] = radius * Math.sin(theta) * Math.sin(phi);
     positions[i3 + 2] = radius * Math.cos(phi);
     sizes[i] = Math.random() * 0.2 + 0.1;
-    // Initialize morph target and uv placeholder; will be set when webcam grid is built
-    morphPositions[i3] = positions[i3];
-    morphPositions[i3 + 1] = positions[i3 + 1];
-    morphPositions[i3 + 2] = positions[i3 + 2];
-    const i2 = i * 2;
-    uvs[i2] = 0.0; uvs[i2 + 1] = 0.0;
     // Seed visible colors (white) until theme applies
     colors[i3] = 0.9; colors[i3 + 1] = 0.9; colors[i3 + 2] = 0.9;
   }
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('morphPosition', new THREE.BufferAttribute(morphPositions, 3));
-  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
   geometry.setAttribute('randomDir', new THREE.BufferAttribute(randomDirs, 3));
   const material = createPointShaderMaterial(mouse);
   material.uniforms.uExplode.value = 0;
-  // New morph/video uniforms
-  material.uniforms.uMorph = { value: 0.0 };
-  material.uniforms.uVideo = { value: null };
-  material.uniforms.uVideoEnabled = { value: 0.0 };
-  material.uniforms.uVideoDepth = { value: 0.0 };
-  material.uniforms.uMirror = { value: 1.0 };
   return new THREE.Points(geometry, material);
 }
 
@@ -192,8 +180,6 @@ function createOrbitRings(radius, count, thickness, particleCount, mouse) {
   for (let i = 0; i < count; i++) {
     const ringGeometry = new THREE.BufferGeometry();
     const positions = new Float32Array(particleCount * 3);
-    const morphPositions = new Float32Array(particleCount * 3);
-    const uvs = new Float32Array(particleCount * 2);
     const colors = new Float32Array(particleCount * 3);
     const sizes = new Float32Array(particleCount);
     const randomDirs = new Float32Array(particleCount * 3);
@@ -203,15 +189,8 @@ function createOrbitRings(radius, count, thickness, particleCount, mouse) {
       positions[j3] = Math.cos(angle) * radiusVariation; positions[j3 + 1] = (Math.random() - 0.5) * (thickness * 0.5); positions[j3 + 2] = Math.sin(angle) * radiusVariation;
       sizes[j] = Math.random() * 0.15 + 0.08; randomVec.set(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
       randomDirs[j3] = randomVec.x; randomDirs[j3 + 1] = randomVec.y; randomDirs[j3 + 2] = randomVec.z;
-      // Dummy morph target and uv (not used visually on rings, but required by shader)
-      morphPositions[j3] = positions[j3];
-      morphPositions[j3 + 1] = positions[j3 + 1];
-      morphPositions[j3 + 2] = positions[j3 + 2];
-      const j2 = j * 2; uvs[j2] = 0.0; uvs[j2 + 1] = 0.0;
     }
     ringGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    ringGeometry.setAttribute('morphPosition', new THREE.BufferAttribute(morphPositions, 3));
-    ringGeometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
     ringGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     ringGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
     ringGeometry.setAttribute('randomDir', new THREE.BufferAttribute(randomDirs, 3));
@@ -259,6 +238,62 @@ function createSparks(count) {
 }
 
 function easeInOutCubic(x) { return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }
+function easeOutExpo(x) { return x >= 1 ? 1 : 1 - Math.pow(2, -10 * x); }
+
+function createShockwave() {
+  const geometry = new THREE.PlaneGeometry(1, 1, 1, 1);
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      uProgress: { value: 0 },
+      uOpacity: { value: 0 },
+      uTime: { value: 0 },
+      uIntensity: { value: 1 },
+      uColorInner: { value: new THREE.Color(0xffffff) },
+      uColorOuter: { value: new THREE.Color(0x6fffff) },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uProgress;
+      uniform float uOpacity;
+      uniform float uTime;
+      uniform float uIntensity;
+      uniform vec3 uColorInner;
+      uniform vec3 uColorOuter;
+      void main() {
+        vec2 p = (vUv - 0.5) * 2.0;
+        float dist = length(p);
+        float clampedProgress = clamp(uProgress, 0.0, 1.0);
+        float radius = mix(0.18, 0.95, clampedProgress);
+        float thickness = mix(0.22, 0.06, clampedProgress);
+        float band = abs(dist - radius);
+        float ring = 1.0 - smoothstep(0.0, thickness, band);
+        float fade = 1.0 - smoothstep(0.9, 1.45, dist);
+        float glow = smoothstep(0.0, 0.45, clampedProgress);
+        float wave = 0.7 + 0.3 * sin(uTime * 5.5 + dist * 18.0);
+        vec3 col = mix(uColorInner, uColorOuter, clamp((dist - radius) * 2.5 + 0.5, 0.0, 1.0));
+        float alpha = ring * fade * glow * uOpacity * wave * clamp(uIntensity, 0.0, 2.5);
+        if (alpha <= 0.001) discard;
+        gl_FragColor = vec4(col * (0.8 + 0.4 * uIntensity), alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 4;
+  return { mesh, material };
+}
 
 export function initScene() {
   const state = {
@@ -266,73 +301,178 @@ export function initScene() {
     camera: new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 50000),
     renderer: new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' }),
     composer: null,
+    renderPass: null,
+    effectPass: null,
     controls: null,
     clock: new THREE.Clock(),
     mouse: new THREE.Vector2(-10, -10),
     coreSphere: null,
+    outerSphere: null,
     orbitRings: null,
     starfield: null,
     centralLight: null,
-    lensflare: null,
+    centralGlow: null,
     bloomEffect: null,
+    chromaticEffect: null,
+    chromaticIntensity: 0,
     currentHdrTexture: null,
     isExplosionActive: false,
     explosionStartTime: 0,
     explosionDuration: 2000,
     mainGroup: new THREE.Group(),
+    shockwave: { mesh: null, material: null, active: false, startTime: 0, duration: 1.2, intensity: 1, progress: 0, opacity: 0 },
+    dispersion: { layer: null, zoom: 0, offsetX: 0, offsetY: 0, opacity: 0.3, twist: 0, twistDir: 1, stutterTimes: [], travel: 0 },
+    metrics: {
+      coreScale: 1,
+      outerScale: 1,
+      coreNoise: 0,
+      coreBrightness: 0,
+      bloomIntensity: 1.2,
+      chromaticEnabled: 0,
+      chromaticOffset: 0,
+      chromaticOffsetY: 0,
+      starTwinkle: 0,
+      starTilt: 0,
+      ringScale: 1,
+      ringSpeed: 0,
+      ringNoise: 0,
+      ringBrightness: 0,
+      cameraFov: 75,
+      cameraRoll: 0,
+      centroidDelta: 0,
+      fluxZ: 0,
+      groupSway: 0,
+      chromaHue: 0,
+      chromaEnergy: 0,
+      chromaIndex: 0,
+      eyePupil: 0,
+      eyeBlink: 0,
+      eyeCatAspect: 0,
+      lightHue: 0,
+      lightMix: 0,
+      shockwaveActive: 0,
+      shockwaveProgress: 0,
+      shockwaveOpacity: 0,
+      shockwaveIntensity: 0,
+      sparksActive: 1,
+      sparksAlive: 0,
+    },
+    _centroidEma: Number.NaN,
+    _cameraRoll: 0,
+    _fluxSway: 0,
     params: {
       theme: 'nebula',
       autoRotate: 0.0005,
       useHdrBackground: false,
       useLensflare: true,
       bloomStrengthBase: 1.2,
-      bloomReactiveGain: 0.6,
+      bloomReactiveGain: 0.8,
       fogDensity: 0.008,
       performanceMode: false,
       pixelRatioCap: Math.min(2, window.devicePixelRatio || 1),
       particleDensity: 0.9, // 0.9 = slightly reduced for better perf on mid-range GPUs
       enableSparks: true,
+      // Outer shell around the core sphere
+      outerShell: { enabled: true, densityScale: 0.6, radius: 6.2 },
       // Auto resolution
       autoResolution: true,
       targetFps: 60,
       minPixelRatio: 0.6,
       // Reactivity
       map: {
-        sizeFromRms: 0.35,
-        ringScaleFromBands: 0.25,
-        ringSpeedFromBands: 1.0,
+        sizeFromRms: 0.5,
+        ringScaleFromBands: 0.45,
+        ringSpeedFromBands: 1.8,
         colorBoostFromCentroid: 0.4,
         cameraShakeFromBeat: 0.2,
-        sphereBrightnessFromRms: 1.2,
-        sphereNoiseFromMid: 0.8,
-        ringNoiseFromBands: 0.3,
-        lightIntensityFromBass: 1.5,
+        sphereBrightnessFromRms: 1.6,
+        sphereNoiseFromMid: 1.2,
+        ringNoiseFromBands: 0.45,
+        lightIntensityFromBass: 2.4,
         // new band sensitivities
-        bandWeightBass: 1.0,
-        bandWeightMid: 1.0,
-        bandWeightTreble: 1.0,
+        bandWeightBass: 1.4,
+        bandWeightMid: 1.15,
+        bandWeightTreble: 1.2,
         starTwinkleFromTreble: 0.8,
-        ringTiltFromBass: 0.3,
+      ringTiltFromBass: 0.65,
+        // new: sphere bass punch and treble sparkle
+        spherePulseFromBass: 0.95,
+        sphereSparkleFromTreble: 0.8,
+        // FOV pump strength
+        fovPumpFromBass: 0.6,
+        cameraRollFromCentroid: 0.18,
+        mainSwayFromFlux: 0.12,
+        chromaLightInfluence: 0.22,
+        ringBrightFromChroma: 0.3,
+        // Advanced mapping toggle
+        advancedMapping: false,
+        // Per-target band weights (used when advancedMapping = true)
+        sizeWeights: { bass: 1.0, mid: 0.4, treble: 0.2 },
+        ringScaleWeights: { bass: 0.8, mid: 0.6, treble: 0.2 },
+        ringSpeedWeights: { bass: 0.6, mid: 0.9, treble: 0.3 },
+        sphereNoiseWeights: { bass: 0.2, mid: 1.0, treble: 0.4 },
+        ringNoiseWeights: { bass: 0.4, mid: 0.6, treble: 0.3 },
+        // Drop visuals
+        drop: { intensity: 1.0, bloomBoost: 0.6, shake: 0.5, ringBurst: 0.6 },
+        // Chromatic aberration response
+        chromatic: { base: 0.00025, treble: 0.0009, beat: 0.0012, drop: 0.0024, lerp: 0.14 },
+        // Shockwave pulse
+        shockwave: { enabled: true, beatIntensity: 0.55, dropIntensity: 1.2, durationMs: 1200 },
+        eye: {
+          enabled: false,
+          pupilBase: 0.22,
+          pupilRange: 0.45,
+          pupilAttack: 0.18,
+          pupilRelease: 0.35,
+          catAspectMax: 0.65,
+          hueMixFromChroma: 0.65,
+          saturationFromCentroid: 0.5,
+          fiberContrast: 1.2,
+          fiberNoiseScale: 3.0,
+          limbusDarkness: 0.55,
+          blinkOnDrop: true,
+          blinkDurationMs: 150,
+          randomBlinkMinSec: 12,
+          randomBlinkMaxSec: 28,
+          corneaEnabled: false,
+          corneaFresnel: 1.25,
+          corneaTintMix: 0.25,
+          corneaOpacity: 0.65,
+          glintSize: 0.035,
+        glintIntensity: 1.2,
+        predatorMode: false,
       },
-      // Morph controls
-      morph: {
-        onBeat: true,
-        durationMs: 650,
-        holdMs: 120,
-        amount: 1.0,
-        autoStartWebcam: true,
-        useManual: false,
-        manual: 0.0,
       },
+      // Morph/Webcam removed
       explosion: { onBeat: true, cooldownMs: 500 },
       _lastBeatTime: -9999,
+      // Overlay features
+      enableDispersion: true,
+      // Visual mode: 'classic' | 'overlay' | 'shader-only'
+      visualMode: 'overlay',
     },
-    // Morph state
-    morphActive: false,
-    morphStartMs: 0,
-    _morphPeak: 0,
-    webcamTexture: null,
-    webcamReady: false,
+    eye: {
+      mesh: null,
+      cornea: null,
+      baseScale: 5.4,
+      pupilRadius: 0.22,
+      blink: 0,
+      blinkDuration: 0.15,
+      blinkElapsed: 0,
+      catAspect: 0,
+      catDropTimer: 0,
+      lastBlinkAt: 0,
+      nextBlinkAt: 0,
+      predatorMode: false,
+      baseHue: 0.6,
+      hue: 0.6,
+      saturation: 0.65,
+      irisGain: 1.0,
+      glint: new THREE.Vector2(0.25, -0.18),
+      qualityDropActive: false,
+      dropBlinkCooldown: 0,
+    },
+    // Morph/Webcam removed state
   };
 
   state.scene.fog = new THREE.FogExp2(0x000000, state.params.fogDensity);
@@ -348,125 +488,272 @@ export function initScene() {
   state.controls.setLookAt(0, 5, 14, 0, 0, 0);
 
   const renderPass = new RenderPass(state.scene, state.camera);
+  state.renderPass = renderPass;
   state.bloomEffect = new BloomEffect({ intensity: state.params.bloomStrengthBase });
-  const effectPass = new EffectPass(state.camera, state.bloomEffect);
+  state.chromaticEffect = new ChromaticAberrationEffect({ offset: new THREE.Vector2(0, 0), radialModulation: false, modulationOffset: 0.0 });
+  state.chromaticIntensity = 0;
+  state.metrics.chromaticEnabled = state.chromaticEffect ? 1 : 0;
+  const effectPass = new EffectPass(state.camera, state.bloomEffect, state.chromaticEffect);
+  state.effectPass = effectPass;
+  state.metrics.bloomIntensity = state.bloomEffect.intensity;
   // Force 8-bit framebuffer to avoid glCopyTexSubImage2D format issues on some GPUs
   state.composer = new EffectComposer(state.renderer, { frameBufferType: THREE.UnsignedByteType });
-  state.composer.addPass(renderPass); state.composer.addPass(effectPass);
+  state.composer.addPass(renderPass);
+  state.composer.addPass(effectPass);
+
+  // Dispersion overlay layer (full-screen quad), composited after effects
+  function setupVisualMode(mode) {
+    // Remove any existing dispersion pass if present
+    if (state.dispersion?.layer) {
+      try { state.dispersion.layer.pass.enabled = false; } catch(_) {}
+    }
+    // Defaults
+    state.renderPass.enabled = true;
+    state.effectPass.enabled = true;
+    try { state.effectPass.renderToScreen = false; } catch(_) {}
+
+    if (mode === 'classic') {
+      // Only the existing 3D visuals
+      if (state.dispersion?.layer) state.dispersion.layer.setEnabled(false);
+      try { state.effectPass.renderToScreen = true; } catch(_) {}
+    } else if (mode === 'overlay') {
+      // 3D + shader overlay on top
+      ensureDispersion();
+      state.dispersion.layer.setEnabled(state.params.enableDispersion !== false);
+      state.dispersion.layer.pass.renderToScreen = true;
+      state.effectPass.renderToScreen = false;
+    } else if (mode === 'shader-only') {
+      // Hide 3D render, only draw the dispersion shader to screen
+      ensureDispersion();
+      state.renderPass.enabled = false;
+      state.effectPass.enabled = false;
+      state.dispersion.layer.setEnabled(true);
+      state.dispersion.layer.pass.renderToScreen = true;
+    }
+  }
+
+  function ensureDispersion() {
+    if (state.dispersion?.layer) return state.dispersion.layer;
+    try {
+      state.dispersion.layer = createDispersionLayer();
+      state.dispersion.layer.setSize(window.innerWidth, window.innerHeight);
+      state.composer.addPass(state.dispersion.layer.pass);
+    } catch (e) {
+      console.warn('Dispersion overlay unavailable:', e);
+      state.dispersion.layer = null;
+      state.params.enableDispersion = false;
+    }
+    return state.dispersion.layer;
+  }
+
+  setupVisualMode(state.params.visualMode || 'overlay');
 
   // Particles
   const sphereCount = Math.floor(40000 * state.params.particleDensity);
   const ringCountPer = Math.floor(4000 * state.params.particleDensity);
   const starCount = Math.floor(10000 * state.params.particleDensity);
 
+  // Decide if we should enable the outer shell layer (perf guard)
+  function shouldEnableOuterShell() {
+    if (!state.params.outerShell?.enabled) return false;
+    if (state.params.performanceMode) return false;
+    try { return state.renderer.getPixelRatio() >= (state.params.minPixelRatio + 0.05); } catch(_) { return true; }
+  }
+
+  function scheduleNextBlink(nowMs) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const cfg = state.params.map.eye;
+    const minSec = Math.max(0, cfg.randomBlinkMinSec ?? 12);
+    const maxSec = Math.max(minSec + 0.5, cfg.randomBlinkMaxSec ?? 28);
+    const minMs = minSec * 1000;
+    const spanMs = Math.max(0, (maxSec - minSec) * 1000);
+    state.eye.nextBlinkAt = nowMs + minMs + Math.random() * spanMs;
+  }
+
+  function triggerEyeBlink(durationMs) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const cfg = state.params.map.eye;
+    const durMs = Math.max(45, durationMs ?? cfg.blinkDurationMs ?? 150);
+    state.eye.blink = 1;
+    state.eye.blinkElapsed = 0;
+    state.eye.blinkDuration = durMs / 1000;
+    const now = performance.now();
+    state.eye.lastBlinkAt = now;
+    scheduleNextBlink(now);
+  }
+
+  function setEyeEnabled(enabled) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const cfg = state.params.map.eye;
+    cfg.enabled = !!enabled;
+    if (state.eye.mesh) state.eye.mesh.visible = !!enabled;
+    if (state.eye.cornea) {
+      const corneaEnabled = cfg.corneaEnabled !== false && enabled;
+      state.eye.cornea.visible = corneaEnabled;
+    }
+    if (enabled) {
+      scheduleNextBlink(performance.now());
+    } else {
+      state.eye.blink = 0;
+      state.eye.nextBlinkAt = 0;
+    }
+  }
+
+  function setEyeCorneaEnabled(enabled) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const cfg = state.params.map.eye;
+    cfg.corneaEnabled = !!enabled;
+    if (enabled) {
+      if (!state.eye.cornea) {
+        try {
+          state.eye.cornea = createCornea(5.06);
+          state.eye.cornea.visible = cfg.enabled !== false;
+          state.scene.add(state.eye.cornea);
+        } catch (e) {
+          console.error('Failed to create cornea layer on enable', e);
+          state.eye.cornea = null;
+        }
+      } else {
+        state.eye.cornea.visible = cfg.enabled !== false;
+      }
+    } else if (state.eye.cornea) {
+      try {
+        state.scene.remove(state.eye.cornea);
+        state.eye.cornea.geometry.dispose();
+        state.eye.cornea.material.dispose();
+      } catch (_) {}
+      state.eye.cornea = null;
+    }
+  }
+
+  function setEyePredatorMode(enabled) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const next = !!enabled;
+    state.params.map.eye.predatorMode = next;
+    state.eye.predatorMode = next;
+    return next;
+  }
+
+  function toggleEyePredatorMode() {
+    return setEyePredatorMode(!state.eye.predatorMode);
+  }
+
   state.coreSphere = createSpiralSphere(5, sphereCount, state.mouse);
+  if (shouldEnableOuterShell()) {
+    const outerCount = Math.max(1000, Math.floor(sphereCount * (state.params.outerShell.densityScale || 0.6)));
+    state.outerSphere = createSpiralSphere(state.params.outerShell.radius || 6.2, outerCount, state.mouse);
+    try { state.outerSphere.renderOrder = 1; } catch(_) {}
+  }
   state.orbitRings = createOrbitRings(7.5, 8, 0.6, ringCountPer, state.mouse);
   state.starfield = createStarfield(starCount, 50000);
   state.sparks = state.params.enableSparks ? createSparks(Math.floor(8000 * state.params.particleDensity)) : null;
-  state.mainGroup.add(state.coreSphere); state.mainGroup.add(state.orbitRings);
+  const shockwaveLayer = createShockwave();
+  state.shockwave.mesh = shockwaveLayer.mesh;
+  state.shockwave.material = shockwaveLayer.material;
+  state.shockwave.mesh.visible = false;
+  state.mainGroup.add(state.coreSphere); if (state.outerSphere) state.mainGroup.add(state.outerSphere); state.mainGroup.add(state.orbitRings);
   state.scene.add(state.mainGroup); state.scene.add(state.starfield); if (state.sparks) state.scene.add(state.sparks);
+  state.scene.add(state.shockwave.mesh);
+  state.metrics.sparksActive = state.sparks ? 1 : 0;
 
-  // Build initial webcam grid morph target when webcam is ready (lazy)
-  async function ensureWebcamTexture() {
-    if (state.webcamTexture) return state.webcamTexture;
+  if (EYE_FEATURE_ENABLED) {
+    if (!state.params.map.eye) state.params.map.eye = {};
+    const eyeParams = state.params.map.eye;
+    state.eye.predatorMode = !!eyeParams.predatorMode;
     try {
-      // AudioEngine is constructed in main.js and passed into UI; we access via window for simplicity
-      const ae = window.__audioEngineRef;
-      if (!ae) return null;
-      const tex = await ae.startWebcam({ video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'user' }, audio: false });
-      state.webcamTexture = tex; state.webcamReady = true;
-      // Assign to material uniforms
-      state.coreSphere.material.uniforms.uVideo.value = tex;
-      state.coreSphere.material.uniforms.uVideoEnabled.value = 1.0;
-      // Build grid morph target and uvs to match video aspect
-      buildMorphGridForSphere();
-      try { ae.webcam?.video?.play?.(); } catch(_) {}
-      return tex;
-    } catch (_) {
-      state.webcamReady = false;
-      return null;
+      state.eye.mesh = createEyeLayer();
+      state.eye.mesh.scale.setScalar(state.eye.baseScale);
+      state.eye.mesh.visible = eyeParams.enabled !== false;
+      state.eye.mesh.position.set(0, 0.12, 0);
+      state.mainGroup.add(state.eye.mesh);
+      scheduleNextBlink(performance.now());
+    } catch (e) {
+      console.error('Failed to create eye layer', e);
+      state.eye.mesh = null;
     }
-  }
-
-  function buildMorphGridForSphere() {
-    if (!state.coreSphere || !state.webcamTexture) return;
-    const g = state.coreSphere.geometry;
-    const N = g.attributes.position.count;
-    const morph = g.attributes.morphPosition.array;
-    const uvs = g.attributes.uv.array;
-    // Determine grid dimensions close to square but matching N
-    let cols = Math.ceil(Math.sqrt(N));
-    let rows = Math.ceil(N / cols);
-    // Adjust to video aspect ratio to minimize stretching
-    const vw = state.webcamTexture.image?.videoWidth || 320;
-    const vh = state.webcamTexture.image?.videoHeight || 240;
-    const aspect = vw / Math.max(1, vh);
-    // Try to fit cols/rows to aspect
-    cols = Math.max(1, Math.round(Math.sqrt(N * aspect)));
-    rows = Math.max(1, Math.ceil(N / cols));
-
-    // Grid size in world units roughly equal to current sphere diameter
-    const span = 10.0; // ~2*radius
-    const dx = span / Math.max(1, cols - 1);
-    const dy = span / Math.max(1, rows - 1);
-    let idx = 0;
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        if (idx >= N) break;
-        const x = -span / 2 + c * dx;
-        const y = span / 2 - r * dy;
-        const i3 = idx * 3;
-        morph[i3] = x; morph[i3 + 1] = y; morph[i3 + 2] = 0;
-        const i2 = idx * 2;
-        const u = cols > 1 ? c / (cols - 1) : 0.0;
-        const v = rows > 1 ? r / (rows - 1) : 0.0;
-        uvs[i2] = u; uvs[i2 + 1] = v;
-        idx++;
+    if (eyeParams.corneaEnabled !== false) {
+      try {
+        state.eye.cornea = createCornea(5.06);
+        state.eye.cornea.visible = eyeParams.enabled !== false;
+        state.scene.add(state.eye.cornea);
+      } catch (e) {
+        console.error('Failed to create cornea layer', e);
+        state.eye.cornea = null;
       }
     }
-    g.attributes.morphPosition.needsUpdate = true;
-    g.attributes.uv.needsUpdate = true;
   }
 
-  // Lights + optional lensflare
+  // Webcam/morph feature removed
+
+  // Lights + optional central glow sprite
   state.centralLight = new THREE.PointLight(0xffffff, 2, 0);
   state.centralLight.position.set(0, 0, 0); state.scene.add(state.centralLight);
   function setupLensflare() {
-    if (state.lensflare) return;
-    const textureLoader = new THREE.TextureLoader();
-    let failed = false;
-    const onErr = () => {
-      failed = true;
-      console.warn('Lensflare textures failed to load; disabling lensflare');
+    if (state.centralGlow) return;
+    const texture = createGlowTexture(256);
+    if (!texture) {
+      console.warn('Failed to create core glow texture; disabling glow layer');
       state.params.useLensflare = false;
+      return;
+    }
+    try {
+      const maxAniso = state.renderer?.capabilities?.getMaxAnisotropy?.();
+      if (maxAniso && Number.isFinite(maxAniso)) {
+        texture.anisotropy = Math.min(8, maxAniso);
+      }
+    } catch (_) {}
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      color: state.centralLight.color.clone(),
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
+      opacity: 0.6,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.setScalar(14);
+    sprite.renderOrder = 5;
+    sprite.position.set(0, 0, 0);
+    sprite.userData.dispose = () => {
+      try { texture.dispose(); } catch (_) {}
+      try { material.dispose(); } catch (_) {}
     };
-    const textureFlare0 = textureLoader.load(
-      'https://threejs.org/examples/textures/lensflare/lensflare0.png',
-      undefined, undefined, onErr
-    );
-    const textureFlare3 = textureLoader.load(
-      'https://threejs.org/examples/textures/lensflare/lensflare3.png',
-      undefined, undefined, onErr
-    );
-    // Check if loading failed synchronously (unlikely but possible)
-    if (failed) return;
-    state.lensflare = new Lensflare();
-    state.lensflare.addElement(new LensflareElement(textureFlare0, 500, 0, state.centralLight.color));
-    state.lensflare.addElement(new LensflareElement(textureFlare3, 60, 0.6));
-    state.lensflare.addElement(new LensflareElement(textureFlare3, 70, 0.7));
-    state.lensflare.addElement(new LensflareElement(textureFlare3, 120, 0.9));
-    state.lensflare.addElement(new LensflareElement(textureFlare3, 70, 1));
-    state.centralLight.add(state.lensflare);
+    state.centralGlow = sprite;
+    state.centralLight.add(sprite);
   }
   function teardownLensflare() {
-    if (!state.lensflare) return;
-    try { state.centralLight.remove(state.lensflare); } catch(_) {}
-    try { state.lensflare.dispose?.(); } catch(_) {}
-    state.lensflare = null;
+    if (!state.centralGlow) return;
+    try { state.centralLight.remove(state.centralGlow); } catch(_) {}
+    try { state.centralGlow.userData.dispose?.(); } catch(_) {}
+    state.centralGlow = null;
   }
   if (state.params.useLensflare) setupLensflare();
 
   function applyThemeColors(theme) {
+    if (Array.isArray(theme?.sphere) && theme.sphere.length) {
+      let sumX = 0;
+      let sumY = 0;
+      let hueCount = 0;
+      let satSum = 0;
+      theme.sphere.forEach((color) => {
+        if (!color) return;
+        const hsl = { h: 0, s: 0, l: 0 };
+        color.getHSL(hsl);
+        const angle = hsl.h * Math.PI * 2;
+        sumX += Math.cos(angle);
+        sumY += Math.sin(angle);
+        satSum += hsl.s;
+        hueCount++;
+      });
+      if (hueCount > 0) {
+        let avgHue = Math.atan2(sumY / hueCount, sumX / hueCount) / (2 * Math.PI);
+        if (avgHue < 0) avgHue += 1;
+        state.eye.baseHue = avgHue;
+        state.eye.hue = avgHue;
+      }
+    }
+
     const sphereColorsAttr = state.coreSphere.geometry.attributes.color;
     for (let i = 0; i < sphereColorsAttr.count; i++) {
       const colorPos = (i / sphereColorsAttr.count) * (theme.sphere.length - 1);
@@ -476,6 +763,18 @@ export function initScene() {
       sphereColorsAttr.setXYZ(i, newColor.r, newColor.g, newColor.b);
     }
     sphereColorsAttr.needsUpdate = true;
+    if (state.outerSphere) {
+      const outerAttr = state.outerSphere.geometry.attributes.color;
+      for (let i = 0; i < outerAttr.count; i++) {
+        const colorPos = (i / outerAttr.count) * (theme.sphere.length - 1);
+        const c1 = theme.sphere[Math.floor(colorPos)];
+        const c2 = theme.sphere[Math.min(Math.floor(colorPos) + 1, theme.sphere.length - 1)];
+        const base = new THREE.Color().copy(c1).lerp(c2, colorPos - Math.floor(colorPos));
+        const halo = new THREE.Color().copy(base).lerp(new THREE.Color(0xffffff), 0.25);
+        outerAttr.setXYZ(i, halo.r, halo.g, halo.b);
+      }
+      outerAttr.needsUpdate = true;
+    }
     state.orbitRings.children.forEach((ring, i) => {
       const ringColorsAttr = ring.geometry.attributes.color;
       for (let j = 0; j < ringColorsAttr.count; j++) {
@@ -528,6 +827,27 @@ export function initScene() {
     const btn = document.getElementById('explode-btn'); if (btn) btn.classList.add('active');
   }
 
+  function triggerShockwave(intensity = 1, overrideDurationMs) {
+    if (!state.shockwave?.mesh) return;
+    const cfg = state.params.map.shockwave || {};
+    if (cfg.enabled === false) return;
+    state.shockwave.active = true;
+    state.shockwave.intensity = Math.max(0.2, intensity);
+    const durationMs = overrideDurationMs ?? cfg.durationMs ?? 1200;
+    state.shockwave.duration = Math.max(0.25, durationMs / 1000);
+    state.shockwave.startTime = state.clock.getElapsedTime();
+    state.shockwave.mesh.visible = true;
+    state.metrics.shockwaveActive = 1;
+    state.metrics.shockwaveIntensity = state.shockwave.intensity;
+    state.metrics.shockwaveProgress = 0;
+    state.metrics.shockwaveOpacity = 1;
+    if (state.shockwave.material?.uniforms) {
+      state.shockwave.material.uniforms.uOpacity.value = 1.0;
+      state.shockwave.material.uniforms.uProgress.value = 0.0;
+      state.shockwave.material.uniforms.uIntensity.value = state.shockwave.intensity;
+    }
+  }
+
   function updateExplosion(elapsedTime) {
     if (!state.isExplosionActive) return;
     const explosionTime = (elapsedTime - state.explosionStartTime) * 1000; const progress = Math.min(explosionTime / state.explosionDuration, 1.0);
@@ -540,8 +860,9 @@ export function initScene() {
 
   function rebuildParticles() {
     // Remove current
-    state.mainGroup.remove(state.coreSphere); state.mainGroup.remove(state.orbitRings); state.scene.remove(state.starfield); if (state.sparks) state.scene.remove(state.sparks);
+    state.mainGroup.remove(state.coreSphere); if (state.outerSphere) state.mainGroup.remove(state.outerSphere); state.mainGroup.remove(state.orbitRings); state.scene.remove(state.starfield); if (state.sparks) state.scene.remove(state.sparks);
     state.coreSphere.geometry.dispose(); state.coreSphere.material.dispose();
+    if (state.outerSphere) { try { state.outerSphere.geometry.dispose(); state.outerSphere.material.dispose(); } catch(_) {} }
     state.orbitRings.children.forEach(r => { r.geometry.dispose(); r.material.dispose(); });
     state.starfield.geometry.dispose(); state.starfield.material.dispose(); if (state.sparks) { state.sparks.geometry.dispose(); state.sparks.material.dispose(); }
 
@@ -550,6 +871,13 @@ export function initScene() {
     const starCount = Math.floor(10000 * state.params.particleDensity);
 
     state.coreSphere = createSpiralSphere(5, sphereCount, state.mouse);
+    if (shouldEnableOuterShell()) {
+      const outerCount = Math.max(1000, Math.floor(sphereCount * (state.params.outerShell.densityScale || 0.6)));
+      state.outerSphere = createSpiralSphere(state.params.outerShell.radius || 6.2, outerCount, state.mouse);
+      try { state.outerSphere.renderOrder = 1; } catch(_) {}
+    } else {
+      state.outerSphere = null;
+    }
     // Re-wire video uniforms if webcam already running
     if (state.webcamTexture && state.coreSphere?.material?.uniforms) {
       state.coreSphere.material.uniforms.uVideo.value = state.webcamTexture;
@@ -563,7 +891,7 @@ export function initScene() {
     state.starfield = createStarfield(starCount, 50000);
     state.sparks = state.params.enableSparks ? createSparks(Math.floor(8000 * state.params.particleDensity)) : null;
 
-    state.mainGroup.add(state.coreSphere); state.mainGroup.add(state.orbitRings); state.scene.add(state.starfield); if (state.sparks) state.scene.add(state.sparks);
+    state.mainGroup.add(state.coreSphere); if (state.outerSphere) state.mainGroup.add(state.outerSphere); state.mainGroup.add(state.orbitRings); state.scene.add(state.starfield); if (state.sparks) state.scene.add(state.sparks);
     // Reapply theme colors
     applyThemeColors(themes[state.params.theme]);
   }
@@ -577,9 +905,12 @@ export function initScene() {
         try { state.sparks.geometry.dispose(); state.sparks.material.dispose(); } catch(_) {}
       }
       state.sparks = null;
+      state.metrics.sparksActive = 0;
+      state.metrics.sparksAlive = 0;
     } else {
       state.sparks = createSparks(Math.floor(8000 * state.params.particleDensity));
       state.scene.add(state.sparks);
+      state.metrics.sparksActive = 1;
     }
   }
 
@@ -592,6 +923,11 @@ export function initScene() {
   function onResize() {
     state.camera.aspect = window.innerWidth / window.innerHeight; state.camera.updateProjectionMatrix();
     state.renderer.setSize(window.innerWidth, window.innerHeight); state.composer.setSize(window.innerWidth, window.innerHeight);
+    if (state.dispersion?.layer) {
+      try { state.dispersion.layer.setSize(window.innerWidth, window.innerHeight); } catch(_) {}
+    }
+    // Re-apply mode to keep renderToScreen wiring intact after pass list changes
+    try { setupVisualMode(state.params.visualMode || 'overlay'); } catch(_) {}
   }
 
   function onMouseMove(event) {
@@ -606,9 +942,12 @@ export function initScene() {
     const nowPerf = performance.now();
     const dt = (nowPerf - _lastUpdateNow) / 1000;
     _lastUpdateNow = nowPerf;
+    const rms = features?.rmsNorm ?? 0.0;
+    const isBeat = !!(features && features.beat);
+    const isDrop = !!(features && features.drop);
 
     // Explosion on beat
-    if (features && features.beat) {
+    if (isBeat) {
       const nowMs = performance.now();
       if (state.params.explosion.onBeat && nowMs - state.params._lastBeatTime > state.params.explosion.cooldownMs) {
         state.params._lastBeatTime = nowMs; triggerExplosion();
@@ -617,64 +956,281 @@ export function initScene() {
 
     updateExplosion(t);
 
-    // Start webcam lazily if morph-on-beat is enabled and autoStartWebcam true
-    if (state.params.morph.autoStartWebcam && state.params.morph.onBeat && !state.webcamTexture) {
-      ensureWebcamTexture();
-    }
-
-    // Handle morph timeline (on beat → hold → release)
-    if (features && features.beat && state.params.morph.onBeat && state.webcamReady) {
-      state.morphActive = true; state.morphStartMs = performance.now(); state._morphPeak = state.params.morph.amount;
-    }
-    let morphValue = 0.0;
-    if (state.params.morph.useManual) {
-      morphValue = Math.max(0.0, Math.min(1.0, state.params.morph.manual));
-    } else {
-    if (state.morphActive) {
-      const elapsed = performance.now() - state.morphStartMs;
-      const d = state.params.morph.durationMs;
-      const hold = state.params.morph.holdMs;
-      if (elapsed <= d) {
-        // Ease-in to peak
-        const p = elapsed / d; morphValue = easeInOutCubic(Math.min(1, p)) * state._morphPeak;
-      } else if (elapsed <= d + hold) {
-        morphValue = state._morphPeak;
-      } else if (elapsed <= d * 2 + hold) {
-        // Ease out back to 0 over same duration
-        const p = (elapsed - d - hold) / d; morphValue = (1.0 - easeInOutCubic(Math.min(1, p))) * state._morphPeak;
+    if (state.shockwave?.material?.uniforms) {
+      const sw = state.shockwave;
+      const cfg = state.params.map.shockwave || {};
+      if (cfg.enabled === false) {
+        sw.active = false;
+        sw.mesh.visible = false;
+        sw.progress = 0;
+        sw.opacity = 0;
+        state.metrics.shockwaveActive = 0;
+        state.metrics.shockwaveProgress = 0;
+        state.metrics.shockwaveOpacity = 0;
+        state.metrics.shockwaveIntensity = 0;
       } else {
-        state.morphActive = false; morphValue = 0.0;
+        if (sw.active) {
+          const elapsed = t - sw.startTime;
+          const progress = THREE.MathUtils.clamp(elapsed / sw.duration, 0, 1);
+          const eased = easeOutExpo(progress);
+          sw.material.uniforms.uTime.value = t;
+          sw.material.uniforms.uProgress.value = eased;
+          sw.material.uniforms.uIntensity.value = sw.intensity;
+          const opacity = Math.max(0, 1 - progress) * 0.85 * sw.intensity;
+          sw.material.uniforms.uOpacity.value = opacity;
+          sw.mesh.scale.setScalar(5 + eased * 38);
+          sw.mesh.position.set(0, 0.2 + rms * 1.1, 0);
+          sw.progress = progress;
+          sw.opacity = opacity;
+          state.metrics.shockwaveActive = 1;
+          state.metrics.shockwaveProgress = progress;
+          state.metrics.shockwaveOpacity = opacity;
+          state.metrics.shockwaveIntensity = sw.intensity;
+          if (progress >= 1) {
+            sw.active = false;
+            sw.mesh.visible = false;
+            state.metrics.shockwaveActive = 0;
+            state.metrics.shockwaveIntensity = 0;
+          }
+        } else {
+          sw.progress = 0;
+          sw.opacity = 0;
+          state.metrics.shockwaveActive = 0;
+          state.metrics.shockwaveProgress = 0;
+          state.metrics.shockwaveOpacity = 0;
+          state.metrics.shockwaveIntensity = 0;
+        }
       }
     }
-    }
 
-    // Uniforms/time
-    state.coreSphere.material.uniforms.time.value = t; state.coreSphere.material.uniforms.uMouse.value.copy(state.mouse);
-    if (state.coreSphere.material.uniforms.uMorph) state.coreSphere.material.uniforms.uMorph.value = morphValue;
-    if (state.coreSphere.material.uniforms.uVideoEnabled) state.coreSphere.material.uniforms.uVideoEnabled.value = state.webcamReady ? 1.0 : 0.0;
-    if (state.coreSphere.material.uniforms.uMirror) {
-      try { state.coreSphere.material.uniforms.uMirror.value = window.__audioEngineRef?.webcam?.mirror ? 1.0 : 0.0; } catch(_) {}
+    // Uniforms/time (guarded)
+    if (state.coreSphere?.material?.uniforms) {
+      state.coreSphere.material.uniforms.time.value = t; state.coreSphere.material.uniforms.uMouse.value.copy(state.mouse);
     }
-    state.orbitRings.children.forEach(r => { r.material.uniforms.time.value = t; r.material.uniforms.uMouse.value.copy(state.mouse); });
-    state.starfield.material.uniforms.time.value = t;
+    if (state.outerSphere?.material?.uniforms) { state.outerSphere.material.uniforms.time.value = t; state.outerSphere.material.uniforms.uMouse.value.copy(state.mouse); }
+    if (state.orbitRings?.children) { state.orbitRings.children.forEach(r => { if (r.material?.uniforms) { r.material.uniforms.time.value = t; r.material.uniforms.uMouse.value.copy(state.mouse); } }); }
+    if (state.starfield?.material?.uniforms) { state.starfield.material.uniforms.time.value = t; }
 
     // Reactivity mappings
-    const rms = features?.rmsNorm ?? 0.0; const bass = features?.bands?.bass ?? 0.0; const mid = features?.bands?.mid ?? 0.0; const treble = features?.bands?.treble ?? 0.0; const centroid = features?.centroidNorm ?? 0.0;
+    const sub = features?.bandEnv?.sub ?? features?.bands?.sub ?? 0.0;
+    const bass = features?.bandEnv?.bass ?? features?.bands?.bass ?? 0.0;
+    const mid = features?.bandEnv?.mid ?? features?.bands?.mid ?? 0.0;
+    const treble = features?.bandEnv?.treble ?? features?.bands?.treble ?? 0.0;
+    const centroid = features?.centroidNorm ?? 0.0;
+    const shockCfg = state.params.map.shockwave || {};
+    const chromaCfg = state.params.map.chromatic || {};
+    const chromaArray = Array.isArray(features?.chroma) ? features.chroma : null;
+    const chromaLength = chromaArray?.length ?? 0;
 
-    const breathe = 1 + rms * state.params.map.sizeFromRms; state.coreSphere.scale.set(breathe, breathe, breathe);
+    let dominantChromaIndex = state.metrics.chromaIndex || 0;
+    let dominantChromaEnergy = state.metrics.chromaEnergy || 0;
+    let chromaHue = state.metrics.chromaHue || (dominantChromaIndex / Math.max(1, chromaLength || 12));
+    if (chromaArray && chromaLength) {
+      let maxVal = -Infinity;
+      for (let i = 0; i < chromaLength; i++) {
+        const val = chromaArray[i] ?? 0;
+        if (val > maxVal) {
+          maxVal = val;
+          dominantChromaIndex = i;
+          dominantChromaEnergy = Math.max(0, val);
+        }
+      }
+      if (maxVal <= 0) {
+        dominantChromaEnergy = 0;
+      }
+      chromaHue = dominantChromaIndex / chromaLength;
+    } else {
+      dominantChromaEnergy = 0;
+    }
+    dominantChromaEnergy = Math.min(1, dominantChromaEnergy);
+    state.metrics.chromaIndex = dominantChromaIndex;
+    state.metrics.chromaEnergy = dominantChromaEnergy;
+    state.metrics.chromaHue = chromaHue;
+
+    if (state.eye.mesh) {
+      const eyeCfg = state.params.map.eye || {};
+      const eyeEnabled = eyeCfg.enabled !== false;
+      if (state.eye.mesh.visible !== eyeEnabled) state.eye.mesh.visible = eyeEnabled;
+      if (state.eye.cornea) {
+        const corneaVisible = eyeEnabled && eyeCfg.corneaEnabled !== false;
+        if (state.eye.cornea.visible !== corneaVisible) state.eye.cornea.visible = corneaVisible;
+      }
+      if (eyeEnabled) {
+        if (typeof eyeCfg.predatorMode === 'boolean' && eyeCfg.predatorMode !== state.eye.predatorMode) {
+          state.eye.predatorMode = eyeCfg.predatorMode;
+        }
+        if (state.eye.dropBlinkCooldown > 0) state.eye.dropBlinkCooldown = Math.max(0, state.eye.dropBlinkCooldown - dt);
+        if (!Number.isFinite(state.eye.nextBlinkAt) || state.eye.nextBlinkAt <= 0) scheduleNextBlink(nowPerf);
+        if (eyeCfg.randomBlinkMaxSec > 0 && nowPerf >= state.eye.nextBlinkAt) triggerEyeBlink();
+        if (eyeCfg.blinkOnDrop && isDrop && state.eye.dropBlinkCooldown <= 0) {
+          triggerEyeBlink();
+          state.eye.dropBlinkCooldown = 1.2;
+        }
+
+        const pupilBase = THREE.MathUtils.clamp(eyeCfg.pupilBase ?? 0.22, 0.02, 0.9);
+        const pupilRange = Math.max(0, eyeCfg.pupilRange ?? 0.45);
+        const pupilMod = THREE.MathUtils.clamp(0.65 * bass - 0.25 * treble + 0.2 * rms, 0, 1);
+        const pupilTarget = THREE.MathUtils.clamp(pupilBase + pupilRange * pupilMod, 0.08, 0.95);
+        const attack = Math.max(0.01, eyeCfg.pupilAttack ?? 0.18);
+        const release = Math.max(0.01, eyeCfg.pupilRelease ?? 0.35);
+        const lerpRate = dt / (pupilTarget > state.eye.pupilRadius ? attack : release);
+        const pupilLerp = THREE.MathUtils.clamp(lerpRate, 0, 1);
+        state.eye.pupilRadius = THREE.MathUtils.lerp(state.eye.pupilRadius, pupilTarget, pupilLerp);
+
+        if (state.eye.catDropTimer > 0) state.eye.catDropTimer = Math.max(0, state.eye.catDropTimer - dt);
+        const catMax = THREE.MathUtils.clamp(eyeCfg.catAspectMax ?? 0.65, 0, 1);
+        if (isDrop && catMax > 0) state.eye.catDropTimer = Math.max(state.eye.catDropTimer, 1.5);
+        let catTarget = state.eye.predatorMode ? catMax : 0;
+        if (state.eye.catDropTimer > 0) catTarget = Math.max(catTarget, catMax * 0.7);
+        state.eye.catAspect = THREE.MathUtils.lerp(state.eye.catAspect, catTarget, Math.min(1, dt * 3));
+
+        if (state.eye.blink > 0) {
+          const blinkDur = Math.max(0.05, state.eye.blinkDuration || 0.15);
+          state.eye.blink = Math.max(0, state.eye.blink - (dt / blinkDur));
+        }
+
+        const hueMixWeight = Math.min(1, dominantChromaEnergy * (eyeCfg.hueMixFromChroma ?? 0.65));
+        state.eye.hue = THREE.MathUtils.lerp(state.eye.baseHue ?? chromaHue, chromaHue, hueMixWeight);
+        const saturationGain = THREE.MathUtils.clamp(0.52 + (eyeCfg.saturationFromCentroid ?? 0.5) * centroid, 0, 1);
+        state.eye.saturation = saturationGain;
+        state.eye.irisGain = 0.9 + rms * 0.7;
+
+        const glintX = 0.2 + 0.08 * Math.sin(t * 0.7);
+        const glintY = -0.18 + 0.06 * Math.cos(t * 0.45);
+        state.eye.glint.set(glintX, glintY);
+
+        const perfDrop = state.params.performanceMode;
+        const fiberContrast = perfDrop ? Math.max(0.6, (eyeCfg.fiberContrast ?? 1.2) * 0.75) : (eyeCfg.fiberContrast ?? 1.2);
+        const fiberNoiseScale = perfDrop ? Math.max(1.2, (eyeCfg.fiberNoiseScale ?? 3.0) * 0.7) : (eyeCfg.fiberNoiseScale ?? 3.0);
+        const limbus = eyeCfg.limbusDarkness ?? 0.55;
+        const alpha = perfDrop ? 0.85 : 1.0;
+
+        updateEyeUniforms(state.eye.mesh, {
+          time: t,
+          pupilRadius: state.eye.pupilRadius,
+          pupilAspect: state.eye.catAspect,
+          blink: state.eye.blink,
+          hue: state.eye.hue,
+          saturation: state.eye.saturation,
+          irisGain: state.eye.irisGain,
+          fiberContrast,
+          fiberNoiseScale,
+          limbus,
+          glintPos: state.eye.glint,
+          glintSize: eyeCfg.glintSize ?? 0.035,
+          glintIntensity: eyeCfg.glintIntensity ?? 1.2,
+          alpha,
+        });
+
+        const scaleFactor = state.eye.baseScale * (state.metrics.coreScale || 1);
+        state.eye.mesh.scale.setScalar(scaleFactor);
+        try { state.eye.mesh.quaternion.copy(state.camera.quaternion); } catch (_) {}
+
+        state.metrics.eyePupil = state.eye.pupilRadius;
+        state.metrics.eyeBlink = state.eye.blink;
+        state.metrics.eyeCatAspect = state.eye.catAspect;
+      }
+    }
+    if (state.eye.cornea && state.eye.cornea.visible) {
+      const eyeCfg = state.params.map.eye || {};
+      const scaleFactor = state.metrics.coreScale || 1;
+      state.eye.cornea.scale.setScalar(scaleFactor);
+      state.eye.cornea.rotation.y += dt * 0.12;
+      state.eye.cornea.rotation.x += dt * 0.06;
+      const uniforms = state.eye.cornea.userData?.uniforms || state.eye.cornea.material.uniforms;
+      if (uniforms) {
+        uniforms.uTime.value = t;
+        uniforms.uFresnel.value = eyeCfg.corneaFresnel ?? 1.25;
+        const lightColor = state.centralLight?.color || new THREE.Color(0xffffff);
+        const tintMix = THREE.MathUtils.clamp(eyeCfg.corneaTintMix ?? 0.25, 0, 1);
+        const tint = new THREE.Color(0xffffff).lerp(lightColor, tintMix);
+        uniforms.uTint.value.copy(tint);
+        const opacityBase = eyeCfg.corneaOpacity ?? 0.65;
+        const opacity = Math.min(1, opacityBase + (isDrop ? 0.15 : 0));
+        uniforms.uOpacity.value = opacity;
+      }
+    }
+
+    if (!Number.isFinite(state._centroidEma)) state._centroidEma = centroid;
+    const centroidDelta = centroid - state._centroidEma;
+    state._centroidEma = THREE.MathUtils.lerp(state._centroidEma, centroid, 0.18);
+    state.metrics.centroidDelta = centroidDelta;
+    const rollStrength = state.params.map.cameraRollFromCentroid ?? 0;
+    const rollTarget = THREE.MathUtils.clamp(centroidDelta * rollStrength, -0.45, 0.45);
+    state._cameraRoll = THREE.MathUtils.lerp(state._cameraRoll ?? 0, rollTarget, 0.12);
+
+    const flux = features?.flux ?? 0;
+    const fluxMean = features?.fluxMean ?? flux;
+    const fluxStd = features?.fluxStd ?? 0;
+    let fluxZ = 0;
+    if (fluxStd > 1e-5) {
+      fluxZ = (flux - fluxMean) / fluxStd;
+    }
+    fluxZ = THREE.MathUtils.clamp(fluxZ, -6, 6);
+    state.metrics.fluxZ = fluxZ;
+    const swayStrength = state.params.map.mainSwayFromFlux ?? 0;
+    const swayTarget = THREE.MathUtils.clamp(fluxZ * swayStrength, -0.6, 0.6);
+    state._fluxSway = THREE.MathUtils.lerp(state._fluxSway ?? 0, swayTarget, 0.1);
+    state.metrics.groupSway = state._fluxSway;
+    state.mainGroup.rotation.x = state._fluxSway;
+
+    if (isBeat && shockCfg.enabled !== false && !isDrop) {
+      if (bass > 0.28 || rms > 0.32) {
+        const intensity = THREE.MathUtils.clamp((bass * 0.7 + rms * 0.5) * (shockCfg.beatIntensity ?? 0.55), 0.25, 1.1);
+        triggerShockwave(intensity);
+      }
+    }
+
+    // Core scale: RMS base + bass punch
+    const bassPunch = bass * state.params.map.spherePulseFromBass;
+    let breathe = 1;
+    // Advanced mapping: compute size from weighted bands if enabled
+    if (state.params.map.advancedMapping) {
+      const w = state.params.map.sizeWeights || { bass: 1, mid: 0.4, treble: 0.2 };
+      const sizeMix = Math.max(0, bass * w.bass + mid * w.mid + treble * w.treble);
+      breathe = 1 + sizeMix * state.params.map.sizeFromRms + bassPunch * 0.25;
+    } else {
+      breathe = 1 + rms * state.params.map.sizeFromRms + bassPunch * 0.4;
+    }
+    state.coreSphere.scale.set(breathe, breathe, breathe);
+    state.metrics.coreScale = breathe;
+    if (state.outerSphere) {
+      const b2 = breathe * 1.02;
+      state.outerSphere.scale.set(b2, b2, b2);
+      state.metrics.outerScale = b2;
+    } else {
+      state.metrics.outerScale = 0;
+    }
 
     const wBass = state.params.map.bandWeightBass;
     const wMid = state.params.map.bandWeightMid;
     const wTreble = state.params.map.bandWeightTreble;
     const bandMixBase = (bass * wBass * 0.6 + mid * wMid * 0.3 + treble * wTreble * 0.1);
+    let ringScaleAccum = 0;
+    let ringSpeedAccum = 0;
+    let ringNoiseAccum = 0;
+    let ringBrightAccum = 0;
+    const ringCount = state.orbitRings.children.length || 1;
     state.orbitRings.children.forEach((ring, index) => {
-      const bandMix = bandMixBase;
-      const speed = 0.0004 * (index + 1) * (1 + bandMix * state.params.map.ringSpeedFromBands);
+      // Advanced mapping per-target
+      let ringScaleMix = bandMixBase;
+      let ringSpeedMix = bandMixBase;
+      if (state.params.map.advancedMapping) {
+        const ws = state.params.map.ringScaleWeights || { bass: 0.8, mid: 0.6, treble: 0.2 };
+        const wv = state.params.map.ringSpeedWeights || { bass: 0.6, mid: 0.9, treble: 0.3 };
+        ringScaleMix = Math.max(0, bass * ws.bass + mid * ws.mid + treble * ws.treble);
+        ringSpeedMix = Math.max(0, bass * wv.bass + mid * wv.mid + treble * wv.treble);
+      }
+      const speed = 0.0004 * (index + 1) * (1 + ringSpeedMix * state.params.map.ringSpeedFromBands);
       ring.rotation.z += speed; ring.rotation.x += speed * 0.3; ring.rotation.y += speed * 0.2;
-      const scaleY = 1.0 + bandMix * state.params.map.ringScaleFromBands; ring.scale.y = scaleY;
+      const scaleY = 1.0 + ringScaleMix * state.params.map.ringScaleFromBands; ring.scale.y = scaleY;
+      ringScaleAccum += scaleY;
+      ringSpeedAccum += speed;
       // subtle tilt from bass energy
       ring.rotation.x += (bass * wBass) * 0.0005 * state.params.map.ringTiltFromBass;
     });
+    state.metrics.ringScale = ringScaleAccum / ringCount;
+    state.metrics.ringSpeed = ringSpeedAccum / ringCount;
 
     // Bloom reactivity (centroid boost is user-tunable)
     const bloomReactive =
@@ -682,26 +1238,62 @@ export function initScene() {
       rms * state.params.bloomReactiveGain +
       centroid * (state.params.map.colorBoostFromCentroid ?? 0.2);
     state.bloomEffect.intensity = bloomReactive;
+    state.metrics.bloomIntensity = state.bloomEffect.intensity;
 
     // Sphere specific reactivity (noise and brightness)
     if (state.coreSphere?.material?.uniforms) {
-      state.coreSphere.material.uniforms.uReactiveScale.value = Math.max(0.0, mid * state.params.map.sphereNoiseFromMid);
-      state.coreSphere.material.uniforms.uReactiveBright.value = Math.max(0.0, rms * state.params.map.sphereBrightnessFromRms);
+      // Noise from mid, brightness from RMS + treble sparkle
+      const coreNoise = Math.max(0.0, mid * state.params.map.sphereNoiseFromMid);
+      state.coreSphere.material.uniforms.uReactiveScale.value = coreNoise;
+      const sparkle = treble * state.params.map.sphereSparkleFromTreble;
+      const coreBright = Math.max(0.0, rms * state.params.map.sphereBrightnessFromRms + sparkle * 0.6);
+      state.coreSphere.material.uniforms.uReactiveBright.value = coreBright;
+      state.metrics.coreNoise = coreNoise;
+      state.metrics.coreBrightness = coreBright;
+    }
+    if (state.outerSphere?.material?.uniforms) {
+      const outerNoise = Math.max(0.0, mid * state.params.map.sphereNoiseFromMid * 0.4);
+      const outerBright = Math.max(0.0, rms * state.params.map.sphereBrightnessFromRms * 0.5);
+      state.outerSphere.material.uniforms.uReactiveScale.value = outerNoise;
+      state.outerSphere.material.uniforms.uReactiveBright.value = outerBright;
     }
 
     // Rings turbulence from band energy
     state.orbitRings.children.forEach((ring) => {
       if (ring.material?.uniforms) {
-        const bandMix = (bass * wBass * 0.6 + mid * wMid * 0.3 + treble * wTreble * 0.1);
-        ring.material.uniforms.uReactiveScale.value = Math.max(0.0, bandMix * state.params.map.ringNoiseFromBands);
-        ring.material.uniforms.uReactiveBright.value = Math.max(0.0, rms * 0.4);
+        let ringNoiseMix = (bass * wBass * 0.6 + mid * wMid * 0.3 + treble * wTreble * 0.1);
+        if (state.params.map.advancedMapping) {
+          const wn = state.params.map.ringNoiseWeights || { bass: 0.4, mid: 0.6, treble: 0.3 };
+          ringNoiseMix = Math.max(0, bass * wn.bass + mid * wn.mid + treble * wn.treble);
+        }
+        const ringReactive = Math.max(0.0, ringNoiseMix * state.params.map.ringNoiseFromBands);
+        ring.material.uniforms.uReactiveScale.value = ringReactive;
+        ringNoiseAccum += ringReactive;
+        const ringBright = Math.max(0.0, rms * 0.4 + dominantChromaEnergy * (state.params.map.ringBrightFromChroma ?? 0));
+        ring.material.uniforms.uReactiveBright.value = ringBright;
+        ringBrightAccum += ringBright;
       }
     });
+    state.metrics.ringNoise = ringNoiseAccum / ringCount;
+    state.metrics.ringBrightness = ringBrightAccum / ringCount;
 
-    // Lens flare subtle color boost with centroid + intensity from bass
-    const c = new THREE.Color().setHSL(0.6 + 0.4 * centroid, 0.7, 0.6 + 0.2 * rms);
-    state.centralLight.color.lerp(c, 0.05);
+    // Lens flare subtle color boost with centroid/chroma + intensity from bass
+    const chromaInfluence = Math.max(0, state.params.map.chromaLightInfluence ?? 0);
+    const chromaMix = Math.min(1, chromaInfluence * dominantChromaEnergy);
+    const baseHue = THREE.MathUtils.euclideanModulo(0.6 + 0.4 * centroid, 1);
+    const hue = THREE.MathUtils.lerp(baseHue, chromaHue, chromaMix);
+    const centralColor = new THREE.Color().setHSL(hue, 0.65 + 0.15 * centroid, 0.55 + 0.25 * rms);
+    state.metrics.lightHue = hue;
+    state.metrics.lightMix = chromaMix;
+    state.centralLight.color.lerp(centralColor, 0.05);
     state.centralLight.intensity = 1.8 + (bass * wBass) * state.params.map.lightIntensityFromBass + rms * 0.8;
+    if (state.centralGlow?.material) {
+      state.centralGlow.material.color.copy(state.centralLight.color);
+      const glowOpacity = THREE.MathUtils.clamp(0.45 + rms * 0.6 + treble * 0.35, 0.2, 1.0);
+      state.centralGlow.material.opacity = glowOpacity;
+      const glowScale = 12 * (1 + bass * 0.9 + rms * 0.4);
+      state.centralGlow.scale.setScalar(glowScale);
+    }
 
     // Camera micro shake on beat
     if (features?.beat) {
@@ -711,7 +1303,59 @@ export function initScene() {
 
     // Stars twinkle more with treble
     if (state.starfield?.material?.uniforms?.uTwinkleGain) {
-      state.starfield.material.uniforms.uTwinkleGain.value = Math.max(0.0, treble * wTreble * state.params.map.starTwinkleFromTreble);
+      const twinkleValue = Math.max(0.0, treble * wTreble * state.params.map.starTwinkleFromTreble);
+      state.starfield.material.uniforms.uTwinkleGain.value = twinkleValue;
+      state.metrics.starTwinkle = twinkleValue;
+    }
+    if (state.starfield) {
+      state.starfield.rotation.y += 0.00002 + treble * 0.00035;
+      const targetTilt = (centroid - 0.5) * 0.35;
+      state.starfield.rotation.x = THREE.MathUtils.lerp(state.starfield.rotation.x, targetTilt, 0.02);
+      state.metrics.starTilt = state.starfield.rotation.x;
+    }
+
+    if (state.chromaticEffect) {
+      let targetChromatic =
+        (chromaCfg.base ?? 0.0002) +
+        treble * (chromaCfg.treble ?? 0.0008) +
+        rms * 0.00025;
+      if (isBeat) targetChromatic += (chromaCfg.beat ?? 0.001);
+      if (isDrop) targetChromatic += (chromaCfg.drop ?? 0.002);
+      const lerpFactor = THREE.MathUtils.clamp(chromaCfg.lerp ?? 0.14, 0.02, 0.4);
+      state.chromaticIntensity = THREE.MathUtils.lerp(state.chromaticIntensity || 0, targetChromatic, lerpFactor);
+      const offset = Math.min(0.006, Math.max(0, state.chromaticIntensity));
+      state.chromaticEffect.offset.set(offset, offset * 0.65);
+      state.metrics.chromaticEnabled = 1;
+      state.metrics.chromaticOffset = offset;
+      state.metrics.chromaticOffsetY = offset * 0.65;
+    } else {
+      state.metrics.chromaticEnabled = 0;
+      state.metrics.chromaticOffset = 0;
+      state.metrics.chromaticOffsetY = 0;
+    }
+
+    // Camera FOV pump from bass (use sub+bass for kick focus)
+    const baseFov = 75;
+    const pump = Math.max(0, (0.7 * bass + 0.3 * sub)) * (state.params.map.fovPumpFromBass || 0);
+    state.camera.fov = baseFov + pump * 10.0;
+    state.camera.far = 50000; state.camera.updateProjectionMatrix();
+    state.metrics.cameraFov = state.camera.fov;
+
+    // Drop visuals
+    if (isDrop) {
+      const m = state.params.map.drop || {};
+      // Bloom flash
+      state.bloomEffect.intensity = (state.params.bloomStrengthBase || 1.2) + (m.bloomBoost || 0.6);
+      state.metrics.bloomIntensity = state.bloomEffect.intensity;
+      // Extra camera shake
+      const shakeAmt = 0.05 * (m.shake || 0.5);
+      state.camera.position.x += (Math.random() - 0.5) * shakeAmt; state.camera.position.y += (Math.random() - 0.5) * shakeAmt;
+      // Ring burst
+      state.orbitRings.children.forEach((ring) => { ring.scale.y *= (1.0 + 0.4 * (m.ringBurst || 0.6)); });
+      if (shockCfg.enabled !== false) {
+        const dropIntensity = THREE.MathUtils.clamp((m.intensity || 1.0) * (shockCfg.dropIntensity ?? 1.2) * (0.7 + rms + bass * 0.6), 0.6, 2.2);
+        triggerShockwave(dropIntensity, shockCfg.durationMs);
+      }
     }
 
     // Sparks: emit on beats and breathe with RMS
@@ -720,6 +1364,7 @@ export function initScene() {
       const pos = g.attributes.position.array;
       const life = g.attributes.life.array;
       const N = life.length;
+      let alive = 0;
       for (let i = 0; i < N; i++) {
         // decay
         life[i] = Math.max(0, life[i] - dt * 0.8);
@@ -732,14 +1377,151 @@ export function initScene() {
           pos[i3+2] = Math.cos(phi) * r;
           life[i] = 1.0;
         }
+        if (life[i] > 0.05) alive++;
       }
       g.attributes.life.needsUpdate = true; g.attributes.position.needsUpdate = true;
+      state.metrics.sparksActive = 1;
+      state.metrics.sparksAlive = N ? alive / N : 0;
+    } else {
+      state.metrics.sparksActive = 0;
+      state.metrics.sparksAlive = 0;
     }
 
     // Slow auto-rotate
     state.mainGroup.rotation.y += state.params.autoRotate;
 
-    state.controls.update(dt); state.composer.render();
+    // Dispersion overlay uniforms
+    if (state.dispersion?.layer) {
+      const enable = state.params.enableDispersion !== false;
+      try { state.dispersion.layer.setEnabled(enable); } catch(_) {}
+      if (enable) {
+        const d = state.params.dispersion || {};
+        const zoomGain = typeof d.zoomGain === 'number' ? d.zoomGain : 28.0;
+        const zoomBias = typeof d.zoomBias === 'number' ? d.zoomBias : -10.0;
+        const zoomLerp = typeof d.zoomLerp === 'number' ? d.zoomLerp : 0.1;
+        const opacityBase = typeof d.opacityBase === 'number' ? d.opacityBase : 0.18;
+        const opacityTrebleGain = typeof d.opacityTrebleGain === 'number' ? d.opacityTrebleGain : 0.55;
+        const opacityMin = typeof d.opacityMin === 'number' ? d.opacityMin : 0.12;
+        const opacityMax = typeof d.opacityMax === 'number' ? d.opacityMax : 0.8;
+        const opacityLerp = typeof d.opacityLerp === 'number' ? d.opacityLerp : 0.12;
+        const warpFrom = d.warpFrom || 'bass';
+        const warpGain = typeof d.warpGain === 'number' ? d.warpGain : 0.8;
+        const warpOnBeat = d.warpOnBeat !== false;
+        const warpOnDropBoost = typeof d.warpOnDropBoost === 'number' ? d.warpOnDropBoost : 0.6;
+        const tintHue = typeof d.tintHue === 'number' ? d.tintHue : 0.0;
+        const tintSat = typeof d.tintSat === 'number' ? d.tintSat : 0.0;
+        const tintMix = typeof d.tintMix === 'number' ? d.tintMix : 0.0;
+        const brightBase = typeof d.brightness === 'number' ? d.brightness : 1.0;
+        const brightGain = typeof d.brightnessGain === 'number' ? d.brightnessGain : 0.4;
+        const contrastBase = typeof d.contrast === 'number' ? d.contrast : 1.0;
+        const contrastGain = typeof d.contrastGain === 'number' ? d.contrastGain : 0.3;
+
+        const zoomTarget = THREE.MathUtils.clamp((bass * 1.2 + rms * 0.6) * zoomGain + zoomBias, -30.0, 30.0);
+        state.dispersion.zoom = THREE.MathUtils.lerp(state.dispersion.zoom || 0, zoomTarget, zoomLerp);
+        // Lock to center (no mouse parallax)
+        const targetOffsetX = 0.0;
+        const targetOffsetY = 0.0;
+        state.dispersion.offsetX = THREE.MathUtils.lerp(state.dispersion.offsetX || 0, targetOffsetX, 0.25);
+        state.dispersion.offsetY = THREE.MathUtils.lerp(state.dispersion.offsetY || 0, targetOffsetY, 0.25);
+        const opacityTarget = THREE.MathUtils.clamp(opacityBase + treble * opacityTrebleGain, opacityMin, opacityMax);
+        state.dispersion.opacity = THREE.MathUtils.lerp(state.dispersion.opacity || opacityTarget, opacityTarget, opacityLerp);
+        let warpSource = 0;
+        if (warpFrom === 'bass') warpSource = bass; else if (warpFrom === 'mid') warpSource = mid; else if (warpFrom === 'treble') warpSource = treble; else if (warpFrom === 'rms') warpSource = rms; else warpSource = bass;
+        let warp = warpSource * warpGain + (warpOnBeat && isBeat ? 0.25 : 0) + (isDrop ? warpOnDropBoost : 0);
+        warp = Math.max(0, warp);
+        const hue = (tintHue + state.metrics.chromaHue) - Math.floor(tintHue + state.metrics.chromaHue);
+        const sat = THREE.MathUtils.clamp(tintSat, 0, 1);
+        const val = 1.0;
+        const c = val * sat;
+        const x = c * (1.0 - Math.abs(((hue * 6.0) % 2.0) - 1.0));
+        const m = val - c;
+        let rt = 0.0, gt = 0.0, bt = 0.0;
+        if (hue < 1.0/6.0) { rt = c; gt = x; bt = 0.0; }
+        else if (hue < 2.0/6.0) { rt = x; gt = c; bt = 0.0; }
+        else if (hue < 3.0/6.0) { rt = 0.0; gt = c; bt = x; }
+        else if (hue < 4.0/6.0) { rt = 0.0; gt = x; bt = c; }
+        else if (hue < 5.0/6.0) { rt = x; gt = 0.0; bt = c; }
+        else { rt = c; gt = 0.0; bt = x; }
+        const tintColor = new THREE.Color(rt + m, gt + m, bt + m);
+        const brightness = brightBase + brightGain * rms;
+        const contrast = contrastBase + contrastGain * (bass * 0.6 + treble * 0.4);
+
+        // Twist synthesis
+        const twistBase = typeof d.twistBase === 'number' ? d.twistBase : 0.0;
+        const twistMax = typeof d.twistMax === 'number' ? d.twistMax : 0.8;
+        const twistBassGain = typeof d.twistBassGain === 'number' ? d.twistBassGain : 0.6;
+        const twistBeatGain = typeof d.twistBeatGain === 'number' ? d.twistBeatGain : 0.35;
+        const twistOnsetGain = typeof d.twistOnsetGain === 'number' ? d.twistOnsetGain : 0.25;
+        const twistFluxGain = typeof d.twistFluxGain === 'number' ? d.twistFluxGain : 0.15;
+        const twistStutterGain = typeof d.twistStutterGain === 'number' ? d.twistStutterGain : 0.2;
+        const twistLerp = typeof d.twistLerp === 'number' ? d.twistLerp : 0.14;
+        const twistFalloff = typeof d.twistFalloff === 'number' ? d.twistFalloff : 1.2;
+        const stutterWindowMs = typeof d.stutterWindowMs === 'number' ? d.stutterWindowMs : 180;
+        const flipOnStutter = d.flipOnStutter !== false;
+
+        const nowMs = performance.now();
+        // Track onsets for stutter detection
+        if (features?.aubioOnset) {
+          state.dispersion.stutterTimes.push(nowMs);
+        }
+        // Remove old events
+        const cutoff = nowMs - Math.max(80, stutterWindowMs);
+        state.dispersion.stutterTimes = state.dispersion.stutterTimes.filter(t0 => t0 >= cutoff);
+        const stutterCount = state.dispersion.stutterTimes.length >= 2 ? 1 : 0;
+        if (stutterCount && flipOnStutter) state.dispersion.twistDir = (state.dispersion.twistDir || 1) * -1;
+
+        const fluxZ = (features && typeof features.fluxStd === 'number' && features.fluxStd > 1e-6)
+          ? Math.max(0, (features.flux - features.fluxMean) / Math.max(1e-3, features.fluxStd))
+          : 0;
+
+        let twistTarget = twistBase
+          + bass * twistBassGain
+          + (isBeat ? twistBeatGain : 0)
+          + ((features?.aubioOnset ? 1 : 0) * twistOnsetGain)
+          + fluxZ * twistFluxGain
+          + stutterCount * twistStutterGain;
+        twistTarget = THREE.MathUtils.clamp(twistTarget, 0, twistMax);
+        state.dispersion.twist = THREE.MathUtils.lerp(state.dispersion.twist || 0, twistTarget, twistLerp);
+
+        // Travel accumulation (forward motion)
+        const travelBase = typeof d.travelBase === 'number' ? d.travelBase : 0.06;
+        const travelGain = typeof d.travelGain === 'number' ? d.travelGain : 0.12;
+        const travelBeatBoost = typeof d.travelBeatBoost === 'number' ? d.travelBeatBoost : 0.06;
+        const travelDropBoost = typeof d.travelDropBoost === 'number' ? d.travelDropBoost : 0.12;
+        const travelLerp = typeof d.travelLerp === 'number' ? d.travelLerp : 0.06;
+        const travelSpeedTarget = travelBase + rms * travelGain + (isBeat ? travelBeatBoost : 0) + (isDrop ? travelDropBoost : 0);
+        state.dispersion.travelSpeed = THREE.MathUtils.lerp(state.dispersion.travelSpeed || travelSpeedTarget, travelSpeedTarget, travelLerp);
+        state.dispersion.travel = (state.dispersion.travel || 0) + state.dispersion.travelSpeed * dt * 60.0; // scale for frame-rate
+
+        try {
+          const dbSize = new THREE.Vector2();
+          try { state.renderer.getDrawingBufferSize(dbSize); } catch(_) {}
+          state.dispersion.layer.update({
+            time: t,
+            zoom: state.dispersion.zoom,
+            offsetX: state.dispersion.offsetX,
+            offsetY: state.dispersion.offsetY,
+            opacity: state.dispersion.opacity,
+            warp,
+            tint: tintColor,
+            tintMix,
+            brightness,
+            contrast,
+            twist: (state.dispersion.twist || 0) * (state.dispersion.twistDir || 1),
+            twistFalloff,
+            travel: state.dispersion.travel || 0,
+            width: dbSize.x || state.renderer.domElement.width,
+            height: dbSize.y || state.renderer.domElement.height,
+          });
+        } catch(_) {}
+      }
+    }
+
+    try { state.controls.update(dt); } catch(_) {}
+    try { state.camera.rotation.z = state._cameraRoll || 0; } catch(_) {}
+    state.metrics.cameraRoll = state._cameraRoll || 0;
+    if (state.composer && state.composer.render) { state.composer.render(); } else { try { state.renderer.render(state.scene, state.camera); } catch(_) {} }
+    return state.metrics;
   }
 
   changeTheme('nebula');
@@ -748,21 +1530,20 @@ export function initScene() {
     state,
     changeTheme,
     triggerExplosion,
-    // Morph/webcam controls
-    async startWebcam() { return await ensureWebcamTexture(); },
-    stopWebcam() { try { window.__audioEngineRef?.stopWebcam?.(); } catch(_) {} state.webcamTexture = null; state.webcamReady = false; if (state.coreSphere?.material?.uniforms?.uVideoEnabled) state.coreSphere.material.uniforms.uVideoEnabled.value = 0.0; },
-    setMorphOnBeat(v) { state.params.morph.onBeat = !!v; },
-    setMorphAmount(v) { state.params.morph.amount = Math.max(0, Math.min(1, v)); },
-    setMorphDuration(ms) { state.params.morph.durationMs = Math.max(50, ms|0); },
-    setMorphHold(ms) { state.params.morph.holdMs = Math.max(0, ms|0); },
-    setVideoDepth(z) { if (state.coreSphere?.material?.uniforms?.uVideoDepth) state.coreSphere.material.uniforms.uVideoDepth.value = z; },
+    triggerShockwave,
+    triggerEyeBlink,
     setPixelRatioCap,
     rebuildParticles,
     setEnableSparks,
     setUseLensflare,
+    setEyeEnabled,
+    setEyeCorneaEnabled,
+    setEyePredatorMode,
+    toggleEyePredatorMode,
     onResize,
     onMouseMove,
     update,
+    setVisualMode: (mode) => { try { setupVisualMode(mode); } catch(_) {} },
     getPixelRatio: () => state.renderer.getPixelRatio(),
   };
 }

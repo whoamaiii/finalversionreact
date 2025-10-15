@@ -8,7 +8,23 @@ function loadOnce(key, importer, transform = (value) => value) {
 }
 
 export function loadAubio() {
-  return loadOnce('aubio', () => import('aubiojs'), (mod) => mod.default ?? mod);
+  return loadOnce('aubio', async () => {
+    const candidates = [
+      'https://esm.sh/aubiojs@0.0.11',
+      'https://esm.sh/aubiojs@0.0.9',
+      'https://cdn.jsdelivr.net/npm/aubiojs@0.0.11/+esm',
+      'https://cdn.jsdelivr.net/npm/aubiojs@0.0.9/+esm',
+    ];
+    for (const url of candidates) {
+      try {
+        const mod = await import(/* @vite-ignore */ url);
+        return mod.default ?? mod;
+      } catch (_) {
+        // try next candidate
+      }
+    }
+    throw new Error('Aubio module could not be loaded from CDNs');
+  });
 }
 
 export function loadEssentia() {

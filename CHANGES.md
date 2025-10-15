@@ -178,7 +178,7 @@ python3 -m http.server 5173
 - [ ] No console spam (unless `?debug` is in URL)
 - [ ] FPS stays near 60 on mid-range GPU (auto-resolution working)
 - [ ] Lensflare either works or disables cleanly (no errors)
-- [ ] Webcam morph → grid appears on beat
+// Webcam feature removed in Oct 2025; test case no longer applicable
 
 ### Browser Compatibility
 - ✅ Chrome 90+ (primary target)

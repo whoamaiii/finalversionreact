@@ -246,6 +246,7 @@
         <div id="settings-content"></div>
         <div id="settings-footer">
           <button id="settings-reset">Reset</button>
+          <button id="settings-save-settings">Save Settings</button>
           <button id="settings-save-preset">Save Preset</button>
           <button id="settings-close-footer">Close</button>
         </div>
@@ -254,12 +255,7 @@
 
     <div id="drop-overlay">Drop an audio file to visualize</div>
 
-    <div id="helper-ribbon">
-      <div class="bubble">
-        Tip: For system audio on macOS, click "System Audio" in the UI (Chrome), or use BlackHole to route output → input.
-        <button id="open-system-audio-help" class="link">Learn more</button>
-      </div>
-    </div>
+    
 
     <!-- iOS/Safari unlock: one-time Start Audio button (hidden after click) -->
     <button id="start-audio-btn" style="position:fixed; inset:auto 20px 20px auto; z-index:60; padding:10px 12px; border-radius:12px; border:1px solid var(--glass-border); background: var(--glass-bg); color:#fff; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); display:none;">Start Audio</button>
@@ -276,7 +272,7 @@
           "postprocessing": "https://esm.sh/postprocessing@6.36.3?external=three",
           "camera-controls": "https://esm.sh/camera-controls@2.7.4?external=three",
           "standardized-audio-context": "https://esm.sh/standardized-audio-context@14.0.2",
-          "aubiojs": "https://esm.sh/aubiojs@0.0.8",
+          "aubiojs": "https://esm.sh/aubiojs@0.0.11",
           "meyda": "https://esm.sh/meyda@5.6.3"
         }
       }

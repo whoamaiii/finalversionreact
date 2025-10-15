@@ -10,8 +10,7 @@ if (new URLSearchParams(location.search).has('debug')) {
 
 const sceneApi = initScene();
 const audio = new AudioEngine();
-// Expose audio engine globally for scene webcam startup
-try { window.__audioEngineRef = audio; } catch(_) {}
+// Webcam feature removed; no global exposure needed
 
 // UI hookups (robust against UI load failures)
 let ui;
@@ -58,17 +57,6 @@ try {
       console.error(e);
     }
   },
-  // Webcam controls
-  onRequestWebcam: async () => {
-    try {
-      await sceneApi.startWebcam();
-    } catch (e) {
-      alert('Webcam access failed or was denied.'); console.error(e);
-    }
-  },
-  onStopWebcam: () => {
-    try { sceneApi.stopWebcam(); } catch(_) {}
-  },
   onRequestFile: async (file) => {
     try {
       if (!file) {
@@ -105,6 +93,64 @@ try {
 
 // Theme is initialized inside scene init; avoid duplicate initial set
 
+// WebSocket feature broadcaster (for TouchDesigner via OSC bridge)
+let featureWs = null;
+let featureWsConnected = false;
+let featureWsConnecting = false;
+let featureWsLastAttemptMs = 0;
+let featureWsLastSendMs = 0;
+const FEATURE_WS_URL = 'ws://127.0.0.1:8090';
+
+function ensureFeatureWs(nowMs) {
+  if (featureWsConnected || featureWsConnecting) return;
+  if (nowMs && nowMs - featureWsLastAttemptMs < 2500) return;
+  featureWsLastAttemptMs = nowMs || performance.now();
+  try {
+    featureWsConnecting = true;
+    const ws = new WebSocket(FEATURE_WS_URL);
+    ws.onopen = () => { featureWsConnected = true; featureWsConnecting = false; featureWsLastSendMs = 0; };
+    ws.onclose = () => { featureWsConnected = false; featureWsConnecting = false; featureWs = null; };
+    ws.onerror = () => { try { ws.close(); } catch(_) {}; };
+    featureWs = ws;
+  } catch (_) {
+    featureWsConnected = false; featureWsConnecting = false; featureWs = null;
+  }
+}
+
+function sendFeaturesOverWs(features, nowMs) {
+  if (!featureWsConnected || !featureWs) return;
+  if (!features) return;
+  if (nowMs - featureWsLastSendMs < 33) return; // ~30Hz
+  featureWsLastSendMs = nowMs;
+  try {
+    const payload = {
+      rms: features.rms,
+      rmsNorm: features.rmsNorm,
+      bandsEMA: features.bandsEMA,
+      bandEnv: features.bandEnv,
+      bandNorm: features.bandNorm,
+      centroidNorm: features.centroidNorm,
+      flux: features.flux,
+      fluxMean: features.fluxMean,
+      fluxStd: features.fluxStd,
+      beat: !!features.beat,
+      drop: !!features.drop,
+      isBuilding: !!features.isBuilding,
+      buildLevel: features.buildLevel,
+      bpm: features.bpm,
+      tapBpm: features.tapBpm,
+      mfcc: features.mfcc,
+      chroma: features.chroma,
+      pitchHz: features.pitchHz,
+      pitchConf: features.pitchConf,
+      aubioTempoBpm: features.aubioTempoBpm,
+      aubioTempoConf: features.aubioTempoConf,
+      beatGrid: features.beatGrid ? { bpm: features.beatGrid.bpm, confidence: features.beatGrid.confidence } : null,
+    };
+    featureWs.send(JSON.stringify({ type: 'features', payload }));
+  } catch (_) {}
+}
+
 // Resize & mouse
 window.addEventListener('resize', sceneApi.onResize);
 window.addEventListener('mousemove', sceneApi.onMouseMove);
@@ -138,6 +184,10 @@ function animate() {
 
   const features = audio.update();
   sceneApi.update(features);
+
+  // Maintain WebSocket connection and broadcast features
+  if (!featureWsConnected) ensureFeatureWs(now);
+  if (features) sendFeaturesOverWs(features, now);
 
   // Ensure the core visuals exist (defensive safety if anything failed earlier)
   if (!sceneApi.state.coreSphere || !sceneApi.state.orbitRings) {
@@ -213,7 +263,10 @@ window.addEventListener('drop', async (e) => {
 
 // System audio help button
 document.getElementById('open-system-audio-help')?.addEventListener('click', () => {
-  const msg = 'Chrome: Click "System" in the UI → select "Entire Screen" → enable "Share system audio".\n\nIf unavailable, install BlackHole (virtual audio device), set Mac output to BlackHole, then select BlackHole as your Mic input in the UI.';
+  const isMac = /Mac/i.test(navigator.userAgent || '') || /Mac/i.test(navigator.platform || '');
+  const msg = isMac
+    ? 'macOS: For one tab, click "Tab (Chrome)" then enable "Share tab audio".\n\nFor full system audio: Install BlackHole 2ch → in Audio MIDI Setup make a Multi-Output (BlackHole + your speakers) → set Mac Output to that device → in the app pick Mic → BlackHole.\n\nIf capture fails, allow Chrome in System Settings → Privacy & Security → Screen Recording.'
+    : 'Click System, then select a tab/window with audio and enable audio sharing. If capture is blocked, allow screen recording permissions for your browser.';
   try {
     let el = document.getElementById('toast');
     if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
