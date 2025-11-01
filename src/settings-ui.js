@@ -479,7 +479,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
     if (!Array.isArray(children)) children = [children];
     for (const c of children) {
-      if (c == null) continue;
+      if (c === null || c === undefined) continue;
       if (typeof c === 'string') el.appendChild(document.createTextNode(c));
       else el.appendChild(c);
     }
