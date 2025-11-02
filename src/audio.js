@@ -26,7 +26,7 @@
  */
 
 import { AudioContext as StdAudioContext } from 'standardized-audio-context';
-import { loadAubio, loadMeyda } from './lazy.js';
+import { loadAubio, loadMeyda, clearModuleCache } from './lazy.js';
 import { showToast } from './toast.js';
 
 /**
@@ -78,11 +78,37 @@ async function getBeatDetectorGuess() {
 }
 
 /**
+ * Safely convert BPM to interval in milliseconds with validation.
+ *
+ * Prevents division by zero and validates BPM is in reasonable range.
+ * Returns 0 for invalid input rather than NaN/Infinity to prevent propagation.
+ *
+ * @param {number} bpm - Beats per minute value
+ * @returns {number} Interval in milliseconds, or 0 if invalid
+ */
+function safeBpmToInterval(bpm) {
+  // Validate input is a finite number
+  if (typeof bpm !== 'number' || !isFinite(bpm)) {
+    return 0;
+  }
+
+  // Validate BPM is in reasonable range for music
+  // Slower than 20 BPM is not musically useful
+  // Faster than 500 BPM is beyond human capability
+  if (bpm <= 0 || bpm < 20 || bpm > 500) {
+    return 0;
+  }
+
+  // Safe to divide now
+  return 60000 / bpm;
+}
+
+/**
  * AudioEngine Class
- * 
+ *
  * The main class that handles all audio processing and feature extraction.
  * This is instantiated once in main.js and used throughout the application.
- * 
+ *
  * Main responsibilities:
  * - Setup and manage AudioContext (the audio processing environment)
  * - Capture audio from microphone, system audio, or files
@@ -124,6 +150,9 @@ export class AudioEngine {
     this.noiseGateThreshold = 0.10; // 0..1 amplitude/energy threshold for gate
     this._noiseGateCalibrating = false; // guard concurrent calibrations
     this._lastBeatMs = -99999;
+
+    // Tap tempo configuration
+    this.tapDebounceMs = 60; // minimum time between tap events (ms) - reduced from 120ms for faster tempos
 
     this.levels = { rms: 0, rmsEMA: 0, bands: { bass: 0, mid: 0, treble: 0 }, bandsEMA: { bass: 0, mid: 0, treble: 0 }, centroid: 0, centroidEMA: 0 };
 
@@ -475,14 +504,50 @@ export class AudioEngine {
     this._fileStartCtxTimeSec = this.ctx.currentTime;
     this._fileDurationSec = audioBuf.duration || 0;
 
+    // Track analysis promises to prevent race conditions
+    // Use unique IDs instead of object identity for reliable tracking
+    if (!this._analysisIdCounter) {
+      this._analysisIdCounter = 0;
+    }
+    const analysisId = ++this._analysisIdCounter;
+
+    const bpmAnalysis = { id: analysisId, timestamp: performance.now() };
+    const essentiaAnalysis = { id: analysisId, timestamp: performance.now() };
+
+    if (!this._analysisPromises) {
+      this._analysisPromises = { bpm: null, essentia: null };
+    }
+    this._analysisPromises.bpm = bpmAnalysis;
+    this._analysisPromises.essentia = essentiaAnalysis;
+
     // Fire-and-forget BPM estimation for tempo assist
     // This runs in the background and updates bpmEstimate when done
-    this._estimateBpmFromBuffer(audioBuf).catch(() => {});
+    const bpmPromise = this._estimateBpmFromBuffer(audioBuf, bpmAnalysis).catch((err) => {
+      console.warn('BPM estimation failed:', err);
+      return null;
+    });
 
     // Run Essentia analysis for beat grid detection
     // This provides precise beat tracking and tempo information
-    this._runEssentiaAnalysis(audioBuf).catch((err) => {
+    const essentiaPromise = this._runEssentiaAnalysis(audioBuf, essentiaAnalysis).catch((err) => {
       console.warn('Essentia analysis failed', err);
+      return null;
+    });
+
+    // Process results in order of completion, giving priority to Essentia
+    // which is generally more accurate but slower
+    Promise.race([
+      bpmPromise.then(result => ({ type: 'bpm', result })),
+      essentiaPromise.then(result => ({ type: 'essentia', result }))
+    ]).then(firstResult => {
+      // Store the first result but wait for both to complete for best accuracy
+      Promise.all([bpmPromise, essentiaPromise]).then(() => {
+        // Both analyses complete - Essentia takes priority if successful
+      }).catch(err => {
+        console.warn('Error waiting for all analyses:', err);
+      });
+    }).catch(err => {
+      console.warn('Error in BPM analysis race:', err);
     });
   }
 
@@ -520,13 +585,22 @@ export class AudioEngine {
 
     // Terminate Essentia worker to prevent memory leak
     if (this._essentiaWorker) {
+      // Reject pending promises before termination
+      if (this._essentiaReadyResolver) {
+        this._essentiaReadyResolver(null);
+        this._essentiaReadyResolver = null;
+      }
+
+      // Clear pending job IDs to prevent processing stale results
+      this._essentiaCurrentJobId = 0;
+      this._essentiaPendingJobId = 0;
+
       try {
         this._essentiaWorker.terminate();
       } catch (_) {}
       this._essentiaWorker = null;
       this._essentiaReady = false;
       this._essentiaReadyPromise = null;
-      this._essentiaReadyResolver = null;
     }
 
     // Don't clear BPM immediately; allow UI to still show last known value
@@ -593,7 +667,8 @@ export class AudioEngine {
    * @param {number} ms - Minimum milliseconds between accepted beats.
    */
   setBeatRefractory(ms) {
-    const v = Math.max(60, Math.floor(ms || 0));
+    // Clamp to reasonable range: min 60ms (1000 BPM), max 2000ms (30 BPM)
+    const v = Math.min(2000, Math.max(60, Math.floor(ms || 0)));
     this.beatRefractoryMs = v;
     // Keep legacy field in sync for presets/loaders referring to beatCooldown
     this.beatCooldownMs = v;
@@ -681,8 +756,9 @@ export class AudioEngine {
     this.noiseGateEnabled = wasEnabled;
     this._noiseGateCalibrating = false;
     if (!samples.length) return this.noiseGateThreshold;
-    samples.sort((a, b) => a - b);
-    const p90 = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.90))];
+    // Create a copy to avoid mutating the original array
+    const sortedSamples = samples.slice().sort((a, b) => a - b);
+    const p90 = sortedSamples[Math.min(sortedSamples.length - 1, Math.floor(sortedSamples.length * 0.90))];
     // Add a margin and clamp to sane upper bound so music still comes through
     const threshold = this._clamp(p90 * 1.15 + 0.02, 0.01, 0.5);
     this.noiseGateThreshold = threshold;
@@ -697,7 +773,7 @@ export class AudioEngine {
     const now = performance.now();
     if (this.tempoAssistEnabled) {
       if (this.bpmEstimate && this.bpmEstimate > 0) {
-        this.tempoIntervalMs = 60000 / this.bpmEstimate;
+        this.tempoIntervalMs = safeBpmToInterval(this.bpmEstimate);
         this._lastTempoMs = now;
         this._lastQuantizeMs = now; // align grid phase when enabling
       }
@@ -726,27 +802,43 @@ export class AudioEngine {
   tapBeat() {
     const now = performance.now();
     const taps = this.tapTimestamps;
-    // debounce taps that are too close (<120ms)
-    if (taps.length && now - taps[taps.length - 1] < 120) return;
+    // debounce taps that are too close (configurable with minimum 10ms to prevent abuse)
+    const effectiveDebounce = Math.max(this.tapDebounceMs, 10);
+    if (taps.length && now - taps[taps.length - 1] < effectiveDebounce) return;
     taps.push(now);
-    // keep last 8 taps
-    if (taps.length > 8) taps.shift();
+    // keep last 8 taps, enforce hard limit with while loop
+    while (taps.length > 8) taps.shift();
     if (taps.length >= 2) {
       // compute intervals between consecutive taps
       const intervals = [];
       for (let i = 1; i < taps.length; i++) intervals.push(taps[i] - taps[i - 1]);
       // remove outliers using median absolute deviation
-      const median = intervals.slice().sort((a,b)=>a-b)[Math.floor(intervals.length/2)];
+      const sortedIntervals = intervals.slice().sort((a,b)=>a-b);
+      // Calculate median with explicit length checks to avoid edge cases
+      const median = sortedIntervals.length === 0 ? 0 :
+        sortedIntervals.length === 1 ? sortedIntervals[0] :
+        sortedIntervals.length % 2 === 0
+        ? (sortedIntervals[sortedIntervals.length/2 - 1] + sortedIntervals[sortedIntervals.length/2]) / 2
+        : sortedIntervals[Math.floor(sortedIntervals.length/2)];
       const mads = intervals.map(v => Math.abs(v - median));
-      const mad = mads.slice().sort((a,b)=>a-b)[Math.floor(mads.length/2)] || 0;
+      const sortedMads = mads.slice().sort((a,b)=>a-b);
+      // Calculate MAD median properly as well
+      const mad = sortedMads.length === 0 ? 0 :
+        (sortedMads.length % 2 === 0
+        ? (sortedMads[Math.floor(sortedMads.length/2) - 1] + sortedMads[Math.floor(sortedMads.length/2)]) / 2
+        : sortedMads[Math.floor(sortedMads.length/2)]) || 0;
       const filtered = mad > 0 ? intervals.filter(v => Math.abs(v - median) <= 3 * mad) : intervals;
-      const avg = filtered.reduce((a,b)=>a+b,0) / filtered.length;
-      if (isFinite(avg) && avg > 200 && avg < 2000) {
-        const bpm = 60000 / avg;
-        const adjustedBpm = bpm * this._tapMultiplier;
-        this.tapBpm = Math.round(adjustedBpm);
-        this.tapTempoIntervalMs = 60000 / (this.tapBpm || 1);
-        this._lastQuantizeMs = now; // reset phase to last tap
+      // Guard against empty filtered array to prevent division by zero
+      if (filtered.length > 0) {
+        const avg = filtered.reduce((a,b)=>a+b,0) / filtered.length;
+        // Use >= and <= with slightly relaxed bounds to handle floating-point precision
+        if (isFinite(avg) && avg >= 195 && avg <= 2005) {
+          const bpm = avg > 0 ? 60000 / avg : 0; // Safe division
+          const adjustedBpm = bpm * this._tapMultiplier;
+          this.tapBpm = Math.round(adjustedBpm);
+          this.tapTempoIntervalMs = safeBpmToInterval(this.tapBpm);
+          this._lastQuantizeMs = now; // reset phase to last tap
+        }
       }
     }
   }
@@ -757,11 +849,11 @@ export class AudioEngine {
   nudgeTapMultiplier(mult) {
     if (!mult || !isFinite(mult)) return;
     this._tapMultiplier = this._clamp(this._tapMultiplier * mult, 0.25, 4);
-    const base = this.tapTempoIntervalMs > 0 ? 60000 / this.tapTempoIntervalMs : this.getBpm();
+    const base = this.tapTempoIntervalMs > 0 ? (60000 / this.tapTempoIntervalMs) : this.getBpm();
     if (base) {
       const updated = base * this._tapMultiplier;
       this.tapBpm = Math.round(updated);
-      this.tapTempoIntervalMs = this.tapBpm ? 60000 / this.tapBpm : 0;
+      this.tapTempoIntervalMs = safeBpmToInterval(this.tapBpm);
     }
   }
 
@@ -843,7 +935,8 @@ export class AudioEngine {
 
     let frameArray = null;
     if (data.samples) {
-      frameArray = new Float32Array(data.samples);
+      // Clone the array to prevent race conditions with concurrent messages
+      frameArray = new Float32Array(data.samples.slice ? data.samples.slice() : data.samples);
       this._workletFrame = frameArray;
     }
     if (typeof data.rms === 'number') this._workletFeatures.rms = data.rms;
@@ -873,8 +966,12 @@ export class AudioEngine {
     return flux;
   }
 
-  async _estimateBpmFromBuffer(buffer) {
+  async _estimateBpmFromBuffer(buffer, thisAnalysis = {}) {
     if (!buffer) return null;
+
+    // Use provided analysis reference for race condition checking
+    // (passed from loadFile to ensure atomicity)
+
     const sampleRate = buffer.sampleRate || this.sampleRate || 44100;
     const mono = this._extractMonoBuffer(buffer);
     if (!mono || !mono.length) return null;
@@ -919,11 +1016,19 @@ export class AudioEngine {
 
     const selection = this._selectBestBpmCandidate(candidates);
     if (selection && selection.bpm && selection.bpm > 0) {
-      this.bpmEstimate = selection.bpm;
-      this.tempoIntervalMs = 60000 / selection.bpm;
-      this._lastTempoMs = performance.now();
-      this.bpmEstimateConfidence = selection.confidence;
-      this.bpmEstimateSource = selection.source;
+      // Only update if this analysis is still current (prevent race condition)
+      // Compare IDs instead of object identity for reliable tracking
+      if (this._analysisPromises &&
+          thisAnalysis &&
+          thisAnalysis.id &&
+          this._analysisPromises.bpm &&
+          this._analysisPromises.bpm.id === thisAnalysis.id) {
+        this.bpmEstimate = selection.bpm;
+        this.tempoIntervalMs = safeBpmToInterval(selection.bpm);
+        this._lastTempoMs = performance.now();
+        this.bpmEstimateConfidence = selection.confidence;
+        this.bpmEstimateSource = selection.source;
+      }
       return selection.bpm;
     }
 
@@ -1017,8 +1122,14 @@ export class AudioEngine {
   _normalizeBpmCandidate(value) {
     if (typeof value !== 'number' || !isFinite(value) || value <= 0) return null;
     let bpm = value;
-    while (bpm > 0 && bpm < 30) bpm *= 2;
-    while (bpm > 300) bpm *= 0.5;
+
+    // Add iteration guards to prevent infinite loops on malformed values
+    let iterations = 0;
+    while (bpm > 0 && bpm < 30 && iterations++ < 20) bpm *= 2;
+
+    iterations = 0;
+    while (bpm > 300 && iterations++ < 20) bpm *= 0.5;
+
     if (bpm < 30 || bpm > 300) return null;
     if (bpm < 60) bpm *= 2;
     if (bpm > 200) bpm *= 0.5;
@@ -1385,14 +1496,23 @@ export class AudioEngine {
     if (data.type === 'result') {
       const { jobId, result } = data;
       if (jobId && jobId === this._essentiaCurrentJobId) {
-        this._applyEssentiaResult(result);
+        // Retrieve the analysis reference for race condition checking
+        const thisAnalysis = this._essentiaAnalysisByJobId?.get(jobId);
+        this._applyEssentiaResult(result, thisAnalysis);
+        // Clean up the reference
+        if (this._essentiaAnalysisByJobId) {
+          this._essentiaAnalysisByJobId.delete(jobId);
+        }
       }
     }
   }
 
   // toast handled via centralized helper in toast.js
 
-  async _runEssentiaAnalysis(buffer) {
+  async _runEssentiaAnalysis(buffer, thisAnalysis = {}) {
+    // Use provided analysis reference for race condition checking
+    // (passed from loadFile to ensure atomicity)
+
     try {
       await this._initEssentiaWorker();
     } catch (err) {
@@ -1405,6 +1525,13 @@ export class AudioEngine {
 
     const jobId = ++this._essentiaCurrentJobId;
     this._essentiaPendingJobId = jobId;
+
+    // Store analysis reference indexed by jobId for race condition checking
+    if (!this._essentiaAnalysisByJobId) {
+      this._essentiaAnalysisByJobId = new Map();
+    }
+    this._essentiaAnalysisByJobId.set(jobId, thisAnalysis);
+
     try {
       this._essentiaWorker.postMessage({
         type: 'analyze',
@@ -1417,6 +1544,7 @@ export class AudioEngine {
       }, [mono.buffer]);
     } catch (err) {
       console.warn('Failed to post Essentia job', err);
+      this._essentiaAnalysisByJobId.delete(jobId);
     }
   }
 
@@ -1434,7 +1562,7 @@ export class AudioEngine {
     return mono;
   }
 
-  _applyEssentiaResult(result) {
+  _applyEssentiaResult(result, thisAnalysis) {
     if (!result) return;
     this.beatGrid = {
       bpm: result.bpm || 0,
@@ -1450,11 +1578,19 @@ export class AudioEngine {
     // Also propagate BPM estimate from analysis so UI updates even if guess() failed.
     const bpm = typeof result.bpm === 'number' && isFinite(result.bpm) ? Math.round(result.bpm) : 0;
     if (bpm > 30 && bpm < 300) {
-      this.bpmEstimate = bpm;
-      this.tempoIntervalMs = 60000 / bpm;
-      this._lastTempoMs = performance.now();
-      this.bpmEstimateConfidence = this._clamp(result.confidence || 0, 0, 1);
-      this.bpmEstimateSource = 'essentia';
+      // Only update if this analysis is still current (prevent race condition)
+      // Compare IDs instead of object identity for reliable tracking
+      if (this._analysisPromises &&
+          thisAnalysis &&
+          thisAnalysis.id &&
+          this._analysisPromises.essentia &&
+          this._analysisPromises.essentia.id === thisAnalysis.id) {
+        this.bpmEstimate = bpm;
+        this.tempoIntervalMs = safeBpmToInterval(bpm);
+        this._lastTempoMs = performance.now();
+        this.bpmEstimateConfidence = this._clamp(result.confidence || 0, 0, 1);
+        this.bpmEstimateSource = 'essentia';
+      }
     }
   }
 
@@ -1599,7 +1735,15 @@ export class AudioEngine {
       return source.slice(0);
     }
     const target = new Float32Array(targetSize);
+    // Check for empty source to prevent division issues
+    if (source.length === 0) {
+      return target; // Return zeros
+    }
     const stride = source.length / targetSize;
+    // Ensure stride is finite
+    if (!isFinite(stride) || stride <= 0) {
+      return target; // Return zeros if stride is invalid
+    }
     for (let i = 0; i < targetSize; i++) {
       const idx = Math.min(source.length - 1, Math.floor(i * stride));
       target[i] = source[idx];
@@ -1655,7 +1799,14 @@ export class AudioEngine {
   }
 
   _computeCentroid(freqData) {
-    const sr = this.sampleRate; const N = freqData.length; const binHz = sr / 2 / N;
+    // Guard against empty array to prevent division by zero
+    if (!freqData || freqData.length === 0) {
+      return { hz: 0, norm: 0 };
+    }
+    // Guard against invalid sample rate (use default 48000 Hz if invalid)
+    const sr = (this.sampleRate && this.sampleRate > 0) ? this.sampleRate : 48000;
+    const N = freqData.length;
+    const binHz = sr / 2 / N;
     let num = 0, den = 0;
     for (let i = 0; i < N; i++) { const mag = freqData[i] / 255; const f = i * binHz; num += f * mag; den += mag; }
     const centroidHz = den > 0 ? num / den : 0; // 0..Nyquist
@@ -1682,10 +1833,15 @@ export class AudioEngine {
 
   _computeBassFlux(freqData) {
     const N = freqData.length;
+    // Validate array length to prevent division issues
+    if (N === 0) return 0;
     const sr = this.sampleRate || 48000;
     const binHz = sr / 2 / N;
+    // Prevent division by zero if binHz is 0
     const cutoffHz = Math.max(40, Math.min(this.bandSplit.low || 180, 600));
-    const cutoffBin = Math.max(1, Math.min(N >> 1, Math.floor(cutoffHz / binHz)));
+    const cutoffBin = binHz > 0
+      ? Math.max(1, Math.min(N >> 1, Math.floor(cutoffHz / binHz)))
+      : Math.max(1, Math.min(N >> 1, 10)); // Fallback value
     if (!this._prevMagBass || this._prevMagBass.length !== cutoffBin) {
       this._prevMagBass = new Float32Array(cutoffBin);
     }
@@ -1714,12 +1870,23 @@ export class AudioEngine {
   _isNearDownbeat(nowSec, toleranceMs = 80) {
     const grid = this.beatGrid;
     if (!grid || !Array.isArray(grid.downbeats) || grid.downbeats.length === 0) return false;
+
+    // Validate nowSec to prevent infinite loops
+    if (!isFinite(nowSec)) return false;
+
     const db = grid.downbeats;
     // binary search nearest
     let lo = 0, hi = db.length - 1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (db[mid] < nowSec) lo = mid + 1; else hi = mid - 1;
+      const midVal = db[mid];
+      // Check for invalid values to prevent infinite loop
+      if (!isFinite(midVal)) {
+        // Skip invalid values
+        hi = mid - 1;
+        continue;
+      }
+      if (midVal < nowSec) lo = mid + 1; else hi = mid - 1;
     }
     const idx = Math.min(db.length - 1, Math.max(0, lo));
     const prevIdx = Math.max(0, idx - 1);
@@ -1729,10 +1896,33 @@ export class AudioEngine {
   }
 
   _percentile(sortedArray, p) {
-    const arr = (sortedArray || []).slice().sort((a,b)=>a-b);
+    // Don't re-sort if already sorted, just clone for safety
+    const arr = (sortedArray || []).slice();
     if (!arr.length) return 0;
-    const idx = Math.min(arr.length - 1, Math.max(0, Math.floor(p * (arr.length - 1))));
-    return arr[idx];
+    // Ensure array is sorted (only if not already sorted)
+    if (!this._isSorted(arr)) {
+      arr.sort((a,b)=>a-b);
+    }
+    // Use proper percentile calculation with interpolation
+    const position = p * (arr.length - 1);
+    const lower = Math.floor(position);
+    const upper = Math.ceil(position);
+    const weight = position - lower;
+
+    // Handle edge cases
+    if (lower === upper || upper >= arr.length) {
+      return arr[lower];
+    }
+
+    // Interpolate between values
+    return arr[lower] * (1 - weight) + arr[upper] * weight;
+  }
+
+  _isSorted(arr) {
+    for (let i = 1; i < arr.length; i++) {
+      if (arr[i] < arr[i-1]) return false;
+    }
+    return true;
   }
 
   _detectBeat(flux, bands) {
@@ -1812,14 +2002,14 @@ export class AudioEngine {
       if (this.isPlayingFile) {
         // keep bpmEstimate from file analysis if available
         if (this.bpmEstimate && this.bpmEstimate > 0) {
-          this.tempoIntervalMs = 60000 / this.bpmEstimate;
+          this.tempoIntervalMs = safeBpmToInterval(this.bpmEstimate);
         }
       } else {
         const liveBpm = this.aubioFeatures.tempoBpm;
         const liveConf = this.aubioFeatures.tempoConf;
         if (typeof liveBpm === 'number' && isFinite(liveBpm) && liveBpm > 30 && liveBpm < 300 && (liveConf ?? 0) >= 0.05) {
           const rounded = Math.round(liveBpm);
-          const intervalMs = rounded > 0 ? 60000 / rounded : 0;
+          const intervalMs = safeBpmToInterval(rounded);
           if (!this.bpmEstimate || Math.abs(rounded - this.bpmEstimate) >= 1) {
             this.bpmEstimate = rounded;
           }
@@ -1944,6 +2134,9 @@ export class AudioEngine {
             this.dropCentroidSlopeThresh = this._clamp(p60, 0.008, 0.05);
           }
           this._autoThrApplied = true;
+          // Clear arrays to prevent memory leak
+          this._autoBassOnBeats = [];
+          this._autoCentroidNegOnBeats = [];
         }
       }
     }
@@ -1980,5 +2173,151 @@ export class AudioEngine {
       aubioOnset: aubioOnsetPulse,
       beatGrid: this.beatGrid,
     };
+  }
+
+  /**
+   * Dispose method to clean up all resources and prevent memory leaks
+   */
+  dispose() {
+    // Stop any active streams
+    this.stop();
+
+    // Clean up Worklet Node
+    if (this.workletNode) {
+      try {
+        // Clear port event handler and close port to prevent memory leak
+        if (this.workletNode.port) {
+          this.workletNode.port.onmessage = null;
+          this.workletNode.port.postMessage({ type: 'shutdown' });
+          try {
+            this.workletNode.port.close();
+          } catch (_) {
+            // Port close may fail if already closed
+          }
+        }
+        this.workletNode.disconnect();
+        this.workletNode = null;
+      } catch (err) {
+        console.warn('Error cleaning up worklet node:', err);
+      }
+    }
+
+    // Clean up Essentia Worker (graceful shutdown with delayed termination)
+    if (this._essentiaWorker) {
+      try {
+        this._essentiaWorker.postMessage({ type: 'shutdown' });
+        // Give worker 100ms to clean up before force-terminating
+        const workerRef = this._essentiaWorker;
+        setTimeout(() => {
+          if (workerRef) {
+            try {
+              workerRef.terminate();
+            } catch (_) {}
+          }
+        }, 100);
+        this._essentiaWorker = null;
+        this._essentiaReady = false;
+        this._essentiaReadyPromise = null;
+      } catch (err) {
+        console.warn('Error terminating Essentia worker:', err);
+      }
+    }
+
+    // Clean up Aubio instances
+    if (this._aubio) {
+      try {
+        if (this._aubio.onset && typeof this._aubio.onset.del === 'function') {
+          this._aubio.onset.del();
+        }
+        if (this._aubio.tempo && typeof this._aubio.tempo.del === 'function') {
+          this._aubio.tempo.del();
+        }
+        if (this._aubio.pitch && typeof this._aubio.pitch.del === 'function') {
+          this._aubio.pitch.del();
+        }
+        this._aubio = { onset: null, tempo: null, pitch: null };
+      } catch (err) {
+        console.warn('Error cleaning up Aubio instances:', err);
+      }
+    }
+    this._aubioModule = null;
+    this._aubioPromise = null;
+    this._aubioQueue = [];
+    this._aubioConfiguredSampleRate = null;
+
+    // Disconnect all audio nodes
+    try {
+      if (this.analyser) this.analyser.disconnect();
+      if (this.gainNode) this.gainNode.disconnect();
+      if (this.splitterNode) this.splitterNode.disconnect();
+      if (this.analyserL) this.analyserL.disconnect();
+      if (this.analyserR) this.analyserR.disconnect();
+    } catch (err) {
+      console.warn('Error disconnecting audio nodes:', err);
+    }
+
+    // Close AudioContext
+    if (this.ctx) {
+      try {
+        // Remove from global context array first
+        if (typeof window !== 'undefined' && window.__reactiveCtxs && Array.isArray(window.__reactiveCtxs)) {
+          const idx = window.__reactiveCtxs.indexOf(this.ctx);
+          if (idx !== -1) {
+            window.__reactiveCtxs.splice(idx, 1);
+          }
+        }
+
+        // First suspend to stop processing
+        this.ctx.suspend().then(() => {
+          // Then close the context
+          if (this.ctx.state !== 'closed') {
+            this.ctx.close().catch(err => {
+              console.warn('Error closing audio context:', err);
+            });
+          }
+        }).catch(err => {
+          console.warn('Error suspending audio context:', err);
+        });
+      } catch (err) {
+        console.warn('Error closing audio context:', err);
+      }
+    }
+
+    // Clear large data arrays
+    this.freqData = null;
+    this.timeData = null;
+    this.timeDataFloat = null;
+    this.freqDataL = null;
+    this.freqDataR = null;
+    this._liveBuffer = null;
+    this._liveBufferWriteIdx = 0;
+
+    // Clear history arrays
+    this.fluxHistory = [];
+    this.bassFluxHistory = [];
+    this.frameHistory = [];
+
+    // Clear adaptive threshold arrays
+    this._autoBassOnBeats = [];
+    this._autoCentroidNegOnBeats = [];
+
+    // Reset all feature tracking
+    this.rms = 0;
+    this.rmsSmooth = 0;
+    this.rmsBass = 0;
+    this.rmsMid = 0;
+    this.rmsTreble = 0;
+    this.spectralFlux = 0;
+    this.bassFlux = 0;
+    this.beatGrid = 0;
+
+    // Clear meyda instances
+    this._meydaInstance = null;
+    this._meydaInstanceStereo = null;
+
+    // Clear lazy-loaded module cache to free memory
+    clearModuleCache('aubio');
+    clearModuleCache('meyda');
+    clearModuleCache('essentia');
   }
 }

@@ -24,7 +24,30 @@ import {
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
 import { showToast } from './toast.js';
 
-export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreenshot, openPresetLibrary, syncCoordinator }) {
+// Timing constants (in milliseconds)
+const SHADER_HUD_TIMEOUT_MS = 1600;  // How long the shader HUD stays visible
+const DRAWER_CLOSE_ANIMATION_MS = 260;  // Duration of drawer close animation
+
+// Store global keydown handler reference to prevent duplicate registration
+let _globalKeydownHandler = null;
+// Track initialization state to prevent duplicate setup
+let _settingsUIInitialized = false;
+// Track document-level overflow menu listeners for cleanup
+let _activeOverflowListeners = [];
+// Store shader hotkeys handler for cleanup
+let _shaderHotkeysHandler = null;
+
+export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreenshot, openPresetLibrary, syncCoordinator, midiApi }) {
+  // Clean up any existing handlers before initialization
+  // This prevents accumulation on module reload or re-initialization
+  if (_settingsUIInitialized) {
+    console.warn('Settings UI already initialized, cleaning up before re-initialization');
+    cleanupSettingsUI(); // This sets _settingsUIInitialized to false
+  }
+
+  // Mark as initialized
+  _settingsUIInitialized = true;
+
   const root = document.getElementById('settings-root');
   const drawer = document.getElementById('settings-drawer');
   const overlay = document.getElementById('settings-overlay');
@@ -115,7 +138,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   const writeJson = (key, value) => {
     try {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch (_) {}
+    } catch (err) {
+      if (err.name === 'QuotaExceededError') {
+        console.warn('[Settings] localStorage quota exceeded');
+        showToast('Storage full! Some settings may not be saved.', 3000);
+      }
+    }
   };
 
   const ensureDispersionParams = () => {
@@ -171,11 +199,15 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   shaderState.snapshots = snapshotSlots;
 
   let sectionPresetStore = readJson(DISPERSION_STORAGE_KEYS.sectionPresets, {});
-  if (!sectionPresetStore || typeof sectionPresetStore !== 'object') sectionPresetStore = {};
+  if (!sectionPresetStore || typeof sectionPresetStore !== 'object' || Array.isArray(sectionPresetStore) || sectionPresetStore === null) {
+    sectionPresetStore = {};
+  }
   const persistSectionPresets = () => writeJson(DISPERSION_STORAGE_KEYS.sectionPresets, sectionPresetStore);
 
   let shaderPresetStore = readJson(DISPERSION_STORAGE_KEYS.shaderPresets, {});
-  if (!shaderPresetStore || typeof shaderPresetStore !== 'object') shaderPresetStore = {};
+  if (!shaderPresetStore || typeof shaderPresetStore !== 'object' || Array.isArray(shaderPresetStore) || shaderPresetStore === null) {
+    shaderPresetStore = {};
+  }
   const persistShaderPresets = () => writeJson(DISPERSION_STORAGE_KEYS.shaderPresets, shaderPresetStore);
 
   const formatValue = (schema, value) => {
@@ -219,12 +251,17 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   const shaderHudNode = ensureShaderHud();
   const showShaderHud = (label, valueText) => {
     if (!shaderHudNode) return;
+    // Clear existing timer to prevent accumulation
+    if (shaderHudTimer) {
+      clearTimeout(shaderHudTimer);
+      shaderHudTimer = null;
+    }
     shaderHudNode.textContent = label ? `${label}: ${valueText}` : valueText;
     shaderHudNode.style.opacity = '1';
-    clearTimeout(shaderHudTimer);
     shaderHudTimer = setTimeout(() => {
       shaderHudNode.style.opacity = shaderState.pinnedHud ? '0.65' : '0';
-    }, 1600);
+      shaderHudTimer = null; // Clear reference after timeout
+    }, SHADER_HUD_TIMEOUT_MS);
   };
 
   const ensurePinnedHud = () => {
@@ -430,15 +467,39 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     if (showHud) showShaderHud(macro.label, `${Math.round(shaderState.macroValues[macroId] * 100)}%`);
   };
 
+  // Timer for drawer close animation
+  let drawerCloseTimer = null;
+
   function open() {
+    // Cancel any pending close animation
+    if (drawerCloseTimer) {
+      clearTimeout(drawerCloseTimer);
+      drawerCloseTimer = null;
+    }
     root.style.display = 'block';
     requestAnimationFrame(() => { root.classList.add('open'); });
     try { btnOpen.setAttribute('aria-expanded', 'true'); } catch(_) {}
   }
   function close() {
     root.classList.remove('open');
-    setTimeout(() => { root.style.display = 'none'; }, 260);
+    // Store timer ID so it can be cancelled if drawer is opened again
+    drawerCloseTimer = setTimeout(() => {
+      root.style.display = 'none';
+      drawerCloseTimer = null;
+    }, DRAWER_CLOSE_ANIMATION_MS);
     try { btnOpen.setAttribute('aria-expanded', 'false'); } catch(_) {}
+
+    // Clean up overflow menu listeners
+    _activeOverflowListeners.forEach(handler => {
+      document.removeEventListener('click', handler, true);
+    });
+    _activeOverflowListeners = [];
+
+    // Clear shader HUD timer if it's running
+    if (shaderHudTimer) {
+      clearTimeout(shaderHudTimer);
+      shaderHudTimer = null;
+    }
   }
 
   // removed buildShaderQuick: merged into buildShader top area
@@ -448,8 +509,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   btnClose.addEventListener('click', close);
   btnCloseFooter.addEventListener('click', close);
 
-  // Define named handler to prevent duplicate listeners
-  const handleGlobalKeydown = (e) => {
+  // Remove old handler if exists
+  if (_globalKeydownHandler) {
+    window.removeEventListener('keydown', _globalKeydownHandler);
+    _globalKeydownHandler = null;
+  }
+
+  // Create new handler with current closure
+  _globalKeydownHandler = (e) => {
     if (e.defaultPrevented) return;
     if (e.key === 'Escape') close();
     if ((e.key === 's' || e.key === 'S') && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -461,9 +528,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
   };
 
-  // Remove before adding to prevent duplicates if initSettingsUI is called multiple times
-  window.removeEventListener('keydown', handleGlobalKeydown);
-  window.addEventListener('keydown', handleGlobalKeydown);
+  // Add the new handler
+  window.addEventListener('keydown', _globalKeydownHandler);
 
   // Helpers: showToast centralized in toast.js
 
@@ -543,11 +609,18 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     const valueChip = h('span', { class: 'value-chip' }, formatNumber(value));
     input.addEventListener('input', () => {
       const v = parseFloat(input.value);
-      valueChip.textContent = formatNumber(v);
-      if (typeof oninput === 'function') oninput(v);
+      // Validate and use default value if invalid
+      const validValue = Number.isFinite(v) ? v : value;
+      valueChip.textContent = formatNumber(validValue);
+      if (typeof oninput === 'function') oninput(validValue);
     });
     if (typeof onchange === 'function') {
-      input.addEventListener('change', () => onchange(parseFloat(input.value)));
+      input.addEventListener('change', () => {
+        const v = parseFloat(input.value);
+        // Validate and use default value if invalid
+        const validValue = Number.isFinite(v) ? v : value;
+        onchange(validValue);
+      });
     }
     wrap.appendChild(input);
     wrap.appendChild(valueChip);
@@ -610,7 +683,22 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       try { await audioEngine.startSystemAudio(); } catch(e){ /* audioEngine shows detailed toasts */ }
     }));
     container.appendChild(button('File', async () => {
-      try { const input = document.createElement('input'); input.type = 'file'; input.accept = 'audio/*'; input.onchange = async () => { const f = input.files?.[0]; if (f) await audioEngine.loadFile(f); }; input.click(); } catch(e){ showToast('File load failed'); }
+      try {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'audio/*';
+        input.onchange = async () => {
+          try {
+            const f = input.files?.[0];
+            if (f) await audioEngine.loadFile(f);
+          } catch(e) {
+            showToast(e.message || 'File load failed');
+          }
+        };
+        input.click();
+      } catch(e) {
+        showToast('File selection failed');
+      }
     }));
     container.appendChild(button('Stop', () => { try { audioEngine.stop(); } catch(_){} }));
 
@@ -696,7 +784,10 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     if (showAdv) {
       el.appendChild(fieldRow('FFT Size', select([
         512,1024,2048,4096,8192,16384,32768
-      ].map(n => ({ label: String(n), value: n })), st.fftSize, (v) => audioEngine.setFFTSize(parseInt(v,10)) )));
+      ].map(n => ({ label: String(n), value: n })), st.fftSize, (v) => {
+        const parsed = parseInt(v, 10);
+        if (isFinite(parsed) && parsed > 0) audioEngine.setFFTSize(parsed);
+      })));
       el.appendChild(fieldRow('Sub Cutoff (Hz)', slider({ min: 40, max: 120, step: 5, value: st.subHz, oninput: (v) => audioEngine.setSubHz(v) })));
       el.appendChild(fieldRow('Bass Cutoff (Hz)', slider({ min: 60, max: 400, step: 10, value: st.lowHz, oninput: (v) => audioEngine.setBandSplit(v, st.midHz=(st.midHz||2000)) })));
       el.appendChild(fieldRow('Mid Cutoff (Hz)', slider({ min: 800, max: 5000, step: 50, value: st.midHz, oninput: (v) => audioEngine.setBandSplit(st.lowHz=(st.lowHz||200), v) })));
@@ -835,9 +926,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
 
   function buildMapping() {
     const m = sceneApi.state.params.map;
-    if (!m.shockwave) m.shockwave = { enabled: true, beatIntensity: 0.55, dropIntensity: 1.2, durationMs: 1200 };
-    if (!m.chromatic) m.chromatic = { base: 0.00025, treble: 0.0009, beat: 0.0012, drop: 0.0024, lerp: 0.14 };
-    if (!m.eye || typeof m.eye !== 'object') {
+    // Properly check for null, undefined, arrays, and non-object types
+    if (!m.shockwave || typeof m.shockwave !== 'object' || Array.isArray(m.shockwave) || m.shockwave === null) {
+      m.shockwave = { enabled: true, beatIntensity: 0.55, dropIntensity: 1.2, durationMs: 1200 };
+    }
+    if (!m.chromatic || typeof m.chromatic !== 'object' || Array.isArray(m.chromatic) || m.chromatic === null) {
+      m.chromatic = { base: 0.00025, treble: 0.0009, beat: 0.0012, drop: 0.0024, lerp: 0.14 };
+    }
+    if (!m.eye || typeof m.eye !== 'object' || Array.isArray(m.eye) || m.eye === null) {
       m.eye = {
         enabled: true,
         pupilBase: 0.22,
@@ -1013,13 +1109,13 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     const searchInput = h('input', { type: 'search', placeholder: 'Search controls…', value: shaderState.searchQuery || '' });
     searchInput.addEventListener('input', () => {
       shaderState.searchQuery = searchInput.value || '';
-      renderSections();
+      renderSections(true); // Force rebuild on search query change
     });
     toolbar.appendChild(h('div', { class: 'shader-toolbar-item search' }, searchInput));
     toolbar.appendChild(button('Clear', () => {
       searchInput.value = '';
       shaderState.searchQuery = '';
-      renderSections();
+      renderSections(true); // Force rebuild on search clear
     }, { class: 'ghost' }));
     const hudToggleLabel = h('label', { class: 'shader-toolbar-item toggle' });
     const hudToggle = checkbox(shaderState.pinnedHud, (checked) => {
@@ -1309,11 +1405,56 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       });
     };
 
-    renderSections = () => {
+    // Track if we need a full rebuild (structure change) vs just updates (value change)
+    let lastRenderedQuery = '';
+    let lastRenderedSection = null;
+
+    renderSections = (forceRebuild = false) => {
       const params = ensureDispersionParams();
       const prevScrollTop = sectionsContainer.scrollTop || 0;
-      sectionsContainer.replaceChildren();
       const query = (shaderState.searchQuery || '').trim().toLowerCase();
+
+      // Determine if we need a full rebuild
+      const needsRebuild = forceRebuild ||
+                          query !== lastRenderedQuery ||
+                          shaderState.activeSection !== lastRenderedSection ||
+                          !sectionsContainer.children.length;
+
+      if (needsRebuild) {
+        // Clean up any active overflow menu listeners before rebuilding
+        if (_activeOverflowListeners && _activeOverflowListeners.length > 0) {
+          _activeOverflowListeners.forEach(handler => {
+            document.removeEventListener('click', handler, true);
+          });
+          _activeOverflowListeners = [];
+        }
+        // Full rebuild for structural changes
+        sectionsContainer.replaceChildren();
+        lastRenderedQuery = query;
+        lastRenderedSection = shaderState.activeSection;
+      } else {
+        // Incremental update for value changes only
+        controlInstances.forEach((instances, key) => {
+          const value = params[key];
+          instances.forEach(inst => {
+            // Update slider value if changed
+            if (inst.slider && inst.slider.value !== String(value)) {
+              inst.slider.value = String(value);
+            }
+            // Update display text if changed
+            if (inst.display) {
+              const newText = formatValue(inst.schema, value);
+              if (inst.display.textContent !== newText) {
+                inst.display.textContent = newText;
+              }
+            }
+          });
+        });
+        // Skip the rest of the render if we did incremental update
+        return;
+      }
+
+      // Original full rebuild logic follows...
       let anyMatches = false;
       const hasSection = DISPERSION_SECTIONS.some((sec) => sec.id === shaderState.activeSection);
       if (!hasSection) shaderState.activeSection = DISPERSION_SECTIONS[0]?.id || null;
@@ -1339,9 +1480,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
               if (!inMenu && !onBtn) {
                 menu.style.display = 'none';
                 document.removeEventListener('click', handleOutside, true);
+                // Remove from active listeners array
+                const idx = _activeOverflowListeners.indexOf(handleOutside);
+                if (idx !== -1) _activeOverflowListeners.splice(idx, 1);
               }
             };
             document.addEventListener('click', handleOutside, true);
+            // Track this listener for cleanup
+            _activeOverflowListeners.push(handleOutside);
           }
         }, { class: 'ghost overflow-btn', 'aria-label': 'Section actions' });
         const menu = h('div', { class: 'section-overflow-menu' });
@@ -1349,7 +1495,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         menu.appendChild(button('Reset', () => {
           shaderState.activeSection = section.id; persistActiveSection();
           resetSectionToDefaults(section.id);
-          renderSections();
+          renderSections(true); // Force rebuild on section change
         }, { class: 'ghost' }));
         menu.appendChild(button('Save', () => {
           shaderState.activeSection = section.id; persistActiveSection();
@@ -1381,7 +1527,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         header.addEventListener('click', (ev) => {
           if (ev.target && (ev.target.closest && ev.target.closest('.actions'))) return;
           shaderState.activeSection = section.id; persistActiveSection();
-          renderSections();
+          renderSections(true); // Force rebuild on section change
         });
         block.appendChild(header);
         const body = h('div', { class: 'shader-section-body' });
@@ -1472,8 +1618,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
             list.appendChild(row);
           });
           presetsContainer.appendChild(list);
-        }).catch(()=>{});
-      } catch(_) {}
+        }).catch((err) => {
+          console.error('Failed to load shader presets:', err);
+        });
+      } catch(err) {
+        console.error('Error setting up shader presets:', err);
+      }
       if (Object.keys(shaderPresetStore).length) {
         const list = h('div', { class: 'shader-preset-list' });
         Object.keys(shaderPresetStore).sort().forEach((name) => {
@@ -1670,7 +1820,10 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
               const p = mod?.BUILT_IN_PRESETS?.['Rave Mode'];
               if (p) applyPresetSnapshot(p, { sceneApi, audioEngine, silent: false });
               showToast('Applied Rave Mode');
-            }).catch(()=>{});
+            }).catch((err) => {
+              console.error('Failed to load Rave Mode preset:', err);
+              showToast('Failed to load preset');
+            });
           }, { class: 'ghost' }),
           button('Create', () => {
             import('./presets.js').then((mod) => {
@@ -1681,8 +1834,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
                 presetManager.setFavorite(id, true);
                 render('presets');
                 showToast('Rave Mode added to library');
-              } catch (_) {}
-            }).catch(()=>{});
+              } catch (err) {
+                console.error('Failed to create Rave Mode preset:', err);
+                showToast('Failed to create preset');
+              }
+            }).catch((err) => {
+              console.error('Failed to load presets module:', err);
+              showToast('Failed to load preset');
+            });
           }, { class: 'ghost' }),
         ]),
       ]);
@@ -1772,10 +1931,13 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       try {
         const data = JSON.stringify(presetManager.exportState(), null, 2);
         const blob = new Blob([data], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
+        a.href = url;
         a.download = 'preset-library.json';
         a.click();
+        // Cleanup blob URL after a short delay to ensure download starts
+        setTimeout(() => URL.revokeObjectURL(url), 100);
       } catch (err) {
         console.error(err);
         showToast('Export failed');
@@ -1839,6 +2001,79 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
     const summary = h('div', { class: 'session-summary' }, summaryItems);
     el.appendChild(fieldRow('Session', summary));
+
+    // MIDI (Launchpad) — optional, shown when midiApi is provided
+    if (midiApi) {
+      const status = h('span', { id: 'midi-status-label' }, 'MIDI: Not connected');
+      const connectBtn = button('Connect MIDI', async () => {
+        const ok = await midiApi.connect();
+        if (!ok) showToast('MIDI connect failed or unsupported');
+      }, { class: 'ghost' });
+
+      // Learn UI: select action + learn button + clear all
+      const selector = document.createElement('select');
+      const addOpt = (value, label) => { const o = document.createElement('option'); o.value = value; o.textContent = label; selector.appendChild(o); };
+      // New big-look macros only
+      addOpt('portalSlam', 'Portal Slam (inward)');
+      addOpt('pullbackVortex', 'Pullback Vortex (outward + twist)');
+      addOpt('chromaticRift', 'Chromatic Rift');
+      addOpt('echoStutter', 'Echo Stutter (triple pulse)');
+      addOpt('vortexHold', 'Vortex Hold (hold)');
+      addOpt('blackout', 'Blackout Gate');
+      addOpt('solarFlare', 'Solar Flare (with shockwave)');
+      addOpt('panic', 'Panic (stop all)');
+
+      const learnBtn = button('Learn', () => {
+        midiApi.startLearn(selector.value);
+        showToast('Hit a Launchpad pad to bind…');
+      });
+      const clearBtn = button('Clear All', () => {
+        midiApi.clearBindings();
+        showToast('MIDI bindings cleared');
+      }, { class: 'ghost' });
+
+      const midiRow = h('div', { class: 'session-summary' }, [status, connectBtn, selector, learnBtn, clearBtn]);
+      el.appendChild(fieldRow('MIDI (Launchpad)', midiRow));
+
+      // Show current mappings with a blink test
+      const mapWrap = document.createElement('div');
+      mapWrap.className = 'section';
+      const mapTable = document.createElement('div');
+      mapTable.style.display = 'grid';
+      mapTable.style.gridTemplateColumns = 'minmax(140px,1fr) minmax(140px,1fr) auto';
+      mapTable.style.gap = '8px 12px';
+      const actions = [
+        ['portalSlam','Portal Slam (inward)'],
+        ['pullbackVortex','Pullback Vortex (outward + twist)'],
+        ['chromaticRift','Chromatic Rift'],
+        ['echoStutter','Echo Stutter (triple pulse)'],
+        ['vortexHold','Vortex Hold (hold)'],
+        ['blackout','Blackout Gate'],
+        ['solarFlare','Solar Flare'],
+        ['panic','Panic'],
+      ];
+      function refreshMapping() {
+        mapTable.innerHTML = '';
+        const b = midiApi.getBindings?.() || {};
+        actions.forEach(([key,label]) => {
+          const l = document.createElement('div'); l.textContent = label; l.style.opacity = '0.85';
+          const v = document.createElement('div'); v.textContent = midiApi.describeBinding?.(b[key]) || '—';
+          const test = button('Blink', () => midiApi.blink?.(key), { class: 'ghost' });
+          mapTable.appendChild(l); mapTable.appendChild(v); mapTable.appendChild(test);
+        });
+      }
+      refreshMapping();
+      mapWrap.appendChild(mapTable);
+      el.appendChild(mapWrap);
+
+      midiApi.onStatus((s) => {
+        const label = s.supported ? (s.connected ? `Connected: ${s.deviceLabel}` : 'Not connected') : 'Unsupported in this browser';
+        status.textContent = `MIDI: ${label}${s.learning ? ` — Learning ${s.learning}` : ''}`;
+        connectBtn.textContent = s.connected ? 'Reconnect' : 'Connect MIDI';
+        // numBindings change implies mapping update
+        refreshMapping();
+      });
+    }
     return el;
   }
 
@@ -1911,7 +2146,10 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(snapshot));
       return true;
     } catch (err) {
-      console.error('Failed to save settings snapshot', err);
+      console.error('[Settings] Failed to save settings snapshot', err);
+      if (err.name === 'QuotaExceededError') {
+        showToast('Storage full! Settings not saved. Free up space.', 4000);
+      }
       return false;
     }
   }
@@ -2008,7 +2246,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
     content.replaceChildren();
     const builder = builders[tabId];
-    Promise.resolve(builder()).then((node) => { content.appendChild(node); });
+    Promise.resolve(builder())
+      .then((node) => { content.appendChild(node); })
+      .catch((err) => {
+        console.error(`Failed to render tab '${tabId}':`, err);
+        content.appendChild(h('div', { class: 'error' }, 'Failed to load content'));
+      });
   }
 
   if (presetManager && typeof presetManager.on === 'function') {
@@ -2069,7 +2312,9 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         import('./presets.js').then((mod) => {
           const p = mod?.BUILT_IN_PRESETS?.[defName];
           if (p) applyPresetSnapshot(p, { sceneApi, audioEngine, silent: true });
-        }).catch(()=>{});
+        }).catch((err) => {
+          console.error('Failed to load default preset:', err);
+        });
       }
     } catch(_) {}
   }
@@ -2081,15 +2326,20 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       import('./presets.js').then((mod) => {
         const p = mod?.BUILT_IN_PRESETS?.[presetName];
         if (p) applyPresetSnapshot(p, { sceneApi, audioEngine, silent: true });
-      }).catch(()=>{});
+      }).catch((err) => {
+        console.error(`Failed to load URL preset '${presetName}':`, err);
+      });
     }
   } catch(_) {}
 
   render('quick');
 
+  // Store reference for cleanup
+  _shaderHotkeysHandler = handleShaderHotkeys;
+
   // Remove before adding to prevent duplicates if initSettingsUI is called multiple times
-  window.removeEventListener('keydown', handleShaderHotkeys, true);
-  window.addEventListener('keydown', handleShaderHotkeys, true);
+  window.removeEventListener('keydown', _shaderHotkeysHandler, true);
+  window.addEventListener('keydown', _shaderHotkeysHandler, true);
 
   // external labels update (FPS etc.)
   function updateFpsLabel(v) {
@@ -2150,7 +2400,9 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         updatePinnedHudOverlay();
         notifyRenderAll();
         showShaderHud(selection.name || 'BPM Preset', 'Applied');
-      }).catch(()=>{});
+      }).catch((err) => {
+        console.error('Failed to load shader presets for auto-apply:', err);
+      });
     } catch(_) {}
   }
   function updateTapAndDrift({ tapBpm, bpm }) {
@@ -2204,4 +2456,28 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   }
 
   return { open, close, updateFpsLabel, updateBpmLabel, updateTapAndDrift, updateDriftDetails, updateSyncStatus, updateBeatIndicator };
+}
+
+// Cleanup function to remove all event listeners and reset state
+export function cleanupSettingsUI() {
+  // Remove global keydown handler
+  if (_globalKeydownHandler) {
+    window.removeEventListener('keydown', _globalKeydownHandler);
+    _globalKeydownHandler = null;
+  }
+
+  // Remove shader hotkeys handler
+  if (_shaderHotkeysHandler) {
+    window.removeEventListener('keydown', _shaderHotkeysHandler, true);
+    _shaderHotkeysHandler = null;
+  }
+
+  // Remove any active overflow menu listeners
+  _activeOverflowListeners.forEach(handler => {
+    document.removeEventListener('click', handler, true);
+  });
+  _activeOverflowListeners = [];
+
+  // Reset initialization flag
+  _settingsUIInitialized = false;
 }

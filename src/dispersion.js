@@ -57,7 +57,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 1.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -65,7 +65,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 2.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -73,7 +73,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 3.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -81,7 +81,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 4.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -89,7 +89,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 5.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -97,7 +97,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 6.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -105,7 +105,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 7.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -113,7 +113,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 8.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -121,7 +121,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 9.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -129,7 +129,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 10.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -137,7 +137,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 11.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -145,7 +145,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 12.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -153,7 +153,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 13.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -161,7 +161,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 14.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -169,7 +169,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 15.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -177,7 +177,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 16.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -185,7 +185,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 17.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -193,7 +193,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 18.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -201,7 +201,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       i = 19.0; p = rayOrigin + z * rayDir; a = p;
       d = 2.0; a -= sin(a * d + t + i).yzx / d * warp; d = 3.0; a -= sin(a * d + t + i).yzx / d * warp;
@@ -209,7 +209,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
       d = 6.0; a -= sin(a * d + t + i).yzx / d * warp;
       p = abs(p); s = a.z + a.y - t;
       z += d = abs(2.0 - max(max(p.x, p.y), p.y)) + abs(cos(s)) / 7.0;
-      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / d;
+      o += (cos(s - z + vec4(0, 1, 8, 0)) + 1.0) / max(abs(d), 0.001);
 
       o = myTanh(o / 200.0);
       vec3 col = o.rgb;
@@ -261,12 +261,15 @@ export function createDispersionLayer(initialVariant = 'classic') {
       float px = 0.5 * min(r.x, r.y);
       FC += vec2(offset.x, offset.y) * px;
 
-      float i, z, d, s;
+      float i, z = 1.0, d, s; // Initialize z to prevent undefined behavior
       vec4 o = vec4(0.0);
 
-      // Slight warp factor for audio drive
+      // Pre-compute constants outside loop to reduce per-pixel calculations
       float warp = 1.0 + max(0.0, uWarp);
       float steps = clamp(uSteps, 60.0, 450.0);
+      float rotDepthFactor = 0.1 + uRotDepth; // Pre-compute rotation depth factor
+      float halfRepPeriod = 0.5 * uRepPeriod; // Pre-compute half period for modulo operations
+
       for(i = 0.0; i < steps; i += 1.0) {
         // Ray-like marching direction
         vec3 p = z * normalize(vec3(FC.xy, 0.0) * 2.0 - r.xyy);
@@ -275,20 +278,24 @@ export function createDispersionLayer(initialVariant = 'classic') {
 
         vec3 q = p;
         // Match reference drill rotation with additional controllable twist
-        q.xy *= rotate(q.z * (0.1 + uRotDepth) + uTwist);
-        vec3 q_rep = mod(q, uRepPeriod) - 0.5 * uRepPeriod;
+        q.xy *= rotate(q.z * rotDepthFactor + uTwist);
+        // Use pre-computed half period to reduce arithmetic operations
+        vec3 q_rep = mod(q + halfRepPeriod, uRepPeriod) - halfRepPeriod;
 
         float tunnel_box = max(abs(q.x), abs(q.y)) - uDrillBox;
         float drill_hole = length(q_rep) - uDrillRadius;
         float final_shape = max(tunnel_box, -drill_hole);
 
-        for(d = 2.0; d++ < 7.0;) {
+        // Use proper loop to iterate j from 2.0 to 7.0 (inclusive, 6 iterations)
+        for(float j = 2.0; j <= 7.0; j += 1.0) {
           // Use ceil() as in the reference and scale by warp
-          a -= sin(ceil(a * d + t)).xzy / d * warp;
+          a -= sin(ceil(a * j + t)).xzy / j * warp;
         }
 
         z += d = final_shape * 0.4 + 0.2 * abs(cos(s = a.y + t));
-        o += (cos(s - t + vec4(0.0, 1.0, 8.0, 0.0)) + 1.0) / max(d, 0.0005);
+        // Ensure d is never zero or negative to prevent division issues
+        float safe_d = max(abs(d), 0.001);
+        o += (cos(s - t + vec4(0.0, 1.0, 8.0, 0.0)) + 1.0) / safe_d;
       }
 
       vec3 col = Tanh(o / steps).rgb;
@@ -378,16 +385,80 @@ export function createDispersionLayer(initialVariant = 'classic') {
     pass.enabled = !!enabled;
   }
 
+  let _pendingVariant = null;
+  let _variantDebounceTimer = null;
+  let _isCompiling = false;
+
   function setVariant(variant) {
     const next = String(variant || 'classic');
     const src = getFragmentShader(next);
-    if (src && material) {
-      material.fragmentShader = src;
-      material.needsUpdate = true;
+
+    // If already compiling, queue the variant change
+    if (_isCompiling) {
+      _pendingVariant = next;
+      return;
+    }
+
+    // Debounce rapid variant changes
+    if (_variantDebounceTimer) {
+      clearTimeout(_variantDebounceTimer);
+    }
+
+    _variantDebounceTimer = setTimeout(() => {
+      // Check if shader is already set to prevent unnecessary recompilation
+      if (src && material && material.fragmentShader !== src) {
+        _isCompiling = true;
+        material.fragmentShader = src;
+        material.needsUpdate = true;
+
+        // Allow GPU time to compile, then check for pending changes
+        setTimeout(() => {
+          _isCompiling = false;
+          if (_pendingVariant && _pendingVariant !== next) {
+            const queued = _pendingVariant;
+            _pendingVariant = null;
+            setVariant(queued);
+          }
+        }, 100); // 100ms should be sufficient for most shader compilations
+      }
+      _variantDebounceTimer = null;
+    }, 50); // 50ms debounce to batch rapid calls
+  }
+
+  /**
+   * Dispose of all resources to prevent memory leaks
+   */
+  function dispose() {
+    // Clear variant change timers
+    if (_variantDebounceTimer) {
+      clearTimeout(_variantDebounceTimer);
+      _variantDebounceTimer = null;
+    }
+    _pendingVariant = null;
+    _isCompiling = false;
+
+    // Dispose geometry
+    if (geometry) {
+      geometry.dispose();
+    }
+
+    // Dispose material and its uniforms
+    if (material) {
+      material.dispose();
+    }
+
+    // Remove mesh from scene
+    if (mesh && overlayScene) {
+      overlayScene.remove(mesh);
+    }
+
+    // Dispose render pass if it exists
+    if (pass && typeof pass.dispose === 'function') {
+      pass.dispose();
     }
   }
 
-  return { scene: overlayScene, camera, mesh, material, pass, setSize, update, setEnabled, setVariant };
+  return { scene: overlayScene, camera, mesh, material, pass, setSize, update, setEnabled, setVariant, dispose };
 }
 
 

@@ -10,6 +10,7 @@
  */
 
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
+import { showToast } from './toast.js';
 
 const STORAGE_KEYS = {
   primary: 'cosmicPresetLibrary.v1',
@@ -314,8 +315,9 @@ export class PresetManager {
   }
 
   save(identifier, options = {}) {
-    const target = this._resolvePreset(identifier || this.activePresetId);
-    if (!target) throw new Error('Preset not found for save');
+    const id = identifier || this.activePresetId;
+    const target = this._resolvePreset(id);
+    if (!target) throw new Error(`Preset not found for save: ${id}`);
 
     const snapshot = options.snapshot || capturePresetSnapshot({ sceneApi: this.sceneApi, audioEngine: this.audioEngine });
     this._writeVersion(target, snapshot, options.note);
@@ -362,7 +364,7 @@ export class PresetManager {
 
   duplicate(identifier, newName) {
     const source = this._resolvePreset(identifier);
-    if (!source) throw new Error('Preset not found for duplicate');
+    if (!source) throw new Error(`Preset not found for duplicate: ${identifier}`);
     const name = newName || `${source.name} Copy`;
     if (this._findByName(name)) throw new Error('Preset name already exists');
     const snapshot = deepClone(source.data);
@@ -381,7 +383,7 @@ export class PresetManager {
   rename(identifier, newName) {
     if (!newName) throw new Error('New name required');
     const target = this._resolvePreset(identifier);
-    if (!target) throw new Error('Preset not found for rename');
+    if (!target) throw new Error(`Preset not found for rename: ${identifier}`);
     const existing = this._findByName(newName);
     if (existing && existing.id !== target.id) throw new Error('Preset name already exists');
     const prevName = target.name;
@@ -395,7 +397,7 @@ export class PresetManager {
 
   delete(identifier) {
     const target = this._resolvePreset(identifier);
-    if (!target) throw new Error('Preset not found for delete');
+    if (!target) throw new Error(`Preset not found for delete: ${identifier}`);
     delete this._state.presets[target.id];
     this._state.order = this._state.order.filter((id) => id !== target.id);
     this._state.favorites = this._state.favorites.filter((id) => id !== target.id);
@@ -408,8 +410,9 @@ export class PresetManager {
   }
 
   revert(identifier) {
-    const target = this._resolvePreset(identifier || this.activePresetId);
-    if (!target) throw new Error('Preset not found for revert');
+    const id = identifier || this.activePresetId;
+    const target = this._resolvePreset(id);
+    if (!target) throw new Error(`Preset not found for revert: ${id}`);
     if (!target.versions || target.versions.length < 2) throw new Error('No previous version to revert to');
     const previous = target.versions[1];
     target.data = deepClone(previous.data);
@@ -423,8 +426,9 @@ export class PresetManager {
   }
 
   load(identifier, options = {}) {
-    const target = this._resolvePreset(identifier || this.activePresetId);
-    if (!target) throw new Error('Preset not found for load');
+    const id = identifier || this.activePresetId;
+    const target = this._resolvePreset(id);
+    if (!target) throw new Error(`Preset not found for load: ${id}`);
     const snapshot = this._applyGuards(deepClone(target.data));
     if (!options.skipRollbackCapture) {
       this._previousSnapshot = capturePresetSnapshot({ sceneApi: this.sceneApi, audioEngine: this.audioEngine });
@@ -439,8 +443,9 @@ export class PresetManager {
   }
 
   quickCompare(identifier) {
-    const target = this._resolvePreset(identifier || this.activePresetId);
-    if (!target) throw new Error('Preset not found for quick compare');
+    const id = identifier || this.activePresetId;
+    const target = this._resolvePreset(id);
+    if (!target) throw new Error(`Preset not found for quick compare: ${id}`);
     if (!this._compareSnapshot) {
       this._compareSnapshot = capturePresetSnapshot({ sceneApi: this.sceneApi, audioEngine: this.audioEngine });
       this.load(target.id, { silent: true, skipRollbackCapture: true });
@@ -453,7 +458,7 @@ export class PresetManager {
 
   setFavorite(identifier, isFavorite) {
     const target = this._resolvePreset(identifier);
-    if (!target) throw new Error('Preset not found for favorite toggle');
+    if (!target) throw new Error(`Preset not found for favorite toggle: ${identifier}`);
     target.favorite = !!isFavorite;
     this._ensureFavorite(target.id, target.favorite);
     this._persist();
@@ -523,8 +528,9 @@ export class PresetManager {
   }
 
   restoreVersion(identifier, versionId) {
-    const target = this._resolvePreset(identifier || this.activePresetId);
-    if (!target) throw new Error('Preset not found for restore');
+    const id = identifier || this.activePresetId;
+    const target = this._resolvePreset(id);
+    if (!target) throw new Error(`Preset not found for restore: ${id}`);
     const entry = target.versions.find((v) => v.id === versionId);
     if (!entry) throw new Error('Version not found');
     target.data = deepClone(entry.data);
@@ -641,7 +647,30 @@ export class PresetManager {
     if (!this.storage) return createEmptyState();
     const tryParse = (raw) => {
       if (!raw) return null;
-      try { return JSON.parse(raw); } catch (_) { return null; }
+      try {
+        const parsed = JSON.parse(raw);
+        // Validate basic structure to prevent boot loops with corrupted data
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          console.warn('[PresetManager] Invalid state structure: not an object');
+          return null;
+        }
+        if (typeof parsed.version !== 'number') {
+          console.warn('[PresetManager] Invalid state structure: version missing or invalid');
+          return null;
+        }
+        if (!parsed.presets || typeof parsed.presets !== 'object' || Array.isArray(parsed.presets)) {
+          console.warn('[PresetManager] Invalid state structure: presets missing or invalid');
+          return null;
+        }
+        if (!Array.isArray(parsed.order)) {
+          console.warn('[PresetManager] Invalid state structure: order missing or invalid');
+          return null;
+        }
+        return parsed;
+      } catch (err) {
+        console.warn('[PresetManager] Failed to parse state:', err);
+        return null;
+      }
     };
     const primary = tryParse(this.storage.getItem(STORAGE_KEYS.primary));
     if (primary) return primary;
@@ -653,16 +682,68 @@ export class PresetManager {
   }
 
   _persist() {
-    if (!this.storage) return;
+    if (!this.storage) return false;
     const payload = JSON.stringify(this._state, null, 2);
+
     try {
+      // Step 1: Write to temporary key first to validate we have space
+      // This prevents corrupting backup if quota is exceeded
       this.storage.setItem(STORAGE_KEYS.working, payload);
-      const previous = this.storage.getItem(STORAGE_KEYS.primary);
-      if (previous) this.storage.setItem(STORAGE_KEYS.backup, previous);
-      this.storage.setItem(STORAGE_KEYS.primary, payload);
-      this.storage.removeItem(STORAGE_KEYS.working);
     } catch (err) {
-      console.error('PresetManager persist failed', err);
+      console.error('[PresetManager] Failed to write temp copy:', err);
+      this._handleQuotaError(err);
+      return false;
+    }
+
+    try {
+      // Step 2: Get current primary before overwriting
+      const previous = this.storage.getItem(STORAGE_KEYS.primary);
+
+      // Step 3: Write new data to primary key
+      // If this fails, we still have the backup intact
+      this.storage.setItem(STORAGE_KEYS.primary, payload);
+
+      // Step 4: Only NOW that primary succeeded, backup the old primary
+      // This ensures we always have valid data in either primary or backup
+      if (previous) {
+        try {
+          this.storage.setItem(STORAGE_KEYS.backup, previous);
+        } catch (backupErr) {
+          // Backup write failed, but primary succeeded
+          // This is non-critical - log and continue
+          console.warn('[PresetManager] Backup write failed, but primary succeeded:', backupErr);
+        }
+      }
+
+      // Step 5: Clean up temporary copy
+      try {
+        this.storage.removeItem(STORAGE_KEYS.working);
+      } catch (_) {
+        // Cleanup failure is non-critical
+      }
+
+      return true; // Success
+    } catch (err) {
+      console.error('[PresetManager] Persist failed:', err);
+      this._handleQuotaError(err);
+
+      // Try to clean up working copy
+      try {
+        this.storage.removeItem(STORAGE_KEYS.working);
+      } catch (_) {}
+
+      return false; // Failed
+    }
+  }
+
+  _handleQuotaError(err) {
+    if (err.name === 'QuotaExceededError') {
+      try {
+        showToast('Storage full! Cannot save preset. Free up space by deleting old presets.', 5000);
+      } catch (_) {
+        // Fallback if toast system unavailable
+        console.error('[PresetManager] CRITICAL: localStorage quota exceeded. User notification failed.');
+      }
     }
   }
 

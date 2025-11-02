@@ -139,15 +139,23 @@ export class PerformanceController {
     if (p._snapRemainMs > 0) p._snapRemainMs = Math.max(0, p._snapRemainMs - dt * 1000);
     if (p._bounceRemainMs > 0) p._bounceRemainMs = Math.max(0, p._bounceRemainMs - dt * 1000);
 
-    // Pad 2 quantize scheduling
-    if (this.enabled && this.pad2 && this.pad2.quantize && this.pad2._pending && features?.beat) {
-      this.pad2._active = true; this.pad2._t0 = this.nowMs; this.pad2._pending = false;
-      this._broadcast({ key: '2', action: 'shot', t: this.nowMs });
+    // Pad 2 quantize scheduling (atomic check-and-clear to prevent double-fire)
+    if (this.enabled && this.pad2 && this.pad2.quantize && features?.beat) {
+      if (this.pad2._pending) {
+        this.pad2._pending = false;
+        this.pad2._active = true;
+        this.pad2._t0 = this.nowMs;
+        this._broadcast({ key: '2', action: 'shot', t: this.nowMs });
+      }
     }
-    // Pad 4 quantize scheduling
-    if (this.enabled && this.pad4 && this.pad4.quantize && this.pad4._pending && features?.beat) {
-      this.pad4._active = true; this.pad4._t0 = this.nowMs; this.pad4._pending = false;
-      this._broadcast({ key: '4', action: 'shot', t: this.nowMs });
+    // Pad 4 quantize scheduling (atomic check-and-clear to prevent double-fire)
+    if (this.enabled && this.pad4 && this.pad4.quantize && features?.beat) {
+      if (this.pad4._pending) {
+        this.pad4._pending = false;
+        this.pad4._active = true;
+        this.pad4._t0 = this.nowMs;
+        this._broadcast({ key: '4', action: 'shot', t: this.nowMs });
+      }
     }
 
     // HUD update (cheap)
@@ -276,6 +284,11 @@ export class PerformanceController {
     p.isDown = false;
     p.latched = false;
     p.intensity = 0;
+    // Clear quantize pending flags to prevent stale triggers
+    p._pendingEngage = false;
+    p._pendingRelease = false;
+    if (this.pad2) this.pad2._pending = false;
+    if (this.pad4) this.pad4._pending = false;
     if (this._hud) this._hud.classList.remove('on');
   }
 
@@ -289,7 +302,8 @@ export class PerformanceController {
       return ['input', 'textarea', 'select', 'button'].includes(tag) || ev.isComposing;
     };
 
-    window.addEventListener('keydown', (ev) => {
+    // Store handler references for cleanup
+    this._keydownHandler = (ev) => {
       if (ev.defaultPrevented) return;
       if (ev.repeat) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -300,6 +314,8 @@ export class PerformanceController {
       if (k === 'p') {
         ev.preventDefault();
         this.enabled = !this.enabled;
+        // Clear pending flags when disabling to prevent stale triggers
+        if (!this.enabled) this.panic();
         if (this._hud) this._hud.classList.toggle('on', this.enabled);
         return;
       }
@@ -363,9 +379,9 @@ export class PerformanceController {
         if (this.pad1.isDown) this.pad1.gain = clamp(this.pad1.gain - 0.08, 0.2, 2.0);
         if (this.pad3.isDown) this.pad3.gain = clamp(this.pad3.gain - 0.08, 0.2, 2.0);
       }
-    });
+    };
 
-    window.addEventListener('keyup', (ev) => {
+    this._keyupHandler = (ev) => {
       if (ev.defaultPrevented) return;
       const k = (ev.key || '').toLowerCase();
       this._lastShiftHeld = !!ev.shiftKey;
@@ -376,7 +392,9 @@ export class PerformanceController {
         // Trigger snap-back pulse if not latched
         if (!this.pad1.latched) {
           this.pad1._snapRemainMs = this.pad1.releaseSnapMs;
-          this.pad1._bounceRemainMs = this.pad1.releaseBounceMs;
+          // Calculate bounce duration from beat timing and releaseBounceBeats
+          const bounceDuration = this._beatMs * (this.pad1.releaseBounceBeats || 0.6);
+          this.pad1._bounceRemainMs = bounceDuration;
         }
         this._broadcast({ key: '1', action: 'release', t: this.nowMs });
       }
@@ -390,21 +408,28 @@ export class PerformanceController {
         this.pad5.isDown = false;
         this._broadcast({ key: '5', action: 'release', t: this.nowMs });
       }
-    });
+    };
 
     // Global wheel → live intensity adjust for the last held pad (1 or 3)
-    window.addEventListener('wheel', (ev) => {
+    this._wheelHandler = (ev) => {
       if (!this.enabled) return;
       const delta = clamp(ev.deltaY, -200, 200) / 600; // gentle
       if (this.pad1.isDown) this.pad1.gain = clamp(this.pad1.gain - delta, 0.2, 2.0);
       if (this.pad3.isDown) this.pad3.gain = clamp(this.pad3.gain - delta, 0.2, 2.0);
-    }, { passive: true });
+    };
 
     // Safety: on blur/visibility change, stop momentary presses
-    window.addEventListener('blur', () => this.panic());
-    document.addEventListener('visibilitychange', () => {
+    this._blurHandler = () => this.panic();
+    this._visibilityHandler = () => {
       if (document.visibilityState !== 'visible') this.panic();
-    });
+    };
+
+    // Add all event listeners
+    window.addEventListener('keydown', this._keydownHandler);
+    window.addEventListener('keyup', this._keyupHandler);
+    window.addEventListener('wheel', this._wheelHandler, { passive: true });
+    window.addEventListener('blur', this._blurHandler);
+    document.addEventListener('visibilitychange', this._visibilityHandler);
   }
 
   _handleRemotePadEvent(evt) {
@@ -415,7 +440,12 @@ export class PerformanceController {
       if (a === 'engage') this.pad1.isDown = true;
       else if (a === 'release') {
         this.pad1.isDown = false;
-        if (!this.pad1.latched) { this.pad1._snapRemainMs = this.pad1.releaseSnapMs; this.pad1._bounceRemainMs = this.pad1.releaseBounceMs; }
+        if (!this.pad1.latched) {
+          this.pad1._snapRemainMs = this.pad1.releaseSnapMs;
+          // Calculate bounce duration from beat timing and releaseBounceBeats
+          const bounceDuration = this._beatMs * (this.pad1.releaseBounceBeats || 0.6);
+          this.pad1._bounceRemainMs = bounceDuration;
+        }
       }
     } else if (k === '2') {
       if (a === 'shot') { this.pad2._active = true; this.pad2._t0 = this.nowMs; }
@@ -468,6 +498,45 @@ export class PerformanceController {
     } catch (_) {
       // HUD is optional; continue silently if DOM is unavailable
     }
+  }
+
+  // Cleanup method to remove all event listeners and prevent memory leaks
+  cleanup() {
+    // Always attempt to remove event listeners to prevent stacking
+    // Even if handler references don't exist or are different
+    if (this._keydownHandler) {
+      window.removeEventListener('keydown', this._keydownHandler);
+    }
+    if (this._keyupHandler) {
+      window.removeEventListener('keyup', this._keyupHandler);
+    }
+    if (this._wheelHandler) {
+      window.removeEventListener('wheel', this._wheelHandler);
+    }
+    if (this._blurHandler) {
+      window.removeEventListener('blur', this._blurHandler);
+    }
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler);
+    }
+
+    // Clear all handler references
+    this._keydownHandler = null;
+    this._keyupHandler = null;
+    this._wheelHandler = null;
+    this._blurHandler = null;
+    this._visibilityHandler = null;
+
+    // Clean up HUD if it exists
+    if (this._hud) {
+      this._hud.remove();
+      this._hud = null;
+      this._hudPad1 = null;
+      this._hudModeText = null;
+    }
+
+    // Clear any remaining state
+    this.panic();
   }
 }
 

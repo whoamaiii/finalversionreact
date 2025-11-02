@@ -19,6 +19,19 @@
 const cache = new Map();
 
 /**
+ * Clear the module cache to free memory
+ * This should be called when modules are no longer needed
+ * @param {string} [key] - Optional specific module to clear, or clears all if not provided
+ */
+export function clearModuleCache(key) {
+  if (key) {
+    cache.delete(key);
+  } else {
+    cache.clear();
+  }
+}
+
+/**
  * Load a library exactly once, using a cache to avoid reloading.
  * 
  * This is like borrowing a book from a library - you only need to get it once,
@@ -33,7 +46,23 @@ function loadOnce(key, importer, transform = (value) => value) {
   // If we've already loaded this library, return the cached version
   if (!cache.has(key)) {
     // Load it and transform it, then store in cache
-    cache.set(key, importer().then(transform));
+    cache.set(key, importer()
+      .then(mod => {
+        // Wrap transform in try-catch for defensive error handling
+        try {
+          return transform(mod);
+        } catch (err) {
+          console.error(`[LazyLoader] Failed to transform module '${key}':`, err);
+          throw err;
+        }
+      })
+      .catch(err => {
+        // If loading or transformation fails, remove from cache so we can retry later
+        cache.delete(key);
+        console.error(`[LazyLoader] Failed to load/initialize module '${key}':`, err);
+        throw err; // Re-throw to propagate the error
+      })
+    );
   }
   // Return the cached promise (which might still be loading, or already resolved)
   return cache.get(key);

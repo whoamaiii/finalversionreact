@@ -21,8 +21,16 @@ function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function deepMerge(target, source) {
+function deepMerge(target, source, seen = new WeakSet()) {
   if (!source || typeof source !== 'object') return target;
+
+  // Detect circular references to prevent stack overflow
+  if (seen.has(source)) {
+    console.warn('[deepMerge] Circular reference detected, skipping');
+    return target;
+  }
+  seen.add(source);
+
   const keys = Object.keys(source);
   for (const key of keys) {
     const src = source[key];
@@ -30,7 +38,7 @@ function deepMerge(target, source) {
       target[key] = src.slice();
     } else if (src && typeof src === 'object') {
       if (!target[key] || typeof target[key] !== 'object') target[key] = {};
-      deepMerge(target[key], src);
+      deepMerge(target[key], src, seen);
     } else {
       target[key] = src;
     }
@@ -226,11 +234,27 @@ export class SyncCoordinator {
 
     this._lastAppliedParams = null;
 
+    // Store timer IDs for cleanup
+    this._helloTimerId = null;
+
     this._initTransports();
-    setTimeout(() => this._sendHello(), 60);
+
+    // Clear any existing hello timer before setting new one (prevents overlap)
+    if (this._helloTimerId) {
+      clearTimeout(this._helloTimerId);
+    }
+    this._helloTimerId = setTimeout(() => this._sendHello(), 60);
   }
 
   _initTransports() {
+    // Close existing BroadcastChannel if present
+    if (this.channel) {
+      try {
+        this.channel.close();
+      } catch (_) {}
+      this.channel = null;
+    }
+
     if (typeof BroadcastChannel === 'function') {
       try {
         this.channel = new BroadcastChannel(CHANNEL_NAME);
@@ -240,11 +264,21 @@ export class SyncCoordinator {
         this.channel = null;
       }
     }
+
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      window.addEventListener('message', (event) => {
+      // Remove old handlers to prevent accumulation on re-initialization
+      if (this._messageHandler) {
+        window.removeEventListener('message', this._messageHandler);
+      }
+      if (this._storageHandler) {
+        window.removeEventListener('storage', this._storageHandler);
+      }
+
+      // Store handler references for cleanup
+      this._messageHandler = (event) => {
         this._handleMessage(event?.data, 'postMessage', event.source || null);
-      });
-      window.addEventListener('storage', (event) => {
+      };
+      this._storageHandler = (event) => {
         if (event.key !== STORAGE_KEY || !event.newValue) return;
         try {
           const parsed = JSON.parse(event.newValue);
@@ -252,7 +286,10 @@ export class SyncCoordinator {
         } catch (_) {
           // ignore
         }
-      });
+      };
+
+      window.addEventListener('message', this._messageHandler);
+      window.addEventListener('storage', this._storageHandler);
     }
     if (this.role === 'receiver' && typeof window !== 'undefined') {
       if (window.opener && !window.opener.closed) this.controlWindow = window.opener;
@@ -305,8 +342,13 @@ export class SyncCoordinator {
 
     if (type === 'paramsSnapshot') {
       if (this.role === 'receiver') {
-        applySceneSnapshot(this.sceneApi, payload.params);
-        this._lastAppliedParams = payload.params;
+        // Validate that params is an object before applying
+        if (payload.params && typeof payload.params === 'object' && !Array.isArray(payload.params)) {
+          applySceneSnapshot(this.sceneApi, payload.params);
+          this._lastAppliedParams = payload.params;
+        } else {
+          console.warn('Invalid params in paramsSnapshot message:', payload);
+        }
       }
       return;
     }
@@ -406,7 +448,12 @@ export class SyncCoordinator {
     if (this.projectorWindow && !this.projectorWindow.closed) directTargets.push(this.projectorWindow);
     if (this.controlWindow && !this.controlWindow.closed) directTargets.push(this.controlWindow);
     if (typeof window !== 'undefined' && window.opener && this.role === 'control') {
-      if (!directTargets.includes(window.opener) && !window.opener.closed) directTargets.push(window.opener);
+      try {
+        const opener = window.opener;
+        if (opener && !directTargets.includes(opener) && !opener.closed) directTargets.push(opener);
+      } catch (_) {
+        // Cross-origin or inaccessible window.opener
+      }
     }
     for (const win of directTargets) {
       try { win.postMessage(message, '*'); } catch (_) {}
@@ -416,7 +463,22 @@ export class SyncCoordinator {
       try {
         const payloadWithNonce = { ...message, nonce: Math.random().toString(36).slice(2) };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payloadWithNonce));
-      } catch (_) {}
+      } catch (err) {
+        // Log quota errors but don't disrupt sync operations
+        if (err.name === 'QuotaExceededError') {
+          console.warn('[SyncCoordinator] localStorage quota exceeded, sync message dropped');
+          // Show warning toast once per session
+          if (!this._quotaWarningShown) {
+            this._quotaWarningShown = true;
+            try {
+              // Import showToast dynamically to avoid circular dependency
+              import('./toast.js').then(({ showToast }) => {
+                showToast('Storage full! Multi-window sync may be affected.', 4000);
+              }).catch(() => {});
+            } catch (_) {}
+          }
+        }
+      }
     }
   }
 
@@ -476,8 +538,9 @@ export class SyncCoordinator {
       this._setConnected(false);
     }
 
-    if (now - this._lastHeartbeatSent > HEARTBEAT_INTERVAL_MS) {
-      this._lastHeartbeatSent = now;
+    // Use consistent wall clock time for heartbeat send timing
+    if (wallNow - this._lastHeartbeatSent > HEARTBEAT_INTERVAL_MS) {
+      this._lastHeartbeatSent = wallNow;
       const target = this.role === 'control' ? 'receiver' : 'control';
       this._sendMessage('heartbeat', {}, { target });
     }
@@ -512,7 +575,11 @@ export class SyncCoordinator {
     url.searchParams.set('from', 'control');
     const win = window.open(url.toString(), 'reactive-projector', 'popup=1,width=1600,height=900,noopener=yes');
     if (win) this.projectorWindow = win;
-    setTimeout(() => this._sendHello(), 120);
+    // Clear any existing hello timer and set a new one
+    if (this._helloTimerId) {
+      clearTimeout(this._helloTimerId);
+    }
+    this._helloTimerId = setTimeout(() => this._sendHello(), 120);
     return win;
   }
 
@@ -530,5 +597,40 @@ export class SyncCoordinator {
     if (!event) return;
     const target = this.role === 'control' ? 'receiver' : 'control';
     this._sendMessage('padEvent', { event }, { target });
+  }
+
+  // Cleanup method to remove all event listeners and prevent memory leaks
+  cleanup() {
+    // Clear any pending timers
+    if (this._helloTimerId) {
+      clearTimeout(this._helloTimerId);
+      this._helloTimerId = null;
+    }
+
+    // Remove event listeners if they exist
+    if (this._messageHandler) {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('message', this._messageHandler);
+      }
+      this._messageHandler = null;
+    }
+    if (this._storageHandler) {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('storage', this._storageHandler);
+      }
+      this._storageHandler = null;
+    }
+
+    // Close BroadcastChannel if it exists
+    if (this.channel) {
+      this.channel.onmessage = null;
+      this.channel.close();
+      this.channel = null;
+    }
+
+    // Clear any references
+    this.projectorWindow = null;
+    this.controlWindow = null;
+    this._statusListeners.clear();
   }
 }

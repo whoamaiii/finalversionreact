@@ -53,6 +53,32 @@ function ensureToastEl() {
  * @param {string} message - The text to display in the toast
  * @param {number} [durationMs=3000] - How long to show the message in milliseconds (default: 3000 = 3 seconds)
  */
+/**
+ * Clean up the toast element and timer to prevent memory leaks
+ * This should be called when the app is shutting down
+ */
+export function cleanupToast() {
+  // Clear any existing timer
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+
+  // Clear legacy timer
+  if (typeof window !== 'undefined' && window.__toastTimer) {
+    clearTimeout(window.__toastTimer);
+    window.__toastTimer = null;
+  }
+
+  // Remove the toast element from DOM
+  try {
+    const el = document.getElementById('toast');
+    if (el && el.parentNode) {
+      el.parentNode.removeChild(el);
+    }
+  } catch (_) {}
+}
+
 export function showToast(message, durationMs = 3000) {
   // Get the toast element (create it if needed)
   const el = ensureToastEl();
@@ -67,11 +93,10 @@ export function showToast(message, durationMs = 3000) {
   try { el.classList.add('visible'); } catch(_) {}
   
   // Cancel any existing timer so multiple toasts don't overlap
-  try {
+  if (toastTimer) {
     clearTimeout(toastTimer);
-    // Also check for legacy timer (in case old code is still using it)
-    if (typeof window !== 'undefined') clearTimeout(window.__toastTimer);
-  } catch(_) {}
+    toastTimer = null;
+  }
   
   // Calculate how long to show the message
   // Make sure it's a valid number, and default to 3000ms (3 seconds) if not

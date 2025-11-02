@@ -22,13 +22,14 @@
 // Import all the major components we need
 import { initScene } from './scene.js';           // 3D scene and rendering
 import { AudioEngine } from './audio.js';          // Audio analysis and processing
-import { initSettingsUI } from './settings-ui.js'; // Settings panel UI
+import { initSettingsUI, cleanupSettingsUI } from './settings-ui.js'; // Settings panel UI
 import { SyncCoordinator } from './sync.js';      // Multi-window synchronization
 import { printFeatureMatrix } from './feature.js'; // Browser capability detection
-import { showToast } from './toast.js';           // Temporary notification messages
+import { showToast, cleanupToast } from './toast.js';           // Temporary notification messages
 import { PresetManager } from './preset-manager.js';
 import { openPresetLibraryWindow } from './preset-library-window.js';
 import { PerformanceController } from './performance-pads.js';
+import { LaunchpadMIDI } from './midi-launchpad.js';
 
 // Debug mode: print browser feature support matrix when ?debug is in the URL
 // This helps developers understand what capabilities are available
@@ -72,13 +73,39 @@ let performancePads;
 try {
   performancePads = new PerformanceController({ sceneApi, sync });
   // Provide a per-frame deltas getter to the scene so it can blend with audio baseline
-  sceneApi.setUniformDeltasProvider(() => performancePads.getDeltas());
+  // (Provider is finalized below after MIDI creation to merge deltas)
 } catch (_) {
   performancePads = { update: () => {}, getDeltas: () => null };
 }
 
+// Launchpad MIDI (optional)
+let midi = null;
+try {
+  midi = new LaunchpadMIDI({ pads: performancePads, sceneApi, sync });
+} catch (_) {
+  midi = null;
+}
 
-window.addEventListener('keydown', (event) => {
+// Merge deltas from performance pads and MIDI shots
+sceneApi.setUniformDeltasProvider(() => {
+  let a = null;
+  try { a = performancePads.getDeltas?.() || null; } catch (err) {
+    console.warn('Performance pads getDeltas error:', err);
+  }
+  let b = null;
+  try { b = midi?.getDeltas?.() || null; } catch (err) {
+    console.warn('MIDI controller getDeltas error:', err);
+  }
+  if (!a && !b) return null;
+  if (a && !b) return a;
+  if (!a && b) return b;
+  const out = { ...a };
+  for (const k of Object.keys(b)) out[k] = (out[k] || 0) + b[k];
+  return out;
+});
+
+// Named event handler for preset library shortcut
+function handlePresetLibraryShortcut(event) {
   if (event.defaultPrevented) return;
   if (event.repeat) return;
   const key = event.key || '';
@@ -88,7 +115,9 @@ window.addEventListener('keydown', (event) => {
   if (['input', 'textarea', 'select', 'button'].includes(tag)) return;
   event.preventDefault();
   openPresetLibrary();
-});
+}
+
+window.addEventListener('keydown', handlePresetLibraryShortcut);
 
 // Initialize the settings UI
 // This creates the settings panel that slides in from the right side
@@ -101,6 +130,7 @@ try {
     syncCoordinator: sync, // Pass sync coordinator so UI can control synchronization
     presetManager,
     openPresetLibrary,
+    midiApi: midi,
     
     // Callback: User clicked "Start System Audio" button
     // This attempts to capture system audio (what's playing on the computer)
@@ -208,8 +238,34 @@ let featureWsBackoffMs = 2500;           // Delay before retrying (exponential b
 const FEATURE_WS_URL = 'ws://127.0.0.1:8090'; // WebSocket server URL (OSC bridge)
 
 /**
+ * Closes the WebSocket connection and cleans up event handlers.
+ * This prevents memory leaks when connections are recreated.
+ */
+function closeFeatureWs() {
+  if (featureWs) {
+    // Remove event handlers to prevent memory leaks
+    featureWs.onopen = null;
+    featureWs.onclose = null;
+    featureWs.onerror = null;
+    featureWs.onmessage = null;
+
+    // Close the connection if it's open
+    try {
+      if (featureWs.readyState === WebSocket.OPEN || featureWs.readyState === WebSocket.CONNECTING) {
+        featureWs.close();
+      }
+    } catch (_) {}
+
+    // Reset state
+    featureWs = null;
+    featureWsConnected = false;
+    featureWsConnecting = false;
+  }
+}
+
+/**
  * Ensures the WebSocket connection is established.
- * 
+ *
  * This function tries to connect to the OSC bridge if we're not already connected
  * or connecting. It uses exponential backoff to avoid spamming connection attempts.
  *
@@ -218,13 +274,16 @@ const FEATURE_WS_URL = 'ws://127.0.0.1:8090'; // WebSocket server URL (OSC bridg
 function ensureFeatureWs(nowMs) {
   // Don't try if already connected or currently connecting
   if (featureWsConnected || featureWsConnecting) return;
-  
+
   // Rate limit: don't try too often (respect backoff delay)
   if (nowMs && nowMs - featureWsLastAttemptMs < featureWsBackoffMs) return;
 
-  // Record this attempt (use proper type check to handle 0 as valid timestamp)
-  featureWsLastAttemptMs = typeof nowMs === 'number' ? nowMs : performance.now();
-  
+  // Clean up any existing connection before creating new one
+  closeFeatureWs();
+
+  // Record this attempt
+  featureWsLastAttemptMs = nowMs || performance.now();
+
   try {
     featureWsConnecting = true;
     // Create new WebSocket connection
@@ -232,25 +291,29 @@ function ensureFeatureWs(nowMs) {
     
     // Connection opened successfully
     ws.onopen = () => {
-      featureWsConnected = true;
-      featureWsConnecting = false;
-      featureWsLastSendMs = 0; // Reset send timer
-      featureWsBackoffMs = 2500; // Reset backoff on success
+      // Only update state if this is still the current WebSocket
+      if (ws === featureWs) {
+        featureWsConnected = true;
+        featureWsConnecting = false;
+        featureWsLastSendMs = 0; // Reset send timer
+        featureWsBackoffMs = 2500; // Reset backoff on success
+      }
     };
-    
+
     // Connection closed (will retry with backoff)
     ws.onclose = () => {
-      featureWsConnected = false;
-      featureWsConnecting = false;
-      featureWs = null;
-      // Increase backoff delay (exponential backoff, capped at 20 seconds)
-      featureWsBackoffMs = Math.min(20000, Math.max(2500, featureWsBackoffMs * 1.6));
+      // Only update state if this is still the current WebSocket
+      if (ws === featureWs) {
+        featureWsConnected = false;
+        featureWsConnecting = false;
+        featureWs = null;
+        // Increase backoff delay (exponential backoff, capped at 20 seconds)
+        featureWsBackoffMs = Math.min(20000, Math.max(2500, featureWsBackoffMs * 1.6));
+      }
     };
-    
-    // Connection error - close it cleanly and reset state
+
+    // Connection error - close it cleanly
     ws.onerror = () => {
-      featureWsConnected = false;
-      featureWsConnecting = false;
       try { ws.close(); } catch(_) {}
     };
     
@@ -273,15 +336,21 @@ function ensureFeatureWs(nowMs) {
  * @param {number} nowMs - Current timestamp (for rate limiting)
  */
 function sendFeaturesOverWs(features, nowMs) {
-  // Don't send if not connected or no WebSocket
-  if (!featureWsConnected || !featureWs) return;
+  // Don't send if not connected or no WebSocket, check readyState to prevent race condition
+  if (!featureWsConnected || !featureWs || featureWs.readyState !== WebSocket.OPEN) return;
   if (!features) return;
-  
+
   // Rate limit: only send ~30 times per second (once every 33ms)
   if (nowMs - featureWsLastSendMs < 33) return;
   featureWsLastSendMs = nowMs;
-  
+
   try {
+    // Double-check readyState before sending
+    if (featureWs.readyState !== WebSocket.OPEN) {
+      featureWsConnected = false;
+      return;
+    }
+
     // Package up all the features we want to send
     const payload = {
       rms: features.rms,                    // Root mean square (overall volume)
@@ -323,11 +392,26 @@ function sendFeaturesOverWs(features, nowMs) {
 // Window Event Handlers
 // =====================
 
+// Store references to event handlers for cleanup
+const eventHandlers = {
+  resize: sceneApi.onResize,
+  mousemove: sceneApi.onMouseMove,
+  focus: null,        // Will be set below
+  pointerdown: null,  // Will be set below
+  dragenter: null,    // Will be set below
+  dragover: null,     // Will be set below
+  dragleave: null,    // Will be set below
+  drop: null,         // Will be set below
+  visibilitychange: null, // Will be set below
+  beforeunload: null,     // Will be set below
+  systemAudioHelp: null   // Will be set below
+};
+
 // Handle window resize - update the 3D scene to match new window size
-window.addEventListener('resize', sceneApi.onResize);
+window.addEventListener('resize', eventHandlers.resize);
 
 // Handle mouse movement - update camera/interaction based on mouse position
-window.addEventListener('mousemove', sceneApi.onMouseMove);
+window.addEventListener('mousemove', eventHandlers.mousemove);
 
 // Pause/Resume Management
 // ======================
@@ -336,35 +420,88 @@ window.addEventListener('mousemove', sceneApi.onMouseMove);
 
 let isPaused = false; // Track if we're currently paused
 
-// Listen for visibility changes (tab hidden/shown)
-document.addEventListener('visibilitychange', async () => {
+// Named handler for visibility changes (tab hidden/shown)
+async function handleVisibilityChange() {
   if (document.visibilityState === 'hidden') {
     // Tab was hidden - pause everything
     isPaused = true;
     lastTime = performance.now(); // Reset time tracking
-    try { await audio.ctx?.suspend?.(); } catch (_) {} // Suspend audio context
+    try { await audio.ctx?.suspend?.(); } catch (err) {
+      console.warn('Failed to suspend audio context:', err);
+    } // Suspend audio context
   } else {
     // Tab became visible - resume everything
     isPaused = false;
     lastTime = performance.now(); // Reset time tracking
-    try { await audio.ctx?.resume?.(); } catch (_) {} // Resume audio context
+    try { await audio.ctx?.resume?.(); } catch (err) {
+      console.warn('Failed to resume audio context:', err);
+    } // Resume audio context
   }
-});
+}
+
+// Store handler reference for cleanup
+eventHandlers.visibilitychange = handleVisibilityChange;
+
+// Listen for visibility changes (tab hidden/shown)
+document.addEventListener('visibilitychange', eventHandlers.visibilitychange);
 
 // Resume Watchdog
 // ===============
 // Some browsers (especially Safari) can suspend the audio context unexpectedly.
 // These event handlers aggressively resume it when the user interacts with the page.
 
+// Track consecutive resume failures to notify user of persistent issues
+let _audioResumeFailureCount = 0;
+let _lastAudioResumeNotification = 0;
+const AUDIO_RESUME_NOTIFICATION_THRESHOLD = 3;
+const AUDIO_RESUME_NOTIFICATION_COOLDOWN_MS = 30000; // 30 seconds
+
+function handleAudioResumeError(err, context) {
+  console.warn(`Failed to resume audio on ${context}:`, err);
+  _audioResumeFailureCount++;
+
+  // Notify user after threshold of consecutive failures
+  const now = performance.now();
+  if (_audioResumeFailureCount >= AUDIO_RESUME_NOTIFICATION_THRESHOLD &&
+      now - _lastAudioResumeNotification > AUDIO_RESUME_NOTIFICATION_COOLDOWN_MS) {
+    try {
+      showToast('Audio playback blocked. Check browser permissions or click the audio unlock button.', 5000);
+      _lastAudioResumeNotification = now;
+      _audioResumeFailureCount = 0; // Reset after notifying
+    } catch (_) {
+      // Toast unavailable, user will see console warnings
+    }
+  }
+}
+
 // Resume on window focus (user clicks back into the tab)
-window.addEventListener('focus', async () => {
-  try { await audio.ctx?.resume?.(); } catch (_) {}
-});
+eventHandlers.focus = async () => {
+  try {
+    await audio.ctx?.resume?.();
+    _audioResumeFailureCount = 0; // Reset on success
+  } catch (err) {
+    handleAudioResumeError(err, 'focus');
+  }
+};
+window.addEventListener('focus', eventHandlers.focus);
 
 // Resume on pointer down (user clicks/taps anywhere)
-window.addEventListener('pointerdown', async () => {
-  try { await audio.ctx?.resume?.(); } catch (_) {}
-});
+eventHandlers.pointerdown = async () => {
+  try {
+    await audio.ctx?.resume?.();
+    _audioResumeFailureCount = 0; // Reset on success
+  } catch (err) {
+    handleAudioResumeError(err, 'pointer down');
+  }
+};
+window.addEventListener('pointerdown', eventHandlers.pointerdown);
+
+// Cleanup on page unload to prevent memory leaks
+eventHandlers.beforeunload = () => {
+  // Call the comprehensive cleanup function
+  stopAnimation();
+};
+window.addEventListener('beforeunload', eventHandlers.beforeunload);
 
 // Main Animation Loop
 // ===================
@@ -385,10 +522,11 @@ let autoLast = performance.now(); // Last auto-resolution check time
 
 // Resume watchdog tracking
 let resumeWatchLastAttempt = 0; // Last time we tried to resume audio context
+let animationFrameId = null; // Store RAF ID for proper cleanup
 
 /**
  * Main animation loop function.
- * 
+ *
  * This function runs continuously, updating:
  * - Audio analysis (extracting features from audio)
  * - 3D scene (animating visuals based on audio features)
@@ -399,7 +537,7 @@ let resumeWatchLastAttempt = 0; // Last time we tried to resume audio context
  */
 function animate() {
   // Schedule the next frame (this creates the loop)
-  requestAnimationFrame(animate);
+  animationFrameId = requestAnimationFrame(animate);
   
   const now = performance.now();
   
@@ -408,6 +546,9 @@ function animate() {
     lastTime = now;
     fpsLast = now;
     autoLast = now;
+    // Reset auto-resolution counters to prevent calculation errors on resume
+    autoFrames = 0;
+    autoElapsedMs = 0;
     return;
   }
   
@@ -416,7 +557,9 @@ function animate() {
   if (document.visibilityState === 'visible' && audio.ctx && audio.ctx.state === 'suspended') {
     if (now - resumeWatchLastAttempt > 400) {
       resumeWatchLastAttempt = now;
-      try { audio.ctx.resume(); } catch (_) {}
+      try { audio.ctx.resume(); } catch (err) {
+        console.warn('Failed to resume audio context in watchdog:', err);
+      }
     }
   }
   
@@ -429,9 +572,13 @@ function animate() {
   let features = audio.update();
   if (!features) {
     // Receiver windows can render using remote features from sync
-    try { features = sync.getRemoteFeatures(now); } catch (_) {}
+    try { features = sync.getRemoteFeatures(now); } catch (err) {
+      console.warn('Failed to get remote features:', err);
+    }
   }
-  try { performancePads.update(dt, now, features); } catch (_) {}
+  try { performancePads.update(dt, now, features); } catch (err) {
+    console.warn('Performance pads update error:', err);
+  }
   
   // Update 3D scene with audio features
   // This animates the particles and visuals based on the audio
@@ -458,7 +605,13 @@ function animate() {
   // Defensive safety check: ensure core visuals exist
   // If something failed earlier, try to rebuild particles
   if (!sceneApi.state.coreSphere || !sceneApi.state.orbitRings) {
-    try { sceneApi.rebuildParticles(); } catch(_) {}
+    try {
+      console.warn('[Scene Recovery] Core visuals missing, attempting rebuild...');
+      sceneApi.rebuildParticles();
+      console.log('[Scene Recovery] Particle rebuild successful');
+    } catch(err) {
+      console.error('[Scene Recovery] Failed to rebuild particles:', err);
+    }
   }
   
   // Update UI Labels
@@ -528,38 +681,164 @@ function animate() {
     autoLast = now;
     
     // Check every ~3 seconds
-    if (autoElapsedMs > 3000) {
-      // Estimate current FPS
+    if (autoElapsedMs > 3000 && autoFrames > 0) {
+      // Estimate current FPS (guard against division by zero or very small values)
+      // Require at least 100ms of elapsed time to avoid unstable calculations
+      const MIN_ELAPSED_MS = 100;
+      if (autoElapsedMs < MIN_ELAPSED_MS) {
+        // Not enough time elapsed, skip this adjustment cycle
+        autoFrames = 0;
+        autoElapsedMs = 0;
+        return;
+      }
+
       const fpsApprox = (autoFrames * 1000) / autoElapsedMs;
-      const target = sceneApi.state.params.targetFps || 60; // Target FPS (default 60)
-      const currentPR = sceneApi.getPixelRatio(); // Current pixel ratio (quality)
-      const desiredMaxPR = sceneApi.state.params.pixelRatioCap; // Maximum allowed quality
-      
-      let newPR = currentPR; // Start with current value
-      
-      // If FPS is too low, reduce quality (lower pixel ratio)
-      if (fpsApprox < target - 8) {
-        newPR = Math.max(sceneApi.state.params.minPixelRatio, currentPR - 0.05);
+
+      // Validate FPS calculation is finite and reasonable before using it
+      if (Number.isFinite(fpsApprox) && fpsApprox > 0 && fpsApprox < 1000) {
+        const target = sceneApi.state.params.targetFps || 60; // Target FPS (default 60)
+        const currentPR = sceneApi.getPixelRatio(); // Current pixel ratio (quality)
+        const desiredMaxPR = sceneApi.state.params.pixelRatioCap; // Maximum allowed quality
+
+        let newPR = currentPR; // Start with current value
+
+        // If FPS is too low, reduce quality (lower pixel ratio)
+        if (fpsApprox < target - 8) {
+          newPR = Math.max(sceneApi.state.params.minPixelRatio, currentPR - 0.05);
+        }
+        // If FPS is too high, increase quality (asymmetric hysteresis prevents oscillation)
+        else if (fpsApprox > target + 12) {
+          newPR = Math.min(desiredMaxPR, currentPR + 0.05);
+        }
+
+        // Only update if change is significant (avoids tiny adjustments)
+        // Validate newPR is finite before using it
+        if (Number.isFinite(newPR) && Math.abs(newPR - currentPR) > 0.01) {
+          const clampedPR = parseFloat(newPR.toFixed(2));
+          // Double-check the result is valid
+          if (Number.isFinite(clampedPR)) {
+            sceneApi.setPixelRatioCap(clampedPR);
+          }
+        }
       }
-      // If FPS is too high, increase quality (higher pixel ratio)
-      else if (fpsApprox > target + 8) {
-        newPR = Math.min(desiredMaxPR, currentPR + 0.05);
-      }
-      
-      // Only update if change is significant (avoids tiny adjustments)
-      if (Math.abs(newPR - currentPR) > 0.01) {
-        sceneApi.setPixelRatioCap(parseFloat(newPR.toFixed(2)));
-      }
-      
-      // Reset counters
+
+      // Reset counters (always reset even if calculation failed)
       autoFrames = 0;
       autoElapsedMs = 0;
     }
   }
 }
 
+// Animation control functions
+function startAnimation() {
+  if (!animationFrameId) {
+    animate();
+  }
+}
+
+/**
+ * Removes all event listeners to prevent memory leaks
+ */
+function removeAllEventListeners() {
+  // Remove window event listeners
+  if (eventHandlers.resize) window.removeEventListener('resize', eventHandlers.resize);
+  if (eventHandlers.mousemove) window.removeEventListener('mousemove', eventHandlers.mousemove);
+  if (eventHandlers.focus) window.removeEventListener('focus', eventHandlers.focus);
+  if (eventHandlers.pointerdown) window.removeEventListener('pointerdown', eventHandlers.pointerdown);
+  if (eventHandlers.beforeunload) window.removeEventListener('beforeunload', eventHandlers.beforeunload);
+  if (eventHandlers.dragenter) window.removeEventListener('dragenter', eventHandlers.dragenter);
+  if (eventHandlers.dragover) window.removeEventListener('dragover', eventHandlers.dragover);
+  if (eventHandlers.dragleave) window.removeEventListener('dragleave', eventHandlers.dragleave);
+  if (eventHandlers.drop) window.removeEventListener('drop', eventHandlers.drop);
+
+  // Remove document event listeners
+  if (eventHandlers.visibilitychange) document.removeEventListener('visibilitychange', eventHandlers.visibilitychange);
+
+  // Remove button event listener
+  const helpButton = document.getElementById('open-system-audio-help');
+  if (helpButton && eventHandlers.systemAudioHelp) {
+    helpButton.removeEventListener('click', eventHandlers.systemAudioHelp);
+  }
+}
+
+function stopAnimation() {
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
+
+  // Clean up WebSocket connection
+  closeFeatureWs();
+
+  // Clean up sync coordinator
+  if (sync && typeof sync.cleanup === 'function') {
+    try {
+      sync.cleanup();
+    } catch (err) {
+      console.warn('Error cleaning up sync coordinator:', err);
+    }
+  }
+
+  // Clean up performance pads
+  if (performancePads && typeof performancePads.cleanup === 'function') {
+    try {
+      performancePads.cleanup();
+    } catch (err) {
+      console.warn('Error cleaning up performance pads:', err);
+    }
+  }
+
+  // Clean up MIDI controller
+  if (midi && typeof midi.disconnect === 'function') {
+    try {
+      midi.disconnect();
+    } catch (err) {
+      console.warn('Error cleaning up MIDI controller:', err);
+    }
+  }
+
+  // Clean up audio engine
+  if (audio && typeof audio.dispose === 'function') {
+    try {
+      audio.dispose();
+    } catch (err) {
+      console.warn('Error disposing audio engine:', err);
+    }
+  }
+
+  // Clean up Three.js scene and WebGL resources
+  if (sceneApi && typeof sceneApi.dispose === 'function') {
+    try {
+      sceneApi.dispose();
+    } catch (err) {
+      console.warn('Error disposing scene resources:', err);
+    }
+  }
+
+  // Clean up toast notifications
+  try {
+    cleanupToast();
+  } catch (err) {
+    console.warn('Error cleaning up toast:', err);
+  }
+
+  // Clean up settings UI event listeners
+  try {
+    cleanupSettingsUI();
+  } catch (err) {
+    console.warn('Error cleaning up settings UI:', err);
+  }
+
+  // Remove all event listeners
+  removeAllEventListeners();
+}
+
+// Export for external control if needed
+window.stopAnimation = stopAnimation;
+window.startAnimation = startAnimation;
+
 // Start the animation loop
-animate();
+startAnimation();
 
 // Drag-and-Drop File Loading
 // ===========================
@@ -567,27 +846,21 @@ animate();
 
 const dropOverlay = document.getElementById('drop-overlay');
 
-// Show overlay when dragging files over the window
-['dragenter', 'dragover'].forEach(evt => {
-  window.addEventListener(evt, (e) => {
-    e.preventDefault(); // Prevent default browser behavior
-    if (dropOverlay) dropOverlay.classList.add('active'); // Show overlay
-  });
-});
+// Named handlers for drag and drop
+function handleDragEnterOver(e) {
+  e.preventDefault(); // Prevent default browser behavior
+  if (dropOverlay) dropOverlay.classList.add('active'); // Show overlay
+}
 
-// Hide overlay when dragging leaves or file is dropped
-['dragleave', 'drop'].forEach(evt => {
-  window.addEventListener(evt, (e) => {
-    e.preventDefault(); // Prevent default browser behavior
-    if (dropOverlay) dropOverlay.classList.remove('active'); // Hide overlay
-  });
-});
+function handleDragLeaveOrDrop(e) {
+  e.preventDefault(); // Prevent default browser behavior
+  if (dropOverlay) dropOverlay.classList.remove('active'); // Hide overlay
+}
 
-// Handle file drop
-window.addEventListener('drop', async (e) => {
+async function handleFileDrop(e) {
   e.preventDefault();
   const file = e.dataTransfer?.files?.[0]; // Get first dropped file
-  
+
   // Only process audio files
   if (file && file.type.startsWith('audio/')) {
     try {
@@ -597,21 +870,40 @@ window.addEventListener('drop', async (e) => {
       try { showToast('Audio file load failed.', 2600); } catch(_) {}
     }
   }
-});
+}
+
+// Store drag-and-drop handlers
+eventHandlers.dragenter = handleDragEnterOver;
+eventHandlers.dragover = handleDragEnterOver;
+eventHandlers.dragleave = handleDragLeaveOrDrop;
+eventHandlers.drop = handleFileDrop;
+
+// Show overlay when dragging files over the window
+window.addEventListener('dragenter', eventHandlers.dragenter);
+window.addEventListener('dragover', eventHandlers.dragover);
+
+// Hide overlay when dragging leaves
+window.addEventListener('dragleave', eventHandlers.dragleave);
+
+// Handle file drop
+window.addEventListener('drop', eventHandlers.drop);
 
 // System Audio Help Button
 // ========================
 // Shows helpful instructions for capturing system audio on different platforms
 
-document.getElementById('open-system-audio-help')?.addEventListener('click', () => {
+// System audio help button handler
+eventHandlers.systemAudioHelp = () => {
   // Detect if we're on macOS
   const isMac = /Mac/i.test(navigator.userAgent || '') || /Mac/i.test(navigator.platform || '');
-  
+
   // Show platform-specific instructions
   const msg = isMac
     ? 'macOS: For one tab, click "Tab (Chrome)" then enable "Share tab audio".\n\nFor full system audio: Install BlackHole 2ch → in Audio MIDI Setup make a Multi-Output (BlackHole + your speakers) → set Mac Output to that device → in the app pick Mic → BlackHole.\n\nIf capture fails, allow Chrome in System Settings → Privacy & Security → Screen Recording.'
     : 'Click System, then select a tab/window with audio and enable audio sharing. If capture is blocked, allow screen recording permissions for your browser.';
-  
+
   // Try to show as toast, fall back to alert if toast fails
   try { showToast(msg, 5200); } catch (_) { alert(msg); }
-});
+};
+
+document.getElementById('open-system-audio-help')?.addEventListener('click', eventHandlers.systemAudioHelp);

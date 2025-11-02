@@ -46,17 +46,52 @@ export class PresetLibraryWindow {
     this.elements = {};
   }
 
-  open() {
-    if (!this.manager) throw new Error('Preset manager required');
-    if (this.win && !this.win.closed) {
-      this.win.focus();
-      this.render();
-      return;
+  _cleanup() {
+    // Centralized cleanup to prevent race conditions
+    // Remove event listeners first
+    if (this.win && this._beforeUnloadHandler) {
+      try {
+        this.win.removeEventListener('beforeunload', this._beforeUnloadHandler);
+      } catch (err) {
+        // Window may be inaccessible, ignore
+      }
     }
+    this._beforeUnloadHandler = null;
+
+    // Detach manager event listener
     if (typeof this.detach === 'function') {
       this.detach();
       this.detach = null;
     }
+
+    // Clear window reference
+    this.win = null;
+
+    // Clear singleton instance
+    if (openPresetLibraryWindow._instance === this) {
+      openPresetLibraryWindow._instance = null;
+    }
+  }
+
+  open() {
+    if (!this.manager) throw new Error('Preset manager required');
+
+    // Check if window exists and is open (with exception handling for cross-origin/closing states)
+    if (this.win) {
+      try {
+        if (!this.win.closed) {
+          this.win.focus();
+          this.render();
+          return;
+        }
+      } catch (err) {
+        // Window became inaccessible or is closing, clean up
+        console.warn('[PresetLibrary] Window access error:', err);
+      }
+      // Window is closed or inaccessible, clean up before opening new one
+      this._cleanup();
+    }
+
     this.win = window.open('', 'PresetLibrary', WINDOW_FEATURES);
     if (!this.win) {
       throw new Error('Preset library popup blocked');
@@ -64,16 +99,29 @@ export class PresetLibraryWindow {
     this._mount();
     this.render();
     this.detach = this.manager.on('*', () => this.render());
-    this.win.addEventListener('beforeunload', () => {
-      if (typeof this.detach === 'function') this.detach();
-      this.detach = null;
-      this.win = null;
+
+    // Store the beforeunload handler for proper cleanup
+    this._beforeUnloadHandler = () => {
+      this._cleanup();
       if (typeof this.onClose === 'function') this.onClose();
-    });
+    };
+
+    this.win.addEventListener('beforeunload', this._beforeUnloadHandler);
   }
 
   close() {
-    if (this.win && !this.win.closed) this.win.close();
+    // Close window (cleanup will happen via beforeunload handler)
+    if (this.win) {
+      try {
+        if (!this.win.closed) {
+          this.win.close();
+        }
+      } catch (err) {
+        // Window may be inaccessible, force cleanup
+        console.warn('[PresetLibrary] Error closing window:', err);
+        this._cleanup();
+      }
+    }
   }
 
   _mount() {

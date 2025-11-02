@@ -75,6 +75,16 @@ export function capturePresetSnapshot({ sceneApi, audioEngine }) {
   };
 }
 
+// Helper functions for validating and clamping snapshot values
+function clampNumber(value, min, max, fallback) {
+  if (typeof value !== 'number' || !isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+function isValidNumber(value, min = -Infinity, max = Infinity) {
+  return typeof value === 'number' && isFinite(value) && value >= min && value <= max;
+}
+
 export function applyPresetSnapshot(snapshot, { sceneApi, audioEngine, silent = false, notify } = {}) {
   if (!snapshot) return;
   if (!sceneApi || !audioEngine) {
@@ -85,13 +95,30 @@ export function applyPresetSnapshot(snapshot, { sceneApi, audioEngine, silent = 
 
   try {
     if (snapshot.visuals?.theme) sceneApi.changeTheme(snapshot.visuals.theme);
-    if (typeof snapshot.visuals?.fogDensity === 'number') sceneApi.state.scene.fog.density = snapshot.visuals.fogDensity;
-    if (typeof snapshot.visuals?.bloomBase === 'number') sceneApi.state.params.bloomStrengthBase = snapshot.visuals.bloomBase;
-    if (typeof snapshot.visuals?.bloomReactive === 'number') sceneApi.state.params.bloomReactiveGain = snapshot.visuals.bloomReactive;
-    if (typeof snapshot.visuals?.pixelRatio === 'number') sceneApi.setPixelRatioCap(snapshot.visuals.pixelRatio);
+
+    // Validate and clamp fog density to prevent negative or extreme values
+    if (isValidNumber(snapshot.visuals?.fogDensity, 0, 1)) {
+      sceneApi.state.scene.fog.density = clampNumber(snapshot.visuals.fogDensity, 0, 1, sceneApi.state.scene.fog.density);
+    }
+
+    // Validate bloom parameters
+    if (isValidNumber(snapshot.visuals?.bloomBase, 0, 10)) {
+      sceneApi.state.params.bloomStrengthBase = clampNumber(snapshot.visuals.bloomBase, 0, 10, sceneApi.state.params.bloomStrengthBase);
+    }
+    if (isValidNumber(snapshot.visuals?.bloomReactive, 0, 10)) {
+      sceneApi.state.params.bloomReactiveGain = clampNumber(snapshot.visuals.bloomReactive, 0, 10, sceneApi.state.params.bloomReactiveGain);
+    }
+
+    // Validate pixel ratio (must be positive and reasonable)
+    if (isValidNumber(snapshot.visuals?.pixelRatio, 0.1, 4)) {
+      sceneApi.setPixelRatioCap(clampNumber(snapshot.visuals.pixelRatio, 0.1, 4, 1));
+    }
+
     if (typeof snapshot.visuals?.autoRotate === 'number') sceneApi.state.params.autoRotate = snapshot.visuals.autoRotate;
-    if (typeof snapshot.visuals?.particleDensity === 'number') {
-      sceneApi.state.params.particleDensity = snapshot.visuals.particleDensity;
+
+    // Validate particle density (expensive operation, clamp to reasonable range)
+    if (isValidNumber(snapshot.visuals?.particleDensity, 0.01, 5)) {
+      sceneApi.state.params.particleDensity = clampNumber(snapshot.visuals.particleDensity, 0.01, 5, 1);
       sceneApi.rebuildParticles();
     }
     if (typeof snapshot.visuals?.useHdrBackground === 'boolean') {

@@ -41,7 +41,7 @@ CameraControls.install({ THREE });
 
 // Hard-disable the experimental eye feature (remove center overlay completely)
 // This was an experimental visual effect that has been disabled
-const EYE_FEATURE_ENABLED = false;
+// Eye feature removed - was never enabled in production
 
 /**
  * Visual Themes
@@ -842,33 +842,7 @@ export function initScene() {
   state.scene.add(state.shockwave.mesh);
   state.metrics.sparksActive = state.sparks ? 1 : 0;
 
-  if (EYE_FEATURE_ENABLED) {
-    if (!state.params.map.eye) state.params.map.eye = {};
-    const eyeParams = state.params.map.eye;
-    state.eye.predatorMode = !!eyeParams.predatorMode;
-    try {
-      state.eye.mesh = createEyeLayer();
-      state.eye.mesh.scale.setScalar(state.eye.baseScale);
-      state.eye.mesh.visible = eyeParams.enabled !== false;
-      state.eye.mesh.position.set(0, 0.12, 0);
-      state.mainGroup.add(state.eye.mesh);
-      scheduleNextBlink(performance.now());
-    } catch (e) {
-      console.error('Failed to create eye layer', e);
-      state.eye.mesh = null;
-    }
-    if (eyeParams.corneaEnabled !== false) {
-      try {
-        state.eye.cornea = createCornea(5.06);
-        state.eye.cornea.visible = eyeParams.enabled !== false;
-        state.scene.add(state.eye.cornea);
-      } catch (e) {
-        console.error('Failed to create cornea layer', e);
-        state.eye.cornea = null;
-      }
-    }
-  }
-
+  // Eye feature removed (was hard-disabled)
   // Webcam/morph feature removed
 
   // Lights + optional central glow sprite
@@ -941,25 +915,31 @@ export function initScene() {
     }
 
     const sphereColorsAttr = state.coreSphere.geometry.attributes.color;
-    for (let i = 0; i < sphereColorsAttr.count; i++) {
-      const colorPos = (i / sphereColorsAttr.count) * (theme.sphere.length - 1);
-      const c1 = theme.sphere[Math.floor(colorPos)];
-      const c2 = theme.sphere[Math.min(Math.floor(colorPos) + 1, theme.sphere.length - 1)];
-      const newColor = new THREE.Color().copy(c1).lerp(c2, colorPos - Math.floor(colorPos));
-      sphereColorsAttr.setXYZ(i, newColor.r, newColor.g, newColor.b);
-    }
-    sphereColorsAttr.needsUpdate = true;
-    if (state.outerSphere) {
-      const outerAttr = state.outerSphere.geometry.attributes.color;
-      for (let i = 0; i < outerAttr.count; i++) {
-        const colorPos = (i / outerAttr.count) * (theme.sphere.length - 1);
+    // Guard against zero particle count to prevent division by zero
+    if (sphereColorsAttr.count > 0) {
+      for (let i = 0; i < sphereColorsAttr.count; i++) {
+        const colorPos = (i / sphereColorsAttr.count) * (theme.sphere.length - 1);
         const c1 = theme.sphere[Math.floor(colorPos)];
         const c2 = theme.sphere[Math.min(Math.floor(colorPos) + 1, theme.sphere.length - 1)];
-        const base = new THREE.Color().copy(c1).lerp(c2, colorPos - Math.floor(colorPos));
-        const halo = new THREE.Color().copy(base).lerp(new THREE.Color(0xffffff), 0.25);
-        outerAttr.setXYZ(i, halo.r, halo.g, halo.b);
+        const newColor = new THREE.Color().copy(c1).lerp(c2, colorPos - Math.floor(colorPos));
+        sphereColorsAttr.setXYZ(i, newColor.r, newColor.g, newColor.b);
       }
-      outerAttr.needsUpdate = true;
+      sphereColorsAttr.needsUpdate = true;
+    }
+    if (state.outerSphere) {
+      const outerAttr = state.outerSphere.geometry.attributes.color;
+      // Guard against zero particle count to prevent division by zero
+      if (outerAttr.count > 0) {
+        for (let i = 0; i < outerAttr.count; i++) {
+          const colorPos = (i / outerAttr.count) * (theme.sphere.length - 1);
+          const c1 = theme.sphere[Math.floor(colorPos)];
+          const c2 = theme.sphere[Math.min(Math.floor(colorPos) + 1, theme.sphere.length - 1)];
+          const base = new THREE.Color().copy(c1).lerp(c2, colorPos - Math.floor(colorPos));
+          const halo = new THREE.Color().copy(base).lerp(new THREE.Color(0xffffff), 0.25);
+          outerAttr.setXYZ(i, halo.r, halo.g, halo.b);
+        }
+        outerAttr.needsUpdate = true;
+      }
     }
     state.orbitRings.children.forEach((ring, i) => {
       const ringColorsAttr = ring.geometry.attributes.color;
@@ -973,7 +953,13 @@ export function initScene() {
 
   async function applyHdr(theme) {
     if (!state.params.useHdrBackground) {
-      if (state.currentHdrTexture) { try { state.currentHdrTexture.dispose(); } catch(_){} }
+      if (state.currentHdrTexture) {
+        try {
+          state.currentHdrTexture.dispose();
+        } catch(err) {
+          console.error('Failed to dispose HDR texture:', err);
+        }
+      }
       state.scene.background = new THREE.Color(0x000000);
       state.scene.environment = null;
       state.currentHdrTexture = null;
@@ -985,18 +971,41 @@ export function initScene() {
       let texture = null;
       const fileName = (theme.hdr || '').split('/').pop();
       if (fileName) {
-        try { texture = await loader.loadAsync(`/assets/hdr/${fileName}`); } catch (_) { texture = null; }
+        try {
+          texture = await loader.loadAsync(`/assets/hdr/${fileName}`);
+        } catch (err) {
+          console.warn('Failed to load local HDR texture, trying remote:', err);
+          texture = null;
+        }
       }
       if (!texture) {
         texture = await loader.loadAsync(theme.hdr);
       }
       texture.mapping = THREE.EquirectangularReflectionMapping;
-      if (state.currentHdrTexture) state.currentHdrTexture.dispose();
-      state.scene.background = texture; state.scene.environment = texture; state.currentHdrTexture = texture;
+
+      // Store reference to old texture for disposal after successful assignment
+      const oldTexture = state.currentHdrTexture;
+
+      // Apply new texture first
+      state.scene.background = texture;
+      state.scene.environment = texture;
+      state.currentHdrTexture = texture;
+
+      // Only dispose old texture after new one is successfully applied
+      if (oldTexture && oldTexture !== texture) {
+        try {
+          oldTexture.dispose();
+        } catch(err) {
+          console.warn('Failed to dispose old HDR texture:', err);
+        }
+      }
     } catch (e) {
-      // CORS or network error: fallback to black
-      state.scene.background = new THREE.Color(0x000000);
-      state.scene.environment = null;
+      console.error('Failed to load HDR texture:', e);
+      // CORS or network error: fallback to black but keep old texture if it exists
+      if (!state.currentHdrTexture) {
+        state.scene.background = new THREE.Color(0x000000);
+        state.scene.environment = null;
+      }
     }
   }
 
@@ -1643,7 +1652,9 @@ export function initScene() {
     // Sparks: emit on beats and breathe with RMS
     if (state.sparks) {
       // Throttle spark updates when FPS is low to save CPU
-      const approxFps = dt > 1e-6 ? Math.min(240, Math.max(1, 1 / dt)) : 60;
+      // Ensure dt is valid to prevent NaN/Infinity in FPS calculation
+      const safeDt = (isFinite(dt) && dt > 1e-6) ? dt : (1.0 / 60.0); // Default to 60fps
+      const approxFps = Math.min(240, Math.max(1, 1 / safeDt));
       const fpsTarget = state.params.targetFps || 60;
       const lowFps = approxFps < (fpsTarget - 10);
       state._sparkStep = (state._sparkStep || 0) + 1;
@@ -1755,11 +1766,12 @@ export function initScene() {
         const x = c * (1.0 - Math.abs(((hue * 6.0) % 2.0) - 1.0));
         const m = val - c;
         let rt = 0.0, gt = 0.0, bt = 0.0;
-        if (hue < 1.0/6.0) { rt = c; gt = x; bt = 0.0; }
-        else if (hue < 2.0/6.0) { rt = x; gt = c; bt = 0.0; }
-        else if (hue < 3.0/6.0) { rt = 0.0; gt = c; bt = x; }
-        else if (hue < 4.0/6.0) { rt = 0.0; gt = x; bt = c; }
-        else if (hue < 5.0/6.0) { rt = x; gt = 0.0; bt = c; }
+        // Use <= for proper boundary handling
+        if (hue <= 1.0/6.0) { rt = c; gt = x; bt = 0.0; }
+        else if (hue <= 2.0/6.0) { rt = x; gt = c; bt = 0.0; }
+        else if (hue <= 3.0/6.0) { rt = 0.0; gt = c; bt = x; }
+        else if (hue <= 4.0/6.0) { rt = 0.0; gt = x; bt = c; }
+        else if (hue <= 5.0/6.0) { rt = x; gt = 0.0; bt = c; }
         else { rt = c; gt = 0.0; bt = x; }
         const tintColor = new THREE.Color(rt + m, gt + m, bt + m);
         const brightness = brightBase + brightGain * rms + (typeof perf.dispersionBrightnessBoost === 'number' ? perf.dispersionBrightnessBoost : 0);
@@ -1849,10 +1861,23 @@ export function initScene() {
           const lr = travelSpeedTarget > current ? travelAttack : travelRelease;
           state.dispersion.travelSpeed = THREE.MathUtils.lerp(current, travelSpeedTarget, THREE.MathUtils.clamp(lr, 0, 1));
         }
-        state.dispersion.travel = (state.dispersion.travel || 0) + state.dispersion.travelSpeed * dt * 60.0; // scale for frame-rate
+        // Use high precision accumulation to prevent floating point drift
+        const increment = state.dispersion.travelSpeed * dt * 60.0; // scale for frame-rate
+        let newTravel = (state.dispersion.travel || 0) + increment;
+
         if (travelModulo > 1) {
           const m = travelModulo;
-          state.dispersion.travel = ((state.dispersion.travel % m) + m) % m;
+          // Reset to prevent accumulated floating point errors
+          if (Math.abs(newTravel) > m * 1000) {
+            newTravel = newTravel % m;
+          }
+          state.dispersion.travel = ((newTravel % m) + m) % m;
+        } else {
+          // Reset periodically to prevent unbounded growth
+          if (Math.abs(newTravel) > 1e6) {
+            newTravel = newTravel % 1e6;
+          }
+          state.dispersion.travel = newTravel;
         }
 
         try {
@@ -1918,14 +1943,174 @@ export function initScene() {
       }
     }
 
-    try { state.controls.update(dt); } catch(_) {}
-    try { state.camera.rotation.z = state._cameraRoll || 0; } catch(_) {}
+    try { state.controls.update(dt); } catch(err) {
+      console.warn('Camera controls update error:', err);
+    }
+    try { state.camera.rotation.z = state._cameraRoll || 0; } catch(err) {
+      console.warn('Camera rotation update error:', err);
+    }
     state.metrics.cameraRoll = state._cameraRoll || 0;
-    if (state.composer && state.composer.render) { state.composer.render(); } else { try { state.renderer.render(state.scene, state.camera); } catch(_) {} }
+    if (state.composer && state.composer.render) {
+      state.composer.render();
+    } else {
+      try {
+        state.renderer.render(state.scene, state.camera);
+      } catch(err) {
+        console.error('Renderer error:', err);
+      }
+    }
     return state.metrics;
   }
 
   changeTheme('nebula');
+
+  /**
+   * Dispose of all WebGL resources to prevent memory leaks
+   * This should be called when the scene is no longer needed
+   */
+  function dispose() {
+    console.log('Disposing WebGL resources...');
+
+    // Dispose of particles and geometries
+    try {
+      if (state.coreSphere) {
+        if (state.coreSphere.geometry) state.coreSphere.geometry.dispose();
+        if (state.coreSphere.material) state.coreSphere.material.dispose();
+        state.scene.remove(state.coreSphere);
+      }
+      if (state.outerSphere) {
+        if (state.outerSphere.geometry) state.outerSphere.geometry.dispose();
+        if (state.outerSphere.material) state.outerSphere.material.dispose();
+        state.scene.remove(state.outerSphere);
+      }
+      if (state.orbitRings) {
+        if (state.orbitRings.geometry) state.orbitRings.geometry.dispose();
+        if (state.orbitRings.material) state.orbitRings.material.dispose();
+        state.scene.remove(state.orbitRings);
+      }
+      if (state.starfield) {
+        if (state.starfield.geometry) state.starfield.geometry.dispose();
+        if (state.starfield.material) state.starfield.material.dispose();
+        state.scene.remove(state.starfield);
+      }
+      if (state.sparks) {
+        if (state.sparks.geometry) state.sparks.geometry.dispose();
+        if (state.sparks.material) state.sparks.material.dispose();
+        state.scene.remove(state.sparks);
+      }
+    } catch(err) {
+      console.error('Error disposing particles:', err);
+    }
+
+    // Dispose of HDR texture
+    try {
+      if (state.currentHdrTexture) {
+        state.currentHdrTexture.dispose();
+        state.currentHdrTexture = null;
+      }
+    } catch(err) {
+      console.error('Error disposing HDR texture:', err);
+    }
+
+    // Dispose of lights
+    try {
+      if (state.centralLight) {
+        state.scene.remove(state.centralLight);
+        if (state.centralLight.dispose) state.centralLight.dispose();
+      }
+    } catch(err) {
+      console.error('Error disposing lights:', err);
+    }
+
+    // Dispose of groups
+    try {
+      if (state.mainGroup) {
+        state.scene.remove(state.mainGroup);
+        // Recursively dispose of children
+        state.mainGroup.traverse((child) => {
+          if (child.geometry) child.geometry.dispose();
+          if (child.material) {
+            if (Array.isArray(child.material)) {
+              child.material.forEach(mat => mat.dispose());
+            } else {
+              child.material.dispose();
+            }
+          }
+        });
+      }
+    } catch(err) {
+      console.error('Error disposing groups:', err);
+    }
+
+    // Dispose of post-processing
+    try {
+      if (state.composer) {
+        state.composer.dispose();
+        state.composer = null;
+      }
+      if (state.renderPass) {
+        if (state.renderPass.dispose) state.renderPass.dispose();
+        state.renderPass = null;
+      }
+      if (state.effectPass) {
+        if (state.effectPass.dispose) state.effectPass.dispose();
+        state.effectPass = null;
+      }
+      if (state.bloomEffect) {
+        if (state.bloomEffect.dispose) state.bloomEffect.dispose();
+        state.bloomEffect = null;
+      }
+      if (state.chromaticEffect) {
+        if (state.chromaticEffect.dispose) state.chromaticEffect.dispose();
+        state.chromaticEffect = null;
+      }
+      if (state.lensflareEffect) {
+        if (state.lensflareEffect.dispose) state.lensflareEffect.dispose();
+        state.lensflareEffect = null;
+      }
+    } catch(err) {
+      console.error('Error disposing post-processing:', err);
+    }
+
+    // Dispose of renderer
+    try {
+      if (state.renderer) {
+        state.renderer.dispose();
+        state.renderer.forceContextLoss();
+        if (state.renderer.domElement && state.renderer.domElement.parentNode) {
+          state.renderer.domElement.parentNode.removeChild(state.renderer.domElement);
+        }
+        state.renderer = null;
+      }
+    } catch(err) {
+      console.error('Error disposing renderer:', err);
+    }
+
+    // Dispose of camera controls
+    try {
+      if (state.controls) {
+        if (state.controls.dispose) state.controls.dispose();
+        state.controls = null;
+      }
+    } catch(err) {
+      console.error('Error disposing camera controls:', err);
+    }
+
+    // Clear the scene
+    try {
+      if (state.scene) {
+        // Remove all children
+        while(state.scene.children.length > 0) {
+          state.scene.remove(state.scene.children[0]);
+        }
+        state.scene = null;
+      }
+    } catch(err) {
+      console.error('Error clearing scene:', err);
+    }
+
+    console.log('WebGL resources disposed');
+  }
 
   return {
     state,
@@ -1946,8 +2131,9 @@ export function initScene() {
     onResize,
     onMouseMove,
     update,
+    dispose,  // Expose the dispose function
     setUniformDeltasProvider: (fn) => { state._perfDeltasProvider = typeof fn === 'function' ? fn : null; },
-    setVisualMode: (mode) => { try { setupVisualMode(mode); } catch(_) {} },
+    setVisualMode: (mode) => { try { setupVisualMode(mode); } catch(err) { console.error('Error setting visual mode:', err); } },
     getPixelRatio: () => state.renderer.getPixelRatio(),
   };
 }
