@@ -243,6 +243,10 @@ export class AudioEngine {
       lastOnsetMs: 0,
     };
     this._aubioFallbackCounter = 0;
+    this._lastAubioTempoAt = 0;
+    this._lastLiveTempoFallbackMs = 0;
+    this._lastLiveTempoSource = null;
+    this._lastLiveTempoSourceAt = 0;
 
     this._essentiaWorker = null;
     this._essentiaReady = false;
@@ -424,23 +428,77 @@ export class AudioEngine {
         const ua = (navigator.userAgent || '').toLowerCase();
         const isChromium = ua.includes('chrome') || ua.includes('edg') || ua.includes('brave');
         const hostOk = (location.protocol === 'https:') || (location.hostname === 'localhost') || (location.hostname === '127.0.0.1');
-        const hint = !isChromium ? 'Open in Chrome and try "Tab (Chrome)".' : (!hostOk ? 'Use https or http://localhost.' : '');
+        const hint = !isChromium ? 'Open in Chrome and try "Screen (Chrome)".' : (!hostOk ? 'Use https or http://localhost.' : '');
         showToast(`System/Tab capture unavailable. ${hint}`.trim());
         throw new Error('getDisplayMedia unavailable');
       }
-      // Chrome tab/window/screen capture. On macOS, this usually only provides tab audio.
-      const stream = await (rawGetDisplay.call ? rawGetDisplay.call(md || navigator, { video: { frameRate: 1 }, audio: true }) : rawGetDisplay({ video: { frameRate: 1 }, audio: true }));
+
+      const audioConstraints = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: { ideal: 2 },
+      };
+      try { audioConstraints.sampleRate = { ideal: this.sampleRate || 48000 }; } catch (_) {}
+      try { audioConstraints.systemAudio = 'include'; } catch (_) {}
+      try { audioConstraints.suppressLocalAudioPlayback = true; } catch (_) {}
+
+      const videoConstraints = {
+        frameRate: { ideal: 5, max: 10 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        cursor: 'never',
+        displaySurface: 'monitor',
+      };
+      try { videoConstraints.logicalSurface = true; } catch (_) {}
+
+      const request = { audio: audioConstraints, video: videoConstraints }; // prefer monitor capture for system mix
+      const stream = await (rawGetDisplay.call ? rawGetDisplay.call(md || navigator, request) : rawGetDisplay(request));
+
       const hasAudio = !!(stream && typeof stream.getAudioTracks === 'function' && stream.getAudioTracks().length);
       if (!hasAudio) {
         try { for (const t of stream.getTracks()) t.stop(); } catch (_) {}
         const msg = isMac
-          ? 'No audio captured. In Chrome, pick a "Chrome Tab" and enable "Share tab audio". For full Mac audio, use BlackHole and select it as Mic.'
-          : 'No audio captured. Choose a tab with audio and enable audio sharing.';
+          ? 'No audio captured. When the Chrome prompt appears, pick "Entire Screen" and tick "Share audio" to grab the Mac mix. If blocked, allow Chrome under System Settings → Screen Recording. As a fallback, use BlackHole and select it as Mic.'
+          : 'No audio captured. Choose a screen or tab with audio and enable audio sharing.';
         showToast(msg);
         const err = new Error('No audio track captured from display media');
         try { err.__reactiveNotified = true; } catch(_) {}
         throw err;
       }
+
+      const audioTracks = stream.getAudioTracks();
+
+      const attachEndedHandler = (track) => {
+        if (!track || typeof track.addEventListener !== 'function') return;
+        const handler = () => {
+          track.removeEventListener('ended', handler);
+          if (this.activeStream === stream) {
+            this.stop();
+          }
+        };
+        track.addEventListener('ended', handler);
+      };
+
+      for (const track of audioTracks) {
+        try {
+          if (track.applyConstraints) {
+            track.applyConstraints({ echoCancellation: false, noiseSuppression: false, autoGainControl: false }).catch(()=>{});
+          }
+        } catch (_) {}
+        attachEndedHandler(track);
+      }
+
+      try {
+        const videoTracks = stream.getVideoTracks();
+        for (const track of videoTracks) {
+          if (track) {
+            track.enabled = false;
+            attachEndedHandler(track);
+          }
+        }
+      } catch (_) {}
+
       this._useStream(stream);
       return stream;
     } catch (e) {
@@ -463,7 +521,7 @@ export class AudioEngine {
           showToast('System audio unsupported with current constraints. Use Chrome tab audio or BlackHole.');
           notified = true;
         } else if (!name && msg.includes('audio') && msg.includes('not')) {
-          showToast('No audio track captured. Choose Chrome Tab and enable "Share tab audio".');
+          showToast('No audio track captured. Pick "Entire Screen" and enable "Share audio" when Chrome prompts.');
           notified = true;
         }
         if (notified) { try { e.__reactiveNotified = true; } catch (_) {} }
@@ -1380,7 +1438,9 @@ export class AudioEngine {
 
   _enqueueAubioFrame(buffer, frameId = -1) {
     if (!buffer) return;
-    if (this._aubioModule && this._aubio.onset && this._aubio.pitch) {
+
+    const aubioReady = this._aubioModule && (this._aubio.onset || this._aubio.tempo || this._aubio.pitch);
+    if (aubioReady) {
       if (frameId === this._aubioLastFrameId) return;
       this._processAubioFrame(buffer, frameId);
       return;
@@ -1421,6 +1481,10 @@ export class AudioEngine {
         if (typeof bpm === 'number' && isFinite(bpm) && bpm > 30 && bpm < 300) {
           this.aubioFeatures.tempoBpm = bpm;
           this.aubioFeatures.tempoConf = conf || 0;
+          const stamp = performance.now();
+          this._lastAubioTempoAt = stamp;
+          this._lastLiveTempoSource = 'aubio-live';
+          this._lastLiveTempoSourceAt = stamp;
         }
       }
     } catch (err) {

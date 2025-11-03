@@ -15,7 +15,8 @@ Because ES modules are used, you need a local web server (file:// won’t work):
 
 ## Audio sources
 - **Mic**: Select your input (or BlackHole if you routed system audio into it).
-- **System (Chrome)**: Click "System" in the UI, select "Entire Screen" and enable "Share system audio". Click "Learn more" in the helper ribbon for detailed instructions.
+- **Screen (Chrome)**: Click "Screen (Chrome)" in the UI, choose "Entire Screen" in Chrome’s picker, and tick "Share audio" to stream macOS system sound. Use "Learn more" in the helper ribbon for detailed instructions or fall back to a virtual device (BlackHole).
+- **Rekordbox Deck**: In Rekordbox, route the deck to a loopback/device that exposes an input (e.g. Rekordbox Audio Capture or a Pioneer DJ aggregate). Then click "Rekordbox Deck" in Source to grab that feed instantly.
 - **File**: Drag-and-drop an audio file anywhere on the page, or use the File button in the Settings drawer.
 
 ## Controls (Settings Drawer)

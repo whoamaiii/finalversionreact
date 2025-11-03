@@ -899,7 +899,7 @@ eventHandlers.systemAudioHelp = () => {
 
   // Show platform-specific instructions
   const msg = isMac
-    ? 'macOS: For one tab, click "Tab (Chrome)" then enable "Share tab audio".\n\nFor full system audio: Install BlackHole 2ch → in Audio MIDI Setup make a Multi-Output (BlackHole + your speakers) → set Mac Output to that device → in the app pick Mic → BlackHole.\n\nIf capture fails, allow Chrome in System Settings → Privacy & Security → Screen Recording.'
+    ? 'macOS: Click "Screen (Chrome)" and, when the Chrome picker appears, choose "Entire Screen" then tick "Share audio" to feed the Mac mix.\n\nFallback: Install BlackHole 2ch → in Audio MIDI Setup create a Multi-Output (BlackHole + speakers) → set system output to that device → in the app choose Mic → BlackHole.\n\nIf capture fails, allow Chrome in System Settings → Privacy & Security → Screen Recording.'
     : 'Click System, then select a tab/window with audio and enable audio sharing. If capture is blocked, allow screen recording permissions for your browser.';
 
   // Try to show as toast, fall back to alert if toast fails

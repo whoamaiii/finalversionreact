@@ -16,8 +16,9 @@ Date: 2025-10-29
 
 ## Operator Checklist
 - Source:
-  - For Chrome tab audio (Mac): pick Tab (Chrome) and enable “Share tab audio”.
-  - For system mix: select BlackHole as Mic; choose the BlackHole device in Settings → Source.
+  - For macOS system mix: click Screen (Chrome), choose Entire Screen, enable “Share audio”.
+  - Fallback: select BlackHole as Mic; choose the BlackHole device in Settings → Source.
+  - For Rekordbox: route Rekordbox to its “Audio Capture” device (or Pioneer loopback) and click Rekordbox Deck.
   - For files: drag-and-drop or use File button.
 
 - Audio Controls (Settings → Audio):
@@ -49,8 +50,8 @@ Date: 2025-10-29
    - Logs: `npm run pm2:logs`
 
 ## Troubleshooting
-- No Audio (Tab):
-  - In Chrome picker: choose a tab with audio and enable “Share tab audio”.
+- No Audio (Screen Share):
+  - In Chrome picker: choose "Entire Screen" and enable “Share audio”.
   - macOS: System Settings → Privacy & Security → Screen Recording → allow Chrome.
 
 - No Audio (System):

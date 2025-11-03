@@ -21,7 +21,12 @@ Then open: **http://localhost:5173**
 ### 2. System Audio Help (NEW!)
 - Look at the bottom helper ribbon: "Tip: For system audio on macOS..."
 - Click the **"Learn more"** button
-- Toast appears with detailed Chrome + BlackHole instructions
+- Toast appears with Chrome "Entire Screen + Share audio" steps and BlackHole fallback instructions
+
+### 2b. Rekordbox Deck (NEW!)
+- In Rekordbox, set the deck output to "Rekordbox Audio Capture" (or your Pioneer loopback)
+- Open the Source tab → click **Rekordbox Deck**
+- Visualizer should react to the live deck audio
 
 ### 3. Clean Console (NEW!)
 - Open Developer Console (⌘+Option+J)

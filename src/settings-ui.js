@@ -675,10 +675,25 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     const container = h('div', { class: 'section' });
     container.appendChild(h('div', { class: 'section-title' }, 'Source'));
     const isMac = (() => { try { const ua = navigator.userAgent || ''; const plat = navigator.platform || ''; return /Mac/i.test(ua) || /Mac/i.test(plat); } catch(_) { return false; } })();
-    const systemLabel = isMac ? 'Tab (Chrome)' : 'System';
+    const devices = await audioEngine.getInputDevices().catch(() => []);
+    const rekordboxNames = ['rekordbox', 'pioneer dj', 'pioneer ddj', 'pioneer nxs', 'djm', 'cdj'];
+    const rekordboxDevice = devices.find(d => rekordboxNames.some(n => (d.label || '').toLowerCase().includes(n)));
+    const systemLabel = isMac ? 'Screen (Chrome)' : 'System';
     container.appendChild(button('Mic', async () => {
       try { await audioEngine.startMic(localStorage.getItem('cosmic_mic_device_id') || undefined); } catch(e){ showToast('Mic denied/unavailable'); }
     }));
+    if (rekordboxDevice) {
+      container.appendChild(button('Rekordbox Deck', async () => {
+        try {
+          const id = rekordboxDevice.deviceId || '';
+          try { localStorage.setItem('cosmic_mic_device_id', id); } catch (_) {}
+          await audioEngine.startMic(id || undefined);
+          showToast('Rekordbox deck connected');
+        } catch (_) {
+          showToast('Could not start Rekordbox deck');
+        }
+      }));
+    }
     container.appendChild(button(systemLabel, async () => {
       try { await audioEngine.startSystemAudio(); } catch(e){ /* audioEngine shows detailed toasts */ }
     }));
@@ -705,21 +720,23 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     // Inline hint for macOS users
     if (isMac) {
       container.appendChild(h('div', { style: { fontSize: '11px', color: 'rgba(255,255,255,0.75)', marginTop: '6px', marginBottom: '6px' } },
-        'macOS: For a single tab, click "Tab (Chrome)" → enable "Share tab audio". For full system audio, select BlackHole as Mic (see below).'));
+        'macOS: Click "Screen (Chrome)" and, when prompted, choose "Entire Screen" then enable "Share audio" to grab the Mac mix. Alternative: route with BlackHole and pick it under Mic.'));
     }
 
     // Devices dropdown
     const deviceRow = h('div', { class: 'section' });
     deviceRow.appendChild(h('div', { class: 'section-title' }, 'Input Device'));
-    const devices = await audioEngine.getInputDevices().catch(() => []);
 
     // Detect popular virtual loopback devices (BlackHole, Loopback, Soundflower, VB-CABLE, Background Music)
-    const names = ['blackhole', 'loopback', 'soundflower', 'vb-cable', 'background music'];
+    const names = ['blackhole', 'loopback', 'soundflower', 'vb-cable', 'background music', 'rekordbox', 'pioneer dj'];
     const virtual = devices.find(d => names.some(n => (d.label || '').toLowerCase().includes(n)));
-    const prettyVirtualName = virtual ? (['BlackHole','Loopback','Soundflower','VB-CABLE','Background Music'].find(n => (virtual.label||'').toLowerCase().includes(n.toLowerCase())) || 'Virtual Device') : null;
+    const prettyVirtualName = virtual ? (['BlackHole','Loopback','Soundflower','VB-CABLE','Background Music','Rekordbox Deck'].find(n => (virtual.label||'').toLowerCase().includes(n.toLowerCase())) || 'Virtual Device') : null;
 
     const opts = devices.map((d, i) => ({ label: d.label || `Mic ${i+1}`, value: d.deviceId || '' }));
     let stored = localStorage.getItem('cosmic_mic_device_id') || '';
+    if (!stored && rekordboxDevice?.deviceId) {
+      try { localStorage.setItem('cosmic_mic_device_id', rekordboxDevice.deviceId); stored = rekordboxDevice.deviceId; } catch(_) {}
+    }
     if (!stored && virtual?.deviceId) {
       try { localStorage.setItem('cosmic_mic_device_id', virtual.deviceId); stored = virtual.deviceId; } catch(_) {}
     }
