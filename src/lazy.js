@@ -85,8 +85,6 @@ export function loadAubio() {
   return loadOnce('aubio', async () => {
     // List of places to try loading from, in order of preference
     const candidates = [
-      // Prefer local package via bundler first (fastest, most reliable)
-      'aubiojs',
       // If that fails, try CDN versions (from the internet)
       'https://esm.sh/aubiojs@0.0.11',
       'https://esm.sh/aubiojs@0.0.9',
@@ -99,7 +97,7 @@ export function loadAubio() {
       try {
         // Load the module from this URL
         // For local packages, use regular import; for URLs, use dynamic import
-        const mod = url === 'aubiojs' ? await import(url) : await import(/* @vite-ignore */ url);
+        const mod = await import(/* @vite-ignore */ url);
         // Return the module (might be in mod.default or mod itself)
         return mod.default ?? mod;
       } catch (_) {

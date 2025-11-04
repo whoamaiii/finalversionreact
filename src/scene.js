@@ -39,6 +39,10 @@ import { withDispersionDefaults } from './dispersion-config.js';
 // This provides smooth, interactive camera controls
 CameraControls.install({ THREE });
 
+const TMP_VEC3_A = new THREE.Vector3();
+const TMP_VEC3_B = new THREE.Vector3();
+const TMP_VEC3_C = new THREE.Vector3();
+
 // Hard-disable the experimental eye feature (remove center overlay completely)
 // This was an experimental visual effect that has been disabled
 // Eye feature removed - was never enabled in production
@@ -253,12 +257,16 @@ function createPointShaderMaterial(mouse) {
  * @param {THREE.Vector2} mouse - Mouse position for shader uniforms
  * @returns {THREE.Points} The particle system configured as a sphere
  */
-function createSpiralSphere(radius, particleCount, mouse) {
+function createSpiralSphere(radius, particleCount, mouse, options = {}) {
+  const { material: providedMaterial = null, capacity: requestedCapacity } = options;
+  const capacity = Math.max(1, Math.max(particleCount, Number.isFinite(requestedCapacity) ? Math.floor(requestedCapacity) : particleCount));
   const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array(particleCount * 3);
-  const colors = new Float32Array(particleCount * 3);
-  const sizes = new Float32Array(particleCount);
-  const randomDirs = new Float32Array(particleCount * 3).fill(0);
+  const positions = new Float32Array(capacity * 3);
+  const colors = new Float32Array(capacity * 3);
+  const sizes = new Float32Array(capacity);
+  const randomDirs = new Float32Array(capacity * 3);
+  const randomVec = TMP_VEC3_A;
+  const normal = TMP_VEC3_B;
   for (let i = 0; i < particleCount; i++) {
     const i3 = i * 3; const phi = Math.acos(-1 + (2 * i) / particleCount); const theta = Math.sqrt(particleCount * Math.PI) * phi;
     positions[i3] = radius * Math.cos(theta) * Math.sin(phi);
@@ -267,14 +275,95 @@ function createSpiralSphere(radius, particleCount, mouse) {
     sizes[i] = Math.random() * 0.2 + 0.1;
     // Seed visible colors (white) until theme applies
     colors[i3] = 0.9; colors[i3 + 1] = 0.9; colors[i3 + 2] = 0.9;
+
+    normal.set(positions[i3], positions[i3 + 1], positions[i3 + 2]).normalize();
+    randomVec
+      .set(
+        normal.x + (Math.random() * 2 - 1) * 0.35,
+        normal.y + (Math.random() * 2 - 1) * 0.35,
+        normal.z + (Math.random() * 2 - 1) * 0.35,
+      )
+      .normalize();
+    randomDirs[i3] = randomVec.x;
+    randomDirs[i3 + 1] = randomVec.y;
+    randomDirs[i3 + 2] = randomVec.z;
   }
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
   geometry.setAttribute('randomDir', new THREE.BufferAttribute(randomDirs, 3));
-  const material = createPointShaderMaterial(mouse);
-  material.uniforms.uExplode.value = 0;
+  geometry.setDrawRange(0, particleCount);
+  geometry.userData.capacity = capacity;
+  geometry.userData.particleCount = particleCount;
+  const material = providedMaterial || createPointShaderMaterial(mouse);
+  if (material.uniforms && material.uniforms.uExplode) {
+    material.uniforms.uExplode.value = 0;
+  }
   return new THREE.Points(geometry, material);
+}
+
+function updateSpiralSphere(points, radius, particleCount) {
+  if (!points?.geometry) return false;
+  const geometry = points.geometry;
+  const positionAttr = geometry.getAttribute('position');
+  const colorAttr = geometry.getAttribute('color');
+  const sizeAttr = geometry.getAttribute('size');
+  const randomDirAttr = geometry.getAttribute('randomDir');
+  if (!positionAttr || !colorAttr || !sizeAttr || !randomDirAttr) return false;
+  const capacity = geometry.userData?.capacity ?? positionAttr.count;
+  if (capacity < particleCount) return false;
+
+  const positions = positionAttr.array;
+  const colors = colorAttr.array;
+  const sizes = sizeAttr.array;
+  const randomDirs = randomDirAttr.array;
+  const normal = TMP_VEC3_A;
+  const randomVec = TMP_VEC3_B;
+  for (let i = 0; i < particleCount; i++) {
+    const i3 = i * 3; const phi = Math.acos(-1 + (2 * i) / particleCount); const theta = Math.sqrt(particleCount * Math.PI) * phi;
+    positions[i3] = radius * Math.cos(theta) * Math.sin(phi);
+    positions[i3 + 1] = radius * Math.sin(theta) * Math.sin(phi);
+    positions[i3 + 2] = radius * Math.cos(phi);
+    sizes[i] = Math.random() * 0.2 + 0.1;
+    colors[i3] = 0.9; colors[i3 + 1] = 0.9; colors[i3 + 2] = 0.9;
+    normal.set(positions[i3], positions[i3 + 1], positions[i3 + 2]).normalize();
+    randomVec
+      .set(
+        normal.x + (Math.random() * 2 - 1) * 0.35,
+        normal.y + (Math.random() * 2 - 1) * 0.35,
+        normal.z + (Math.random() * 2 - 1) * 0.35,
+      )
+      .normalize();
+    randomDirs[i3] = randomVec.x;
+    randomDirs[i3 + 1] = randomVec.y;
+    randomDirs[i3 + 2] = randomVec.z;
+  }
+  geometry.setDrawRange(0, particleCount);
+  positionAttr.needsUpdate = true;
+  colorAttr.needsUpdate = true;
+  sizeAttr.needsUpdate = true;
+  randomDirAttr.needsUpdate = true;
+  geometry.computeBoundingSphere();
+  geometry.userData.capacity = capacity;
+  geometry.userData.particleCount = particleCount;
+  if (points.material?.uniforms?.uExplode) {
+    points.material.uniforms.uExplode.value = 0;
+  }
+  return true;
+}
+
+function disposePoints(points, { keepMaterial = false } = {}) {
+  if (!points) return;
+  if (points.geometry) {
+    points.geometry.dispose();
+  }
+  if (!keepMaterial && points.material) {
+    if (Array.isArray(points.material)) {
+      points.material.forEach((mat) => mat?.dispose?.());
+    } else {
+      points.material.dispose();
+    }
+  }
 }
 
 /**
@@ -291,30 +380,119 @@ function createSpiralSphere(radius, particleCount, mouse) {
  * @param {THREE.Vector2} mouse - Mouse position for shader uniforms
  * @returns {THREE.Group} Group containing all ring particle systems
  */
+function createOrbitRing(radius, thickness, particleCount, mouse, options = {}) {
+  const { material: providedMaterial = null, capacity: requestedCapacity } = options;
+  const capacity = Math.max(1, Math.max(particleCount, Number.isFinite(requestedCapacity) ? Math.floor(requestedCapacity) : particleCount));
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(capacity * 3);
+  const colors = new Float32Array(capacity * 3);
+  const sizes = new Float32Array(capacity);
+  const randomDirs = new Float32Array(capacity * 3);
+  const randomVec = TMP_VEC3_C;
+  for (let j = 0; j < particleCount; j++) {
+    const j3 = j * 3; const angle = (j / particleCount) * Math.PI * 2; const radiusVariation = radius + (Math.random() - 0.5) * thickness;
+    positions[j3] = Math.cos(angle) * radiusVariation;
+    positions[j3 + 1] = (Math.random() - 0.5) * (thickness * 0.5);
+    positions[j3 + 2] = Math.sin(angle) * radiusVariation;
+    sizes[j] = Math.random() * 0.15 + 0.08;
+    randomVec.set(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
+    randomDirs[j3] = randomVec.x;
+    randomDirs[j3 + 1] = randomVec.y;
+    randomDirs[j3 + 2] = randomVec.z;
+  }
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+  geometry.setAttribute('randomDir', new THREE.BufferAttribute(randomDirs, 3));
+  geometry.setDrawRange(0, particleCount);
+  geometry.userData.capacity = capacity;
+  geometry.userData.particleCount = particleCount;
+  const material = providedMaterial || createPointShaderMaterial(mouse);
+  const ring = new THREE.Points(geometry, material);
+  ring.rotation.x = Math.random() * Math.PI;
+  ring.rotation.y = Math.random() * Math.PI;
+  return ring;
+}
+
+function updateOrbitRing(points, radius, thickness, particleCount) {
+  if (!points?.geometry) return false;
+  const geometry = points.geometry;
+  const positionAttr = geometry.getAttribute('position');
+  const colorAttr = geometry.getAttribute('color');
+  const sizeAttr = geometry.getAttribute('size');
+  const randomDirAttr = geometry.getAttribute('randomDir');
+  if (!positionAttr || !colorAttr || !sizeAttr || !randomDirAttr) return false;
+  const capacity = geometry.userData?.capacity ?? positionAttr.count;
+  if (capacity < particleCount) return false;
+  const positions = positionAttr.array;
+  const colors = colorAttr.array;
+  const sizes = sizeAttr.array;
+  const randomDirs = randomDirAttr.array;
+  const randomVec = TMP_VEC3_C;
+  for (let j = 0; j < particleCount; j++) {
+    const j3 = j * 3; const angle = (j / particleCount) * Math.PI * 2; const radiusVariation = radius + (Math.random() - 0.5) * thickness;
+    positions[j3] = Math.cos(angle) * radiusVariation;
+    positions[j3 + 1] = (Math.random() - 0.5) * (thickness * 0.5);
+    positions[j3 + 2] = Math.sin(angle) * radiusVariation;
+    sizes[j] = Math.random() * 0.15 + 0.08;
+    colors[j3] = 0; colors[j3 + 1] = 0; colors[j3 + 2] = 0;
+    randomVec.set(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
+    randomDirs[j3] = randomVec.x;
+    randomDirs[j3 + 1] = randomVec.y;
+    randomDirs[j3 + 2] = randomVec.z;
+  }
+  geometry.setDrawRange(0, particleCount);
+  positionAttr.needsUpdate = true;
+  colorAttr.needsUpdate = true;
+  sizeAttr.needsUpdate = true;
+  randomDirAttr.needsUpdate = true;
+  geometry.computeBoundingSphere();
+  geometry.userData.capacity = capacity;
+  geometry.userData.particleCount = particleCount;
+  return true;
+}
+
 function createOrbitRings(radius, count, thickness, particleCount, mouse) {
   const group = new THREE.Group();
   for (let i = 0; i < count; i++) {
-    const ringGeometry = new THREE.BufferGeometry();
-    const positions = new Float32Array(particleCount * 3);
-    const colors = new Float32Array(particleCount * 3);
-    const sizes = new Float32Array(particleCount);
-    const randomDirs = new Float32Array(particleCount * 3);
-    const randomVec = new THREE.Vector3();
-    for (let j = 0; j < particleCount; j++) {
-      const j3 = j * 3; const angle = (j / particleCount) * Math.PI * 2; const radiusVariation = radius + (Math.random() - 0.5) * thickness;
-      positions[j3] = Math.cos(angle) * radiusVariation; positions[j3 + 1] = (Math.random() - 0.5) * (thickness * 0.5); positions[j3 + 2] = Math.sin(angle) * radiusVariation;
-      sizes[j] = Math.random() * 0.15 + 0.08; randomVec.set(Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1).normalize();
-      randomDirs[j3] = randomVec.x; randomDirs[j3 + 1] = randomVec.y; randomDirs[j3 + 2] = randomVec.z;
-    }
-    ringGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    ringGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    ringGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
-    ringGeometry.setAttribute('randomDir', new THREE.BufferAttribute(randomDirs, 3));
-    const ring = new THREE.Points(ringGeometry, createPointShaderMaterial(mouse));
-    ring.rotation.x = Math.random() * Math.PI; ring.rotation.y = Math.random() * Math.PI;
+    const ring = createOrbitRing(radius, thickness, particleCount, mouse);
     group.add(ring);
   }
   return group;
+}
+
+function ensureOrbitRings(group, radius, count, thickness, particleCount, mouse) {
+  const rings = group || new THREE.Group();
+  const growthFactor = 1.25;
+
+  while (rings.children.length > count) {
+    const child = rings.children.pop();
+    rings.remove(child);
+    disposePoints(child);
+  }
+  while (rings.children.length < count) {
+    rings.add(createOrbitRing(radius, thickness, particleCount, mouse));
+  }
+
+  rings.children.forEach((ring, idx) => {
+    if (!updateOrbitRing(ring, radius, thickness, particleCount)) {
+      const reuseMaterial = ring.material || null;
+      const capacity = ring.geometry?.userData?.capacity || particleCount;
+      const newCapacity = capacity >= particleCount
+        ? capacity
+        : Math.ceil(Math.max(particleCount, capacity * growthFactor));
+      const replacement = createOrbitRing(radius, thickness, particleCount, mouse, {
+        material: reuseMaterial,
+        capacity: newCapacity,
+      });
+      replacement.rotation.copy(ring.rotation);
+      rings.add(replacement);
+      rings.remove(ring);
+      disposePoints(ring, { keepMaterial: !!reuseMaterial });
+    }
+  });
+
+  return rings;
 }
 
 function createStarfield(count, spread) {
@@ -485,6 +663,9 @@ export function initScene() {
       beatIndex: 0,
       tintMix: 0,
     },
+    _centralColor: new THREE.Color(),
+    _dispersionTintColor: new THREE.Color(),
+    _corneaTintColor: new THREE.Color(),
     // Effects profile scales for global quality control
     effectsBloomScale: 1.0,
     effectsChromaticScale: 1.0,
@@ -632,7 +813,40 @@ export function initScene() {
   state.controls.smoothTime = 0.12; state.controls.minDistance = 10; state.controls.maxDistance = 50; state.controls.draggingSmoothTime = 0.15;
   state.controls.setLookAt(0, 5, 14, 0, 0, 0);
 
+  function disposeComposer() {
+    if (state.composer && state.dispersion?.layer?.pass) {
+      try { state.composer.removePass(state.dispersion.layer.pass); } catch (_) {}
+    }
+
+    if (state.effectPass?.dispose) {
+      try { state.effectPass.dispose(); } catch (_) {}
+    }
+
+    if (state.bloomEffect?.dispose) {
+      try { state.bloomEffect.dispose(); } catch (_) {}
+    }
+
+    if (state.chromaticEffect?.dispose) {
+      try { state.chromaticEffect.dispose(); } catch (_) {}
+    }
+
+    if (state.renderPass?.dispose) {
+      try { state.renderPass.dispose(); } catch (_) {}
+    }
+
+    if (state.composer) {
+      try { state.composer.dispose(); } catch (_) {}
+    }
+
+    state.renderPass = null;
+    state.effectPass = null;
+    state.bloomEffect = null;
+    state.chromaticEffect = null;
+    state.composer = null;
+  }
+
   function buildComposer() {
+    disposeComposer();
     const renderPass = new RenderPass(state.scene, state.camera);
     state.renderPass = renderPass;
     state.bloomEffect = new BloomEffect({ intensity: state.params.bloomStrengthBase });
@@ -1062,25 +1276,66 @@ export function initScene() {
   function setPixelRatioCap(value) { state.params.pixelRatioCap = value; state.renderer.setPixelRatio(value); }
 
   function rebuildParticles() {
-    // Remove current
-    state.mainGroup.remove(state.coreSphere); if (state.outerSphere) state.mainGroup.remove(state.outerSphere); state.mainGroup.remove(state.orbitRings); state.scene.remove(state.starfield); if (state.sparks) state.scene.remove(state.sparks);
-    state.coreSphere.geometry.dispose(); state.coreSphere.material.dispose();
-    if (state.outerSphere) { try { state.outerSphere.geometry.dispose(); state.outerSphere.material.dispose(); } catch(_) {} }
-    state.orbitRings.children.forEach(r => { r.geometry.dispose(); r.material.dispose(); });
-    state.starfield.geometry.dispose(); state.starfield.material.dispose(); if (state.sparks) { state.sparks.geometry.dispose(); state.sparks.material.dispose(); }
+    const density = Math.max(0, Number(state.params.particleDensity) || 0);
+    const sphereCount = Math.max(0, Math.floor(40000 * density));
+    const ringCountPer = Math.max(0, Math.floor(4000 * density));
+    const starCount = Math.max(0, Math.floor(10000 * density));
+    const sparksTarget = Math.max(0, Math.floor(8000 * density));
+    const growthFactor = 1.25;
 
-    const sphereCount = Math.floor(40000 * state.params.particleDensity);
-    const ringCountPer = Math.floor(4000 * state.params.particleDensity);
-    const starCount = Math.floor(10000 * state.params.particleDensity);
+    // Core sphere reuse or rebuild
+    const existingCore = state.coreSphere;
+    const coreReused = existingCore && updateSpiralSphere(existingCore, 5, sphereCount);
+    if (!coreReused) {
+      const reuseMaterial = existingCore?.material || null;
+      if (existingCore) {
+        state.mainGroup.remove(existingCore);
+        disposePoints(existingCore, { keepMaterial: !!reuseMaterial });
+      }
+      const prevCapacity = existingCore?.geometry?.userData?.capacity || sphereCount;
+      const newCapacity = prevCapacity >= sphereCount
+        ? prevCapacity
+        : Math.ceil(Math.max(sphereCount, prevCapacity * growthFactor));
+      const newCore = createSpiralSphere(5, sphereCount, state.mouse, {
+        material: reuseMaterial,
+        capacity: newCapacity,
+      });
+      console.debug('[Scene] Core sphere rebuilt', { requested: sphereCount, capacity: newCapacity });
+      state.coreSphere = newCore;
+      state.mainGroup.add(newCore);
+    }
 
-    state.coreSphere = createSpiralSphere(5, sphereCount, state.mouse);
+    // Outer sphere reuse or rebuild
     if (shouldEnableOuterShell()) {
       const outerCount = Math.max(1000, Math.floor(sphereCount * (state.params.outerShell.densityScale || 0.6)));
-      state.outerSphere = createSpiralSphere(state.params.outerShell.radius || 6.2, outerCount, state.mouse);
-      try { state.outerSphere.renderOrder = 1; } catch(_) {}
-    } else {
+      const outerRadius = state.params.outerShell.radius || 6.2;
+      const existingOuter = state.outerSphere;
+      const outerReused = existingOuter && updateSpiralSphere(existingOuter, outerRadius, outerCount);
+      if (!outerReused) {
+        const reuseMaterial = existingOuter?.material || null;
+        if (existingOuter) {
+          state.mainGroup.remove(existingOuter);
+          disposePoints(existingOuter, { keepMaterial: !!reuseMaterial });
+        }
+        const prevCapacity = existingOuter?.geometry?.userData?.capacity || outerCount;
+        const newCapacity = prevCapacity >= outerCount
+          ? prevCapacity
+          : Math.ceil(Math.max(outerCount, prevCapacity * growthFactor));
+        const newOuter = createSpiralSphere(outerRadius, outerCount, state.mouse, {
+          material: reuseMaterial,
+          capacity: newCapacity,
+        });
+        try { newOuter.renderOrder = 1; } catch (_) {}
+        console.debug('[Scene] Outer sphere rebuilt', { requested: outerCount, capacity: newCapacity });
+        state.outerSphere = newOuter;
+        state.mainGroup.add(newOuter);
+      }
+    } else if (state.outerSphere) {
+      state.mainGroup.remove(state.outerSphere);
+      disposePoints(state.outerSphere);
       state.outerSphere = null;
     }
+
     // Re-wire video uniforms if webcam already running
     if (state.webcamTexture && state.coreSphere?.material?.uniforms) {
       state.coreSphere.material.uniforms.uVideo.value = state.webcamTexture;
@@ -1090,12 +1345,38 @@ export function initScene() {
     if (state.webcamTexture) {
       buildMorphGridForSphere();
     }
-    state.orbitRings = createOrbitRings(7.5, 8, 0.6, ringCountPer, state.mouse);
-    state.starfield = createStarfield(starCount, 50000);
-    state.sparks = state.params.enableSparks ? createSparks(Math.floor(8000 * state.params.particleDensity)) : null;
 
-    state.mainGroup.add(state.coreSphere); if (state.outerSphere) state.mainGroup.add(state.outerSphere); state.mainGroup.add(state.orbitRings); state.scene.add(state.starfield); if (state.sparks) state.scene.add(state.sparks);
-    // Reapply theme colors
+    state.orbitRings = ensureOrbitRings(state.orbitRings, 7.5, 8, 0.6, ringCountPer, state.mouse);
+    if (!state.orbitRings.parent) {
+      state.mainGroup.add(state.orbitRings);
+    }
+
+    if (state.starfield) {
+      state.scene.remove(state.starfield);
+      disposePoints(state.starfield);
+    }
+    state.starfield = createStarfield(starCount, 50000);
+    state.scene.add(state.starfield);
+
+    if (state.sparks) {
+      state.scene.remove(state.sparks);
+      disposePoints(state.sparks);
+      state.sparks = null;
+    }
+    if (state.params.enableSparks && sparksTarget > 0) {
+      state.sparks = createSparks(sparksTarget);
+      state.scene.add(state.sparks);
+    }
+
+    state.metrics.sparksActive = state.sparks ? 1 : 0;
+    state.metrics.sparksAlive = state.sparks ? sparksTarget : 0;
+    state.metrics.coreSphereParticles = sphereCount;
+    state.metrics.coreSphereCapacity = state.coreSphere?.geometry?.userData?.capacity || sphereCount;
+    state.metrics.outerSphereParticles = state.outerSphere?.geometry?.userData?.particleCount || 0;
+    state.metrics.outerSphereCapacity = state.outerSphere?.geometry?.userData?.capacity || 0;
+    state.metrics.orbitRingParticles = ringCountPer;
+
+    // Reapply theme colors to updated geometry
     applyThemeColors(themes[state.params.theme]);
   }
 
@@ -1395,8 +1676,9 @@ export function initScene() {
         uniforms.uFresnel.value = eyeCfg.corneaFresnel ?? 1.25;
         const lightColor = state.centralLight?.color || new THREE.Color(0xffffff);
         const tintMix = THREE.MathUtils.clamp(eyeCfg.corneaTintMix ?? 0.25, 0, 1);
-        const tint = new THREE.Color(0xffffff).lerp(lightColor, tintMix);
-        uniforms.uTint.value.copy(tint);
+        const corneaTint = state._corneaTintColor;
+        corneaTint.setRGB(1, 1, 1).lerp(lightColor, tintMix);
+        uniforms.uTint.value.copy(corneaTint);
         const opacityBase = eyeCfg.corneaOpacity ?? 0.65;
         const opacity = Math.min(1, opacityBase + (isDrop ? 0.15 : 0));
         uniforms.uOpacity.value = opacity;
@@ -1570,7 +1852,8 @@ export function initScene() {
     const chromaMix = Math.min(1, chromaInfluence * dominantChromaEnergy);
     const baseHue = THREE.MathUtils.euclideanModulo(0.6 + 0.4 * centroid, 1);
     const hue = THREE.MathUtils.lerp(baseHue, chromaHue, chromaMix);
-    const centralColor = new THREE.Color().setHSL(hue, 0.65 + 0.15 * centroid, 0.55 + 0.25 * rms);
+    const centralColor = state._centralColor;
+    centralColor.setHSL(hue, 0.65 + 0.15 * centroid, 0.55 + 0.25 * rms);
     state.metrics.lightHue = hue;
     state.metrics.lightMix = chromaMix;
     state.centralLight.color.lerp(centralColor, 0.05);
@@ -1773,7 +2056,8 @@ export function initScene() {
         else if (hue <= 4.0/6.0) { rt = 0.0; gt = x; bt = c; }
         else if (hue <= 5.0/6.0) { rt = x; gt = 0.0; bt = c; }
         else { rt = c; gt = 0.0; bt = x; }
-        const tintColor = new THREE.Color(rt + m, gt + m, bt + m);
+        const tintColor = state._dispersionTintColor;
+        tintColor.setRGB(rt + m, gt + m, bt + m);
         const brightness = brightBase + brightGain * rms + (typeof perf.dispersionBrightnessBoost === 'number' ? perf.dispersionBrightnessBoost : 0);
         const contrast = contrastBase + contrastGain * (bass * 0.6 + treble * 0.4);
 
@@ -1814,8 +2098,18 @@ export function initScene() {
         }
         // Remove old events
         const cutoff = nowMs - Math.max(80, stutterWindowMs);
-        state.dispersion.stutterTimes = state.dispersion.stutterTimes.filter(t0 => t0 >= cutoff);
-        const stutterCount = state.dispersion.stutterTimes.length >= 2 ? 1 : 0;
+        const stutterTimes = state.dispersion.stutterTimes;
+        if (Array.isArray(stutterTimes) && stutterTimes.length) {
+          let write = 0;
+          for (let idx = 0; idx < stutterTimes.length; idx++) {
+            const t0 = stutterTimes[idx];
+            if (t0 >= cutoff) {
+              stutterTimes[write++] = t0;
+            }
+          }
+          if (write < stutterTimes.length) stutterTimes.length = write;
+        }
+        const stutterCount = (Array.isArray(state.dispersion.stutterTimes) && state.dispersion.stutterTimes.length >= 2) ? 1 : 0;
         if (stutterCount && flipOnStutter && !twistFlippedThisFrame) {
           state.dispersion.twistDir = (state.dispersion.twistDir || 1) * -1;
           twistFlippedThisFrame = true;

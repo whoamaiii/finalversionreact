@@ -64,15 +64,34 @@ class AnalysisProcessor extends AudioWorkletProcessor {
     this._fluxIndex = 0;
     this._fluxCount = 0;
     this._frameCounter = 0;
+    this._bufferPool = [];
+    this._nextBufferId = 1;
 
     this.port.onmessage = (event) => {
-      if (event.data && event.data.type === 'reset') {
+      const data = event?.data;
+      if (!data || !data.type) return;
+      if (data.type === 'reset') {
         this._prevMagnitudes.fill(0);
         this._fluxRing.fill(0);
         this._fluxIndex = 0;
         this._fluxCount = 0;
+      } else if (data.type === 'release-buffer') {
+        const bufferId = data.bufferId;
+        const buffer = data.buffer;
+        if (typeof bufferId === 'number' && buffer instanceof ArrayBuffer) {
+          this._bufferPool.push({ buffer, id: bufferId });
+        }
       }
     };
+  }
+
+  _acquireBuffer() {
+    if (this._bufferPool.length) {
+      return this._bufferPool.pop();
+    }
+    const buffer = new ArrayBuffer(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
+    const id = this._nextBufferId++;
+    return { buffer, id };
   }
 
   process(inputs, outputs) {
@@ -149,7 +168,8 @@ class AnalysisProcessor extends AudioWorkletProcessor {
     }
     fluxVar = this._fluxCount ? fluxVar / this._fluxCount : 0;
 
-    const frameCopy = new Float32Array(FRAME_SIZE);
+    const bufferEntry = this._acquireBuffer();
+    const frameCopy = new Float32Array(bufferEntry.buffer);
     frameCopy.set(frame);
 
     this.port.postMessage({
@@ -160,6 +180,7 @@ class AnalysisProcessor extends AudioWorkletProcessor {
       fluxMean,
       fluxStd: Math.sqrt(Math.max(fluxVar, 0)),
       dc: this._dcState[0] || 0,
+      bufferId: bufferEntry.id,
       samples: frameCopy.buffer,
     }, [frameCopy.buffer]);
   }

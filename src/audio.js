@@ -134,11 +134,15 @@ export class AudioEngine {
     this.freqData = null;               // Uint8Array - frequency data (0-255 for each frequency bin)
     this.timeData = null;               // Uint8Array - waveform data (0-255 for each sample)
     this.sampleRate = 48000;            // Audio sample rate (samples per second)
+    this.monitorGain = null;            // Gain node for optional monitoring to speakers
+    this.monitorEnabled = true;         // Monitor output to destination by default (can be toggled)
+    this._monitorConnected = false;
 
     // Feature extraction state
     this.prevMag = null; // previous normalized magnitude spectrum (Float32)
     this.fluxHistory = [];
     this.fluxWindow = 43; // ~0.5s at 86 fps of analyser pulls (approx)
+    this._maxFluxHistoryLength = 512;
     this.sensitivity = 1.0; // beat threshold multiplier
     this.smoothing = 0.55; // EMA smoothing for RMS/bands (rave tuned)
     this.bandSplit = { sub: 90, low: 180, mid: 2500 }; // Hz (rave tuned)
@@ -188,6 +192,7 @@ export class AudioEngine {
     this.dropUseBassFlux = false; // can be enabled via presets (Rave Mode)
     this.bassFluxHistory = [];
     this.bassFluxWindow = 43;
+    this._maxBassFluxHistoryLength = 512;
     this._prevMagBass = null;
 
     // Adaptive thresholds (learn per-track in warmup period)
@@ -221,6 +226,8 @@ export class AudioEngine {
     this.workletEnabled = false;
     this._workletInitPromise = null;
     this._workletFrame = null;
+    this._workletFrameBuffer = null;
+    this._workletFrameBufferId = -1;
     this._workletFrameId = -1;
     this._lastFluxFrameId = -1;
     this._lastMeydaFrameId = -1;
@@ -233,6 +240,12 @@ export class AudioEngine {
     this._aubioModule = null;
     this._aubio = { onset: null, tempo: null, pitch: null };
     this._aubioQueue = [];
+    this._aubioBufferPool = new Map();
+    this._aubioQueueMax = 12;
+    this._aubioQueueDrops = 0;
+    this._aubioQueueHighWater = 0;
+    this._aubioQueueLastWarningAt = 0;
+    this.aubioMetrics = { queueDepth: 0, highWater: 0, dropped: 0, maxDepth: this._aubioQueueMax };
     this._aubioLastFrameId = -1;
     this._aubioConfiguredSampleRate = null;
     this.aubioFeatures = {
@@ -274,10 +287,14 @@ export class AudioEngine {
     this.tempoAssistEnabled = false;
     this.tempoIntervalMs = 0;
     this._lastTempoMs = 0;
-    this._lastAudioBuffer = null; // only set for file playback
+    this._lastMonoBuffer = null;
+    this._lastMonoSampleRate = 0;
+    this._lastMonoDuration = 0;
 
     // Tap-tempo & quantization
     this.tapTimestamps = [];
+    this.maxTapHistoryLength = 8;
+    this.tapHistoryWindowMs = 12000;
     this.tapBpm = null;
     this.tapTempoIntervalMs = 0;
     this.tapQuantizeEnabled = false;
@@ -285,10 +302,21 @@ export class AudioEngine {
     this._tapMultiplier = 1;
 
     // Rolling live-audio buffer (for BPM recalc on live sources)
-    this._liveBufferSec = 20; // keep ~20s of recent audio
+    this._liveBufferMaxSec = 30; // hard ceiling to prevent runaway allocations
+    this._liveBufferMinSec = 4;  // minimum window that still yields stable BPM
+    this._liveBufferSec = this._clampLiveBufferSeconds(20); // keep ~20s of recent audio
     this._liveBuffer = null; // Float32Array ring buffer (mono)
     this._liveBufferWrite = 0;
     this._liveBufferFilled = 0;
+    this._liveBufferLargestSamples = 0;
+    this._liveBufferStats = {
+      capacitySamples: 0,
+      capacitySeconds: 0,
+      filledSamples: 0,
+      utilization: 0,
+    };
+    this._liveScratchBuffer = null;
+    this._liveScratchCapacity = 0;
 
     // Webcam feature removed
   }
@@ -345,6 +373,11 @@ export class AudioEngine {
       this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
       this.timeData = new Uint8Array(this.analyser.fftSize);
       this.timeDataFloat = new Float32Array(this.analyser.fftSize);
+    }
+
+    if (!this.monitorGain) {
+      this.monitorGain = this.ctx.createGain();
+      this.monitorGain.gain.value = 1;
     }
 
     // Connect audio graph: source → gain → worklet (optional) → analyser
@@ -557,7 +590,10 @@ export class AudioEngine {
     this.source = src;
     this.isPlayingFile = true;
     this.activeStream = null;
-    this._lastAudioBuffer = audioBuf; // Store for BPM recalculation
+    const monoForAnalysis = this._downmixToMono(audioBuf);
+    this._lastMonoBuffer = monoForAnalysis;
+    this._lastMonoSampleRate = audioBuf.sampleRate || this.sampleRate || 44100;
+    this._lastMonoDuration = audioBuf.duration || (monoForAnalysis ? monoForAnalysis.length / Math.max(1, this._lastMonoSampleRate) : 0);
     // Track playback timeline for downbeat gating
     this._fileStartCtxTimeSec = this.ctx.currentTime;
     this._fileDurationSec = audioBuf.duration || 0;
@@ -580,14 +616,14 @@ export class AudioEngine {
 
     // Fire-and-forget BPM estimation for tempo assist
     // This runs in the background and updates bpmEstimate when done
-    const bpmPromise = this._estimateBpmFromBuffer(audioBuf, bpmAnalysis).catch((err) => {
+    const bpmPromise = this._estimateBpmFromBuffer(audioBuf, bpmAnalysis, monoForAnalysis).catch((err) => {
       console.warn('BPM estimation failed:', err);
       return null;
     });
 
     // Run Essentia analysis for beat grid detection
     // This provides precise beat tracking and tempo information
-    const essentiaPromise = this._runEssentiaAnalysis(audioBuf, essentiaAnalysis).catch((err) => {
+    const essentiaPromise = this._runEssentiaAnalysis(audioBuf, essentiaAnalysis, monoForAnalysis).catch((err) => {
       console.warn('Essentia analysis failed', err);
       return null;
     });
@@ -635,7 +671,14 @@ export class AudioEngine {
     this.isPlayingFile = false;
     this._fileStartCtxTimeSec = 0;
     this._fileDurationSec = 0;
-    
+    this._lastMonoBuffer = null;
+    this._lastMonoSampleRate = 0;
+    this._lastMonoDuration = 0;
+
+    this._releaseWorkletFrameBuffer();
+    this._flushAubioQueue();
+    this._disposeLiveBuffer();
+
     // Reset worklet state
     if (this.workletNode) {
       try { this.workletNode.port.postMessage({ type: 'reset' }); } catch (_) {}
@@ -841,10 +884,10 @@ export class AudioEngine {
   getBpmConfidence() { return this.bpmEstimateConfidence || 0; }
   getBpmSource() { return this.bpmEstimateSource || ''; }
   async recalcBpm() {
-    if (this._lastAudioBuffer) {
-      await this._estimateBpmFromBuffer(this._lastAudioBuffer);
+    if (this._lastMonoBuffer && this._lastMonoBuffer.length) {
+      await this._estimateBpmFromBuffer(null, undefined, this._lastMonoBuffer, this._lastMonoSampleRate);
       // Also compute/refresh beat grid via Essentia to backfill BPM if guess failed
-      try { this._runEssentiaAnalysis(this._lastAudioBuffer); } catch(_) {}
+      try { this._runEssentiaAnalysis(null, undefined, this._lastMonoBuffer); } catch(_) {}
       return;
     }
     const live = this._buildLiveAudioBuffer(12);
@@ -860,12 +903,16 @@ export class AudioEngine {
   tapBeat() {
     const now = performance.now();
     const taps = this.tapTimestamps;
+    const maxAgeMs = Math.max(0, Math.floor(this.tapHistoryWindowMs || 0));
+    if (maxAgeMs > 0) {
+      while (taps.length && now - taps[0] > maxAgeMs) taps.shift();
+    }
     // debounce taps that are too close (configurable with minimum 10ms to prevent abuse)
     const effectiveDebounce = Math.max(this.tapDebounceMs, 10);
     if (taps.length && now - taps[taps.length - 1] < effectiveDebounce) return;
     taps.push(now);
-    // keep last 8 taps, enforce hard limit with while loop
-    while (taps.length > 8) taps.shift();
+    const maxStoredTaps = Math.max(1, Math.floor(this.maxTapHistoryLength || 8));
+    while (taps.length > maxStoredTaps) taps.shift();
     if (taps.length >= 2) {
       // compute intervals between consecutive taps
       const intervals = [];
@@ -929,6 +976,7 @@ export class AudioEngine {
 
   _ensureGraph() {
     if (!this.gainNode || !this.analyser) return;
+    this._teardownMonitorRouting();
     try { this.gainNode.disconnect(); } catch (_) {}
     if (this.workletNode) {
       try { this.workletNode.disconnect(); } catch (_) {}
@@ -937,6 +985,44 @@ export class AudioEngine {
     } else {
       this.gainNode.connect(this.analyser);
     }
+    this._updateMonitorRouting();
+  }
+
+  _updateMonitorRouting() {
+    if (!this.analyser || !this.ctx) return;
+    if (!this.monitorEnabled) {
+      this._teardownMonitorRouting();
+      return;
+    }
+    if (!this.monitorGain) {
+      this.monitorGain = this.ctx.createGain();
+      this.monitorGain.gain.value = 1;
+    }
+    if (this._monitorConnected) return;
+    try { this.monitorGain.disconnect(); } catch (_) {}
+    try { this.analyser.connect(this.monitorGain); } catch (_) {}
+    try { this.monitorGain.connect(this.ctx.destination); } catch (_) {}
+    this._monitorConnected = true;
+  }
+
+  _teardownMonitorRouting() {
+    if (!this.monitorGain) {
+      this._monitorConnected = false;
+      return;
+    }
+    try { if (this.analyser) this.analyser.disconnect(this.monitorGain); } catch (_) {}
+    try { this.monitorGain.disconnect(); } catch (_) {}
+    this._monitorConnected = false;
+  }
+
+  setMonitorEnabled(enabled) {
+    this.monitorEnabled = !!enabled;
+    if (this.monitorEnabled) this._updateMonitorRouting();
+    else this._teardownMonitorRouting();
+  }
+
+  isMonitorEnabled() {
+    return !!this.monitorEnabled;
   }
 
   async _maybeInitWorklet() {
@@ -992,8 +1078,13 @@ export class AudioEngine {
     this._workletFrameTimestamp = performance.now();
 
     let frameArray = null;
-    if (data.samples) {
-      // Clone the array to prevent race conditions with concurrent messages
+    if (data.samples instanceof ArrayBuffer) {
+      this._workletFrameBuffer = data.samples;
+      this._workletFrameBufferId = typeof data.bufferId === 'number' ? data.bufferId : -1;
+      frameArray = new Float32Array(this._workletFrameBuffer);
+      this._workletFrame = frameArray;
+    } else if (data.samples) {
+      // Fallback for legacy worklet messages without transferable buffers
       frameArray = new Float32Array(data.samples.slice ? data.samples.slice() : data.samples);
       this._workletFrame = frameArray;
     }
@@ -1003,10 +1094,39 @@ export class AudioEngine {
     if (typeof data.fluxStd === 'number') this._workletFeatures.fluxStd = data.fluxStd;
 
     if (frameArray) {
-      this._enqueueAubioFrame(frameArray, frameId);
+      const aubioBuffer = this._acquireAubioScratch(frameArray.length);
+      aubioBuffer.set(frameArray);
       // Append to rolling live buffer for later BPM estimation
-      this._appendToLiveBuffer(frameArray);
+      this._appendToLiveBuffer(aubioBuffer);
+      this._enqueueAubioFrame(aubioBuffer, frameId);
     }
+  }
+
+  _releaseWorkletFrameBuffer() {
+    if (!this._workletFrameBuffer) return;
+    if (!this.workletNode || typeof this.workletNode.port?.postMessage !== 'function') {
+      this._workletFrameBuffer = null;
+      this._workletFrameBufferId = -1;
+      return;
+    }
+    if (typeof this._workletFrameBufferId === 'number' && this._workletFrameBufferId >= 0) {
+      try {
+        this.workletNode.port.postMessage(
+          {
+            type: 'release-buffer',
+            bufferId: this._workletFrameBufferId,
+            buffer: this._workletFrameBuffer,
+          },
+          [this._workletFrameBuffer]
+        );
+      } catch (_) {
+        // Ignore transfer failures; buffer will be GC'd
+      }
+    }
+    this._workletFrameBuffer = null;
+    this._workletFrameBufferId = -1;
+    this._workletFrame = null;
+    this._workletFrameTimestamp = 0;
   }
 
   _consumeWorkletFlux() {
@@ -1018,20 +1138,20 @@ export class AudioEngine {
     if (frameId !== this._lastFluxFrameId) {
       this._lastFluxFrameId = frameId;
       this.fluxHistory.push(flux);
-      if (this.fluxHistory.length > this.fluxWindow) this.fluxHistory.shift();
+      this._trimFluxHistory();
       this.prevMag = null; // reset FFT state when using worklet
     }
     return flux;
   }
 
-  async _estimateBpmFromBuffer(buffer, thisAnalysis = {}) {
-    if (!buffer) return null;
+  async _estimateBpmFromBuffer(buffer, thisAnalysis = {}, monoData = null, monoSampleRate = null) {
+    if (!buffer && (!monoData || !monoData.length)) return null;
 
     // Use provided analysis reference for race condition checking
     // (passed from loadFile to ensure atomicity)
 
-    const sampleRate = buffer.sampleRate || this.sampleRate || 44100;
-    const mono = this._extractMonoBuffer(buffer);
+    const sampleRate = buffer?.sampleRate || monoSampleRate || this._lastMonoSampleRate || this.sampleRate || 44100;
+    const mono = (monoData && monoData.length) ? monoData : this._extractMonoBuffer(buffer);
     if (!mono || !mono.length) return null;
 
     const segments = this._buildBpmAnalysisSegments(buffer, mono, sampleRate);
@@ -1100,12 +1220,15 @@ export class AudioEngine {
       return segments;
     }
 
-    segments.push({
-      label: 'full',
-      mono,
-      audioBuffer: buffer,
-      weight: mono.length >= sr * 30 ? 2 : 1.5,
-    });
+    const fullBuffer = buffer || (this.ctx ? this._createAudioBufferFromMonoSegment(mono, sr) : null);
+    if (fullBuffer) {
+      segments.push({
+        label: 'full',
+        mono,
+        audioBuffer: fullBuffer,
+        weight: mono.length >= sr * 30 ? 2 : 1.5,
+      });
+    }
 
     const totalSamples = mono.length;
     const minSliceSec = 10;
@@ -1299,13 +1422,83 @@ export class AudioEngine {
     return bpm;
   }
 
+  _clampLiveBufferSeconds(seconds) {
+    const min = Number.isFinite(this._liveBufferMinSec) ? Math.max(1, this._liveBufferMinSec) : 4;
+    const max = Number.isFinite(this._liveBufferMaxSec) ? Math.max(min, this._liveBufferMaxSec) : Math.max(min, 30);
+    const value = Number.isFinite(seconds) ? seconds : this._liveBufferSec || min;
+    return Math.min(max, Math.max(min, value));
+  }
+
+  setLiveBufferDuration(seconds) {
+    const clamped = this._clampLiveBufferSeconds(seconds);
+    if (clamped === this._liveBufferSec) return;
+    this._liveBufferSec = clamped;
+    this._disposeLiveBuffer();
+  }
+
+  _disposeLiveBuffer() {
+    this._liveBuffer = null;
+    this._liveBufferWrite = 0;
+    this._liveBufferFilled = 0;
+    this._updateLiveBufferStats();
+  }
+
+  _resetLiveBufferContents() {
+    if (this._liveBuffer) {
+      this._liveBuffer.fill(0);
+    }
+    this._liveBufferWrite = 0;
+    this._liveBufferFilled = 0;
+    this._updateLiveBufferStats();
+  }
+
+  _updateLiveBufferStats() {
+    if (!this._liveBuffer) {
+      this._liveBufferStats.capacitySamples = 0;
+      this._liveBufferStats.capacitySeconds = 0;
+      this._liveBufferStats.filledSamples = 0;
+      this._liveBufferStats.utilization = 0;
+      return;
+    }
+    const sr = this.sampleRate || 44100;
+    this._liveBufferStats.capacitySamples = this._liveBuffer.length;
+    this._liveBufferStats.capacitySeconds = this._liveBuffer.length / sr;
+    this._liveBufferStats.filledSamples = Math.min(this._liveBufferFilled, this._liveBuffer.length);
+    this._liveBufferStats.utilization = this._liveBuffer.length > 0
+      ? this._liveBufferStats.filledSamples / this._liveBuffer.length
+      : 0;
+  }
+
+  getLiveBufferStats() {
+    return { ...this._liveBufferStats };
+  }
+
   _ensureLiveBuffer() {
     const sr = this.sampleRate || 44100;
+    this._liveBufferSec = this._clampLiveBufferSeconds(this._liveBufferSec);
     const desiredLength = Math.max(1, Math.floor(sr * this._liveBufferSec));
     if (!this._liveBuffer || this._liveBuffer.length !== desiredLength) {
       this._liveBuffer = new Float32Array(desiredLength);
       this._liveBufferWrite = 0;
       this._liveBufferFilled = 0;
+      this._updateLiveBufferStats();
+      if (desiredLength > this._liveBufferLargestSamples) {
+        this._liveBufferLargestSamples = desiredLength;
+        const bytes = desiredLength * Float32Array.BYTES_PER_ELEMENT;
+        const seconds = desiredLength / sr;
+        console.debug(`[AudioEngine] live buffer resized to ${seconds.toFixed(1)}s (${(bytes / 1024 / 1024).toFixed(2)} MiB)`);
+      }
+      if (typeof this.onLiveBufferResize === 'function') {
+        try {
+          this.onLiveBufferResize({
+            capacitySamples: desiredLength,
+            capacitySeconds: desiredLength / sr,
+            bytes: desiredLength * Float32Array.BYTES_PER_ELEMENT,
+          });
+        } catch (_) {
+          // ignore listener errors
+        }
+      }
     }
   }
 
@@ -1314,13 +1507,126 @@ export class AudioEngine {
     this._ensureLiveBuffer();
     const buf = this._liveBuffer;
     const N = buf.length;
-    let w = this._liveBufferWrite;
-    for (let i = 0; i < samples.length; i++) {
-      buf[w++] = samples[i];
-      if (w >= N) w = 0;
+    let writeIndex = this._liveBufferWrite;
+    const sliceView = (arr, start, end) => {
+      if (ArrayBuffer.isView(arr) && typeof arr.subarray === 'function') {
+        return arr.subarray(start, end);
+      }
+      return arr.slice(start, end);
+    };
+    const source = samples.length > N ? sliceView(samples, samples.length - N) : samples;
+    if (source.length === N) {
+      buf.set(source);
+      writeIndex = 0;
+    } else {
+      const remaining = N - writeIndex;
+      if (source.length <= remaining) {
+        buf.set(source, writeIndex);
+        writeIndex = (writeIndex + source.length) % N;
+      } else {
+        buf.set(sliceView(source, 0, remaining), writeIndex);
+        const tailCount = source.length - remaining;
+        buf.set(sliceView(source, remaining), 0);
+        writeIndex = tailCount % N;
+      }
     }
-    this._liveBufferWrite = w;
-    this._liveBufferFilled = Math.min(N, this._liveBufferFilled + samples.length);
+    this._liveBufferWrite = writeIndex;
+    this._liveBufferFilled = Math.min(N, this._liveBufferFilled + source.length);
+    this._updateLiveBufferStats();
+  }
+
+  _acquireLiveScratch(size) {
+    const wanted = Math.max(0, size | 0);
+    if (wanted === 0) {
+      return new Float32Array(0);
+    }
+    if (!this._liveScratchBuffer || this._liveScratchCapacity < wanted) {
+      const prev = this._liveScratchCapacity || 1024;
+      const newCapacity = Math.max(wanted, Math.ceil(prev * 1.5));
+      this._liveScratchBuffer = new Float32Array(newCapacity);
+      this._liveScratchCapacity = newCapacity;
+    }
+    return this._liveScratchBuffer.subarray(0, wanted);
+  }
+
+  _trimFluxHistory() {
+    const maxLimit = Number.isFinite(this._maxFluxHistoryLength)
+      ? Math.max(1, Math.floor(this._maxFluxHistoryLength))
+      : Number.POSITIVE_INFINITY;
+    const desired = Math.max(1, Math.floor(this.fluxWindow || 1));
+    const limit = Math.min(desired, maxLimit);
+    if (limit !== this.fluxWindow) this.fluxWindow = limit;
+    while (this.fluxHistory.length > limit) {
+      this.fluxHistory.shift();
+    }
+  }
+
+  _trimBassFluxHistory() {
+    const maxLimit = Number.isFinite(this._maxBassFluxHistoryLength)
+      ? Math.max(1, Math.floor(this._maxBassFluxHistoryLength))
+      : Number.POSITIVE_INFINITY;
+    const desired = Math.max(1, Math.floor(this.bassFluxWindow || 1));
+    const limit = Math.min(desired, maxLimit);
+    if (limit !== this.bassFluxWindow) this.bassFluxWindow = limit;
+    while (this.bassFluxHistory.length > limit) {
+      this.bassFluxHistory.shift();
+    }
+  }
+
+  setMaxFluxHistoryLength(limit) {
+    if (!Number.isFinite(limit) || limit <= 0) return;
+    this._maxFluxHistoryLength = Math.floor(limit);
+    this._trimFluxHistory();
+  }
+
+  setMaxBassFluxHistoryLength(limit) {
+    if (!Number.isFinite(limit) || limit <= 0) return;
+    this._maxBassFluxHistoryLength = Math.floor(limit);
+    this._trimBassFluxHistory();
+  }
+
+  setAubioQueueMax(capacity) {
+    if (!Number.isFinite(capacity) || capacity <= 0) return;
+    this._aubioQueueMax = Math.max(1, Math.floor(capacity));
+    this.aubioMetrics.maxDepth = this._aubioQueueMax;
+    this._enforceAubioQueueCapacity();
+  }
+
+  _resetAubioMetrics({ resetHighWater = true } = {}) {
+    if (resetHighWater) {
+      this._aubioQueueHighWater = 0;
+      this.aubioMetrics.highWater = 0;
+    }
+    this._aubioQueueDrops = 0;
+    this._aubioQueueLastWarningAt = 0;
+    this.aubioMetrics.queueDepth = this._aubioQueue.length;
+    this.aubioMetrics.dropped = 0;
+    this.aubioMetrics.maxDepth = this._aubioQueueMax;
+  }
+
+  _updateAubioMetrics() {
+    this.aubioMetrics.queueDepth = this._aubioQueue.length;
+    if (this._aubioQueueHighWater > this.aubioMetrics.highWater) {
+      this.aubioMetrics.highWater = this._aubioQueueHighWater;
+    }
+    this.aubioMetrics.dropped = this._aubioQueueDrops;
+    this.aubioMetrics.maxDepth = this._aubioQueueMax;
+  }
+
+  getAubioQueueStats() {
+    return { ...this.aubioMetrics };
+  }
+
+  _enforceAubioQueueCapacity() {
+    const maxDepth = Math.max(1, Math.floor(this._aubioQueueMax || 1));
+    while (this._aubioQueue.length > maxDepth) {
+      const dropped = this._aubioQueue.shift();
+      if (dropped && dropped.buffer) {
+        this._releaseAubioScratch(dropped.buffer);
+      }
+      this._aubioQueueDrops += 1;
+    }
+    this._updateAubioMetrics();
   }
 
   _buildLiveAudioBuffer(seconds = 12) {
@@ -1331,7 +1637,7 @@ export class AudioEngine {
     if (N < sr * 4) { // need at least ~4s to get a stable guess
       return null;
     }
-    const out = new Float32Array(N);
+    const out = this._acquireLiveScratch(N);
     const ring = this._liveBuffer;
     const R = ring.length;
     let start = this._liveBufferWrite - N;
@@ -1428,12 +1734,66 @@ export class AudioEngine {
     this._aubioConfiguredSampleRate = sr;
 
     if (this._aubioQueue.length) {
-      const queued = this._aubioQueue.slice();
-      this._aubioQueue.length = 0;
-      for (const item of queued) {
-        this._processAubioFrame(item.buffer, item.frameId);
+      while (this._aubioQueue.length) {
+        const item = this._aubioQueue.shift();
+        if (!item) continue;
+        try {
+          this._processAubioFrame(item.buffer, item.frameId);
+        } finally {
+          if (item.buffer) this._releaseAubioScratch(item.buffer);
+        }
       }
     }
+  }
+
+  _acquireAubioScratch(length) {
+    const size = Math.max(0, length | 0);
+    if (!size) {
+      return new Float32Array(0);
+    }
+    if (!this._aubioBufferPool) {
+      this._aubioBufferPool = new Map();
+    }
+    const pool = this._aubioBufferPool.get(size);
+    if (pool && pool.length) {
+      return pool.pop();
+    }
+    return new Float32Array(size);
+  }
+
+  _releaseAubioScratch(buffer) {
+    if (!buffer || !buffer.length) {
+      return;
+    }
+    if (!this._aubioBufferPool) {
+      this._aubioBufferPool = new Map();
+    }
+    const size = buffer.length;
+    let pool = this._aubioBufferPool.get(size);
+    if (!pool) {
+      pool = [];
+      this._aubioBufferPool.set(size, pool);
+    }
+    // Cap pool depth to avoid unbounded growth
+    if (pool.length >= 6) {
+      return;
+    }
+    pool.push(buffer);
+  }
+
+  _flushAubioQueue() {
+    if (!Array.isArray(this._aubioQueue) || !this._aubioQueue.length) {
+      this._aubioQueue = [];
+      this._resetAubioMetrics();
+      return;
+    }
+    for (const item of this._aubioQueue) {
+      if (item && item.buffer) {
+        this._releaseAubioScratch(item.buffer);
+      }
+    }
+    this._aubioQueue.length = 0;
+    this._resetAubioMetrics();
   }
 
   _enqueueAubioFrame(buffer, frameId = -1) {
@@ -1441,15 +1801,34 @@ export class AudioEngine {
 
     const aubioReady = this._aubioModule && (this._aubio.onset || this._aubio.tempo || this._aubio.pitch);
     if (aubioReady) {
-      if (frameId === this._aubioLastFrameId) return;
-      this._processAubioFrame(buffer, frameId);
+      if (frameId === this._aubioLastFrameId) {
+        this._releaseAubioScratch(buffer);
+        return;
+      }
+      try {
+        this._processAubioFrame(buffer, frameId);
+      } finally {
+        this._releaseAubioScratch(buffer);
+      }
       return;
     }
 
-    if (this._aubioQueue.length > 12) {
-      this._aubioQueue.shift();
+    const maxDepth = Math.max(1, Math.floor(this._aubioQueueMax || 1));
+    if (this._aubioQueue.length >= maxDepth) {
+      const dropped = this._aubioQueue.shift();
+      if (dropped && dropped.buffer) {
+        this._releaseAubioScratch(dropped.buffer);
+      }
+      this._aubioQueueDrops += 1;
+      const now = performance.now();
+      if (!this._aubioQueueLastWarningAt || now - this._aubioQueueLastWarningAt > 5000) {
+        this._aubioQueueLastWarningAt = now;
+        console.warn('[AudioEngine] Aubio processing backlog — dropping oldest frame');
+      }
     }
-    this._aubioQueue.push({ buffer: buffer.slice(0), frameId });
+    this._aubioQueue.push({ buffer, frameId });
+    this._aubioQueueHighWater = Math.max(this._aubioQueueHighWater, this._aubioQueue.length);
+    this._updateAubioMetrics();
     this._ensureAubioLoaded();
   }
 
@@ -1573,7 +1952,7 @@ export class AudioEngine {
 
   // toast handled via centralized helper in toast.js
 
-  async _runEssentiaAnalysis(buffer, thisAnalysis = {}) {
+  async _runEssentiaAnalysis(buffer, thisAnalysis = {}, monoData = null) {
     // Use provided analysis reference for race condition checking
     // (passed from loadFile to ensure atomicity)
 
@@ -1584,7 +1963,7 @@ export class AudioEngine {
     }
     if (!this._essentiaWorker) return;
 
-    const mono = this._extractMonoBuffer(buffer);
+    const mono = (monoData && monoData.length) ? monoData : this._extractMonoBuffer(buffer);
     if (!mono) return;
 
     const jobId = ++this._essentiaCurrentJobId;
@@ -1596,34 +1975,62 @@ export class AudioEngine {
     }
     this._essentiaAnalysisByJobId.set(jobId, thisAnalysis);
 
+    const sampleRate = buffer?.sampleRate || this._lastMonoSampleRate || this.sampleRate || 44100;
+    const usingSharedMono = !!(monoData && monoData.length);
+    const duration = buffer?.duration || (usingSharedMono && this._lastMonoDuration
+      ? this._lastMonoDuration
+      : (sampleRate > 0 ? mono.length / sampleRate : 0));
     try {
       this._essentiaWorker.postMessage({
         type: 'analyze',
         jobId,
         payload: {
-          sampleRate: buffer.sampleRate,
-          duration: buffer.duration,
+          sampleRate,
+          duration,
           channelData: mono,
         },
-      }, [mono.buffer]);
+      }, usingSharedMono || !mono?.buffer ? undefined : [mono.buffer]);
     } catch (err) {
       console.warn('Failed to post Essentia job', err);
       this._essentiaAnalysisByJobId.delete(jobId);
     }
   }
 
-  _extractMonoBuffer(buffer) {
+  _downmixToMono(buffer) {
     if (!buffer) return null;
-    const length = buffer.length;
+    const length = buffer.length || 0;
+    if (!length) return new Float32Array(0);
     const channels = buffer.numberOfChannels || 1;
     const mono = new Float32Array(length);
-    for (let c = 0; c < channels; c++) {
-      const channelData = buffer.getChannelData(c);
+    try {
+      const baseChannel = buffer.getChannelData(0);
+      if (baseChannel && typeof baseChannel.length === 'number') {
+        mono.set(baseChannel);
+      }
+    } catch (_) {
+      // If channel data retrieval fails, leave mono zero-initialized
+    }
+    if (channels > 1) {
+      for (let c = 1; c < channels; c++) {
+        try {
+          const channelData = buffer.getChannelData(c);
+          for (let i = 0; i < length; i++) {
+            mono[i] += channelData[i];
+          }
+        } catch (_) {
+          // Skip channels that fail to provide data
+        }
+      }
+      const inv = 1 / channels;
       for (let i = 0; i < length; i++) {
-        mono[i] += channelData[i] / channels;
+        mono[i] *= inv;
       }
     }
     return mono;
+  }
+
+  _extractMonoBuffer(buffer) {
+    return this._downmixToMono(buffer);
   }
 
   _applyEssentiaResult(result, thisAnalysis) {
@@ -1701,11 +2108,13 @@ export class AudioEngine {
     let bufferSize = 0;
     let frameIdForMeyda = -1;
     let aubioCandidate = null;
+    let usedWorkletBuffer = false;
 
     if (this.workletEnabled && this._workletFrame && this._workletFrameId !== this._lastMeydaFrameId) {
       bufferForAnalysis = this._workletFrame;
       bufferSize = bufferForAnalysis.length;
       frameIdForMeyda = this._workletFrameId;
+      usedWorkletBuffer = true;
     } else {
       if (!this.timeDataFloat || this.timeDataFloat.length !== this.analyser.fftSize) {
         this.timeDataFloat = new Float32Array(this.analyser.fftSize);
@@ -1743,6 +2152,7 @@ export class AudioEngine {
       );
     } catch (err) {
       // Meyda may throw if fed denormal data; skip frame
+      if (usedWorkletBuffer) this._releaseWorkletFrameBuffer();
       return this.meydaFeatures;
     }
 
@@ -1756,7 +2166,10 @@ export class AudioEngine {
       this._appendToLiveBuffer(bufferForAnalysis);
     }
 
-    if (!result) return this.meydaFeatures;
+    if (!result) {
+      if (usedWorkletBuffer) this._releaseWorkletFrameBuffer();
+      return this.meydaFeatures;
+    }
 
     const mfccRaw = Array.isArray(result.mfcc) ? result.mfcc.slice(0, 13) : [];
     while (mfccRaw.length < 13) mfccRaw.push(0);
@@ -1785,6 +2198,8 @@ export class AudioEngine {
     this.meydaFeatures.flatness = this.meydaFeatures.flatness * alpha + flatness * inv;
     this.meydaFeatures.rolloff = this.meydaFeatures.rolloff * alpha + rolloffNorm * inv;
 
+    if (usedWorkletBuffer) this._releaseWorkletFrameBuffer();
+
     return this.meydaFeatures;
   }
 
@@ -1796,16 +2211,20 @@ export class AudioEngine {
     if (!source || !source.length) return null;
     const targetSize = 512;
     if (source.length === targetSize) {
-      return source.slice(0);
+      const copy = this._acquireAubioScratch(targetSize);
+      copy.set(source);
+      return copy;
     }
-    const target = new Float32Array(targetSize);
+    const target = this._acquireAubioScratch(targetSize);
     // Check for empty source to prevent division issues
     if (source.length === 0) {
+      target.fill(0);
       return target; // Return zeros
     }
     const stride = source.length / targetSize;
     // Ensure stride is finite
     if (!isFinite(stride) || stride <= 0) {
+      target.fill(0);
       return target; // Return zeros if stride is invalid
     }
     for (let i = 0; i < targetSize; i++) {
@@ -1891,7 +2310,7 @@ export class AudioEngine {
     }
     this.prevMag = mag;
     this.fluxHistory.push(flux);
-    if (this.fluxHistory.length > this.fluxWindow) this.fluxHistory.shift();
+    this._trimFluxHistory();
     return flux;
   }
 
@@ -1918,7 +2337,7 @@ export class AudioEngine {
     }
     flux /= cutoffBin;
     this.bassFluxHistory.push(flux);
-    if (this.bassFluxHistory.length > this.bassFluxWindow) this.bassFluxHistory.shift();
+    this._trimBassFluxHistory();
     return flux;
   }
 
@@ -2245,6 +2664,17 @@ export class AudioEngine {
   dispose() {
     // Stop any active streams
     this.stop();
+    this._releaseWorkletFrameBuffer();
+
+    // Reset graph wiring state so ensureContext() rebuilds cleanly
+    this._graphConnected = false;
+
+    this._teardownMonitorRouting();
+    if (this.monitorGain) {
+      try { this.monitorGain.disconnect(); } catch (_) {}
+      this.monitorGain = null;
+    }
+    this._monitorConnected = false;
 
     // Clean up Worklet Node
     if (this.workletNode) {
@@ -2306,7 +2736,11 @@ export class AudioEngine {
     }
     this._aubioModule = null;
     this._aubioPromise = null;
+    this._flushAubioQueue();
     this._aubioQueue = [];
+    if (this._aubioBufferPool) {
+      this._aubioBufferPool.clear();
+    }
     this._aubioConfiguredSampleRate = null;
 
     // Disconnect all audio nodes
@@ -2320,22 +2754,30 @@ export class AudioEngine {
       console.warn('Error disconnecting audio nodes:', err);
     }
 
+    // Clear node references so they can be recreated on next ensureContext()
+    this.gainNode = null;
+    this.analyser = null;
+    this.analyserL = null;
+    this.analyserR = null;
+    this.splitterNode = null;
+
     // Close AudioContext
     if (this.ctx) {
+      const ctx = this.ctx;
       try {
         // Remove from global context array first
         if (typeof window !== 'undefined' && window.__reactiveCtxs && Array.isArray(window.__reactiveCtxs)) {
-          const idx = window.__reactiveCtxs.indexOf(this.ctx);
+          const idx = window.__reactiveCtxs.indexOf(ctx);
           if (idx !== -1) {
             window.__reactiveCtxs.splice(idx, 1);
           }
         }
 
         // First suspend to stop processing
-        this.ctx.suspend().then(() => {
+        ctx.suspend().then(() => {
           // Then close the context
-          if (this.ctx.state !== 'closed') {
-            this.ctx.close().catch(err => {
+          if (ctx.state !== 'closed') {
+            ctx.close().catch(err => {
               console.warn('Error closing audio context:', err);
             });
           }
@@ -2345,6 +2787,17 @@ export class AudioEngine {
       } catch (err) {
         console.warn('Error closing audio context:', err);
       }
+      // Clear context-related state after scheduling close
+      this.ctx = null;
+      this.sampleRate = 48000;
+      this.workletEnabled = false;
+      this._workletInitAttempted = false;
+      this._workletInitPromise = null;
+      this._workletFrame = null;
+      this._workletFrameId = -1;
+      this._lastFluxFrameId = -1;
+      this._workletFrameTimestamp = 0;
+      this._workletFeatures = { rms: 0, flux: 0, fluxMean: 0, fluxStd: 0 };
     }
 
     // Clear large data arrays
@@ -2353,8 +2806,12 @@ export class AudioEngine {
     this.timeDataFloat = null;
     this.freqDataL = null;
     this.freqDataR = null;
-    this._liveBuffer = null;
-    this._liveBufferWriteIdx = 0;
+    this._disposeLiveBuffer();
+    this._liveScratchBuffer = null;
+    this._liveScratchCapacity = 0;
+    this._lastMonoBuffer = null;
+    this._lastMonoSampleRate = 0;
+    this._lastMonoDuration = 0;
 
     // Clear history arrays
     this.fluxHistory = [];
@@ -2383,5 +2840,9 @@ export class AudioEngine {
     clearModuleCache('aubio');
     clearModuleCache('meyda');
     clearModuleCache('essentia');
+
+    if (typeof globalThis !== 'undefined' && typeof globalThis.gc === 'function') {
+      try { globalThis.gc(); } catch (_) {}
+    }
   }
 }

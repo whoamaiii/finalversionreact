@@ -6,6 +6,12 @@ const STATE = {
   queue: [],
   module: null,
   essentia: null,
+  extractors: {
+    sampleRate: null,
+    rhythm: null,
+    beatTracker: null,
+    loudness: null,
+  },
 };
 
 function postReady() {
@@ -147,35 +153,36 @@ function runAnalysis(essentia, payload) {
     mono = Float32Array.from(channelData);
   }
 
-  const rhythm = essentia.RhythmExtractor2013({
-    method: 'degara',
-    maxTempo: 220,
-    minTempo: 60,
-  });
+  const extractors = ensureExtractors(essentia, sampleRate);
+  if (!extractors.rhythm) {
+    return { beatTimes: [], bpm: 0, confidence: 0, duration, downbeats: [], loudness: null };
+  }
 
-  const { bpm, beats, confidence } = rhythm(mono);
+  const { bpm, beats, confidence } = extractors.rhythm(mono);
 
   const beatTimes = beats instanceof Float32Array ? Array.from(beats) : beats;
 
   let downbeats = [];
-  try {
-    const danceability = essentia.BeatTrackerMultiFeature();
-    const { beatLocations, downbeatLocations } = danceability(mono);
-    downbeats = downbeatLocations instanceof Float32Array ? Array.from(downbeatLocations) : downbeatLocations;
-  } catch (_) {
-    downbeats = [];
+  if (extractors.beatTracker) {
+    try {
+      const { beatLocations, downbeatLocations } = extractors.beatTracker(mono);
+      downbeats = downbeatLocations instanceof Float32Array ? Array.from(downbeatLocations) : downbeatLocations;
+    } catch (_) {
+      downbeats = [];
+    }
   }
 
   let loudness = null;
-  try {
-    const loudnessExtractor = essentia.BeatsLoudness();
-    const { meanLoudness, loudness: loudnessArr } = loudnessExtractor(mono);
-    loudness = {
-      mean: meanLoudness,
-      samples: loudnessArr instanceof Float32Array ? Array.from(loudnessArr) : loudnessArr,
-    };
-  } catch (_) {
-    loudness = null;
+  if (extractors.loudness) {
+    try {
+      const { meanLoudness, loudness: loudnessArr } = extractors.loudness(mono);
+      loudness = {
+        mean: meanLoudness,
+        samples: loudnessArr instanceof Float32Array ? Array.from(loudnessArr) : loudnessArr,
+      };
+    } catch (_) {
+      loudness = null;
+    }
   }
 
   return {
@@ -196,4 +203,41 @@ function serializeError(err) {
     stack: err.stack || null,
     name: err.name || 'Error',
   };
+}
+
+function ensureExtractors(essentia, sampleRate) {
+  const store = STATE.extractors;
+  if (!store.rhythm || store.sampleRate !== sampleRate) {
+    store.sampleRate = sampleRate;
+    try {
+      store.rhythm = essentia.RhythmExtractor2013({
+        method: 'degara',
+        maxTempo: 220,
+        minTempo: 60,
+        sampleRate,
+      });
+    } catch (err) {
+      console.warn('[EssentiaWorker] failed to create RhythmExtractor2013', err);
+      store.rhythm = essentia.RhythmExtractor2013({
+        method: 'degara',
+        maxTempo: 220,
+        minTempo: 60,
+      });
+    }
+
+    try {
+      store.beatTracker = essentia.BeatTrackerMultiFeature({ sampleRate });
+    } catch (err) {
+      console.warn('[EssentiaWorker] BeatTrackerMultiFeature unavailable', err);
+      store.beatTracker = null;
+    }
+
+    try {
+      store.loudness = essentia.BeatsLoudness({ sampleRate });
+    } catch (err) {
+      console.warn('[EssentiaWorker] BeatsLoudness unavailable', err);
+      store.loudness = null;
+    }
+  }
+  return store;
 }

@@ -37,7 +37,78 @@ let _activeOverflowListeners = [];
 // Store shader hotkeys handler for cleanup
 let _shaderHotkeysHandler = null;
 
-export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreenshot, openPresetLibrary, syncCoordinator, midiApi }) {
+const _trackedTimeouts = new Set();
+const _trackedDomListeners = [];
+const _trackedCleanupFns = [];
+
+function trackTimeout(handler, delay = 0, ...args) {
+  if (typeof handler !== 'function') return window.setTimeout(handler, delay, ...args);
+  const id = window.setTimeout(() => {
+    _trackedTimeouts.delete(id);
+    try {
+      handler(...args);
+    } catch (err) {
+      console.error('[SettingsUI] tracked timeout handler failed', err);
+    }
+  }, delay);
+  _trackedTimeouts.add(id);
+  return id;
+}
+
+function clearTrackedTimeout(id) {
+  if (id === undefined || id === null) return;
+  window.clearTimeout(id);
+  _trackedTimeouts.delete(id);
+}
+
+function clearAllTrackedTimeouts() {
+  for (const id of _trackedTimeouts) {
+    window.clearTimeout(id);
+  }
+  _trackedTimeouts.clear();
+}
+
+function trackDomListener(target, type, handler, options) {
+  if (!target || typeof target.addEventListener !== 'function' || typeof handler !== 'function') {
+    return () => {};
+  }
+  target.addEventListener(type, handler, options);
+  const dispose = () => {
+    try {
+      target.removeEventListener(type, handler, options);
+    } catch (_) {
+      // ignore removal errors
+    }
+  };
+  _trackedDomListeners.push(dispose);
+  return dispose;
+}
+
+function clearTrackedDomListeners() {
+  while (_trackedDomListeners.length) {
+    const dispose = _trackedDomListeners.pop();
+    try { dispose(); } catch (_) {}
+  }
+}
+
+function trackCleanup(fn) {
+  if (typeof fn !== 'function') return () => {};
+  _trackedCleanupFns.push(fn);
+  return fn;
+}
+
+function runTrackedCleanup() {
+  while (_trackedCleanupFns.length) {
+    const dispose = _trackedCleanupFns.pop();
+    try {
+      dispose();
+    } catch (err) {
+      console.warn('[SettingsUI] cleanup handler failed', err);
+    }
+  }
+}
+
+export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreenshot, openPresetLibrary, syncCoordinator }) {
   // Clean up any existing handlers before initialization
   // This prevents accumulation on module reload or re-initialization
   if (_settingsUIInitialized) {
@@ -253,12 +324,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     if (!shaderHudNode) return;
     // Clear existing timer to prevent accumulation
     if (shaderHudTimer) {
-      clearTimeout(shaderHudTimer);
+      clearTrackedTimeout(shaderHudTimer);
       shaderHudTimer = null;
     }
     shaderHudNode.textContent = label ? `${label}: ${valueText}` : valueText;
     shaderHudNode.style.opacity = '1';
-    shaderHudTimer = setTimeout(() => {
+    shaderHudTimer = trackTimeout(() => {
       shaderHudNode.style.opacity = shaderState.pinnedHud ? '0.65' : '0';
       shaderHudTimer = null; // Clear reference after timeout
     }, SHADER_HUD_TIMEOUT_MS);
@@ -473,7 +544,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   function open() {
     // Cancel any pending close animation
     if (drawerCloseTimer) {
-      clearTimeout(drawerCloseTimer);
+      clearTrackedTimeout(drawerCloseTimer);
       drawerCloseTimer = null;
     }
     root.style.display = 'block';
@@ -483,7 +554,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   function close() {
     root.classList.remove('open');
     // Store timer ID so it can be cancelled if drawer is opened again
-    drawerCloseTimer = setTimeout(() => {
+    drawerCloseTimer = trackTimeout(() => {
       root.style.display = 'none';
       drawerCloseTimer = null;
     }, DRAWER_CLOSE_ANIMATION_MS);
@@ -497,17 +568,17 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
 
     // Clear shader HUD timer if it's running
     if (shaderHudTimer) {
-      clearTimeout(shaderHudTimer);
+      clearTrackedTimeout(shaderHudTimer);
       shaderHudTimer = null;
     }
   }
 
   // removed buildShaderQuick: merged into buildShader top area
 
-  btnOpen.addEventListener('click', open);
-  overlay.addEventListener('click', close);
-  btnClose.addEventListener('click', close);
-  btnCloseFooter.addEventListener('click', close);
+  trackDomListener(btnOpen, 'click', open);
+  trackDomListener(overlay, 'click', close);
+  trackDomListener(btnClose, 'click', close);
+  trackDomListener(btnCloseFooter, 'click', close);
 
   // Remove old handler if exists
   if (_globalKeydownHandler) {
@@ -1954,7 +2025,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         a.download = 'preset-library.json';
         a.click();
         // Cleanup blob URL after a short delay to ensure download starts
-        setTimeout(() => URL.revokeObjectURL(url), 100);
+        trackTimeout(() => URL.revokeObjectURL(url), 100);
       } catch (err) {
         console.error(err);
         showToast('Export failed');
@@ -2019,78 +2090,6 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     const summary = h('div', { class: 'session-summary' }, summaryItems);
     el.appendChild(fieldRow('Session', summary));
 
-    // MIDI (Launchpad) — optional, shown when midiApi is provided
-    if (midiApi) {
-      const status = h('span', { id: 'midi-status-label' }, 'MIDI: Not connected');
-      const connectBtn = button('Connect MIDI', async () => {
-        const ok = await midiApi.connect();
-        if (!ok) showToast('MIDI connect failed or unsupported');
-      }, { class: 'ghost' });
-
-      // Learn UI: select action + learn button + clear all
-      const selector = document.createElement('select');
-      const addOpt = (value, label) => { const o = document.createElement('option'); o.value = value; o.textContent = label; selector.appendChild(o); };
-      // New big-look macros only
-      addOpt('portalSlam', 'Portal Slam (inward)');
-      addOpt('pullbackVortex', 'Pullback Vortex (outward + twist)');
-      addOpt('chromaticRift', 'Chromatic Rift');
-      addOpt('echoStutter', 'Echo Stutter (triple pulse)');
-      addOpt('vortexHold', 'Vortex Hold (hold)');
-      addOpt('blackout', 'Blackout Gate');
-      addOpt('solarFlare', 'Solar Flare (with shockwave)');
-      addOpt('panic', 'Panic (stop all)');
-
-      const learnBtn = button('Learn', () => {
-        midiApi.startLearn(selector.value);
-        showToast('Hit a Launchpad pad to bind…');
-      });
-      const clearBtn = button('Clear All', () => {
-        midiApi.clearBindings();
-        showToast('MIDI bindings cleared');
-      }, { class: 'ghost' });
-
-      const midiRow = h('div', { class: 'session-summary' }, [status, connectBtn, selector, learnBtn, clearBtn]);
-      el.appendChild(fieldRow('MIDI (Launchpad)', midiRow));
-
-      // Show current mappings with a blink test
-      const mapWrap = document.createElement('div');
-      mapWrap.className = 'section';
-      const mapTable = document.createElement('div');
-      mapTable.style.display = 'grid';
-      mapTable.style.gridTemplateColumns = 'minmax(140px,1fr) minmax(140px,1fr) auto';
-      mapTable.style.gap = '8px 12px';
-      const actions = [
-        ['portalSlam','Portal Slam (inward)'],
-        ['pullbackVortex','Pullback Vortex (outward + twist)'],
-        ['chromaticRift','Chromatic Rift'],
-        ['echoStutter','Echo Stutter (triple pulse)'],
-        ['vortexHold','Vortex Hold (hold)'],
-        ['blackout','Blackout Gate'],
-        ['solarFlare','Solar Flare'],
-        ['panic','Panic'],
-      ];
-      function refreshMapping() {
-        mapTable.innerHTML = '';
-        const b = midiApi.getBindings?.() || {};
-        actions.forEach(([key,label]) => {
-          const l = document.createElement('div'); l.textContent = label; l.style.opacity = '0.85';
-          const v = document.createElement('div'); v.textContent = midiApi.describeBinding?.(b[key]) || '—';
-          const test = button('Blink', () => midiApi.blink?.(key), { class: 'ghost' });
-          mapTable.appendChild(l); mapTable.appendChild(v); mapTable.appendChild(test);
-        });
-      }
-      refreshMapping();
-      mapWrap.appendChild(mapTable);
-      el.appendChild(mapWrap);
-
-      midiApi.onStatus((s) => {
-        const label = s.supported ? (s.connected ? `Connected: ${s.deviceLabel}` : 'Not connected') : 'Unsupported in this browser';
-        status.textContent = `MIDI: ${label}${s.learning ? ` — Learning ${s.learning}` : ''}`;
-        connectBtn.textContent = s.connected ? 'Reconnect' : 'Connect MIDI';
-        // numBindings change implies mapping update
-        refreshMapping();
-      });
-    }
     return el;
   }
 
@@ -2272,13 +2271,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   }
 
   if (presetManager && typeof presetManager.on === 'function') {
-    presetManager.on('*', () => {
+    const disposePresetListener = presetManager.on('*', () => {
       if (currentTab === 'presets') render('presets');
     });
+    trackCleanup(disposePresetListener);
   }
 
-  btnReset.addEventListener('click', ()=> { try { window.location.reload(); } catch(_) {} });
-  btnSaveSettings.addEventListener('click', ()=> {
+  trackDomListener(btnReset, 'click', () => { try { window.location.reload(); } catch(_) {} });
+  trackDomListener(btnSaveSettings, 'click', () => {
     try {
       const snapshot = capturePresetSnapshot({ sceneApi, audioEngine });
       if (persistSettingsSnapshot(snapshot)) showToast('Settings saved'); else showToast('Save failed');
@@ -2287,7 +2287,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       showToast('Save failed');
     }
   });
-  btnSavePreset.addEventListener('click', ()=> {
+  trackDomListener(btnSavePreset, 'click', () => {
     if (!presetManager) {
       showToast('Preset manager unavailable');
       return;
@@ -2368,8 +2368,11 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     if (isBeat) {
       el.classList.add('on');
       // Clear quickly to make a short pulse
-      clearTimeout(updateBeatIndicator._t);
-      updateBeatIndicator._t = setTimeout(() => el.classList.remove('on'), 80);
+      clearTrackedTimeout(updateBeatIndicator._t);
+      updateBeatIndicator._t = trackTimeout(() => {
+        el.classList.remove('on');
+        updateBeatIndicator._t = null;
+      }, 80);
     }
   }
   function updateBpmLabel(info) {
@@ -2494,6 +2497,10 @@ export function cleanupSettingsUI() {
     document.removeEventListener('click', handler, true);
   });
   _activeOverflowListeners = [];
+
+  runTrackedCleanup();
+  clearTrackedDomListeners();
+  clearAllTrackedTimeouts();
 
   // Reset initialization flag
   _settingsUIInitialized = false;

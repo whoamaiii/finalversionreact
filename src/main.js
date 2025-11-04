@@ -29,7 +29,6 @@ import { showToast, cleanupToast } from './toast.js';           // Temporary not
 import { PresetManager } from './preset-manager.js';
 import { openPresetLibraryWindow } from './preset-library-window.js';
 import { PerformanceController } from './performance-pads.js';
-import { LaunchpadMIDI } from './midi-launchpad.js';
 
 // Debug mode: print browser feature support matrix when ?debug is in the URL
 // This helps developers understand what capabilities are available
@@ -78,30 +77,14 @@ try {
   performancePads = { update: () => {}, getDeltas: () => null };
 }
 
-// Launchpad MIDI (optional)
-let midi = null;
-try {
-  midi = new LaunchpadMIDI({ pads: performancePads, sceneApi, sync });
-} catch (_) {
-  midi = null;
-}
-
-// Merge deltas from performance pads and MIDI shots
+// Provide scene with reactive deltas driven by performance pads
 sceneApi.setUniformDeltasProvider(() => {
-  let a = null;
-  try { a = performancePads.getDeltas?.() || null; } catch (err) {
+  try {
+    return performancePads.getDeltas?.() || null;
+  } catch (err) {
     console.warn('Performance pads getDeltas error:', err);
+    return null;
   }
-  let b = null;
-  try { b = midi?.getDeltas?.() || null; } catch (err) {
-    console.warn('MIDI controller getDeltas error:', err);
-  }
-  if (!a && !b) return null;
-  if (a && !b) return a;
-  if (!a && b) return b;
-  const out = { ...a };
-  for (const k of Object.keys(b)) out[k] = (out[k] || 0) + b[k];
-  return out;
 });
 
 // Named event handler for preset library shortcut
@@ -117,8 +100,6 @@ function handlePresetLibraryShortcut(event) {
   openPresetLibrary();
 }
 
-window.addEventListener('keydown', handlePresetLibraryShortcut);
-
 // Initialize the settings UI
 // This creates the settings panel that slides in from the right side
 // We wrap it in a try-catch so the app continues working even if UI fails to load
@@ -130,7 +111,6 @@ try {
     syncCoordinator: sync, // Pass sync coordinator so UI can control synchronization
     presetManager,
     openPresetLibrary,
-    midiApi: midi,
     
     // Callback: User clicked "Start System Audio" button
     // This attempts to capture system audio (what's playing on the computer)
@@ -235,13 +215,18 @@ let featureWsConnecting = false;         // Are we currently trying to connect?
 let featureWsLastAttemptMs = 0;          // Timestamp of last connection attempt
 let featureWsLastSendMs = 0;             // Timestamp of last feature send
 let featureWsBackoffMs = 2500;           // Delay before retrying (exponential backoff, capped)
+let featureWsAttemptCount = 0;           // Attempts made in current window
+let featureWsLockoutUntil = 0;           // Timestamp when we're allowed to try again after repeated failures
+let featureWsLockoutNotifiedAt = 0;      // Last time we notified the user about lockout
 const FEATURE_WS_URL = 'ws://127.0.0.1:8090'; // WebSocket server URL (OSC bridge)
+const FEATURE_WS_MAX_ATTEMPTS = 12;      // Maximum consecutive attempts before pausing
+const FEATURE_WS_LOCKOUT_MS = 60000;     // Pause duration (ms) after hitting attempt ceiling
 
 /**
  * Closes the WebSocket connection and cleans up event handlers.
  * This prevents memory leaks when connections are recreated.
  */
-function closeFeatureWs() {
+function closeFeatureWs({ resetState = false } = {}) {
   if (featureWs) {
     // Remove event handlers to prevent memory leaks
     featureWs.onopen = null;
@@ -261,28 +246,64 @@ function closeFeatureWs() {
     featureWsConnected = false;
     featureWsConnecting = false;
   }
+
+  if (resetState) {
+    featureWsAttemptCount = 0;
+    featureWsLockoutUntil = 0;
+    featureWsLockoutNotifiedAt = 0;
+    featureWsBackoffMs = 2500;
+  }
 }
 
 /**
  * Ensures the WebSocket connection is established.
  *
  * This function tries to connect to the OSC bridge if we're not already connected
- * or connecting. It uses exponential backoff to avoid spamming connection attempts.
+ * or connecting. It uses exponential backoff and a lockout window to avoid spamming
+ * connection attempts when the bridge is offline.
  *
  * @param {number} [nowMs] - Current timestamp (for rate limiting)
+ * @param {Object} [options]
+ * @param {boolean} [options.force=false] - Ignore backoff/lockout guards for a manual retry
  */
-function ensureFeatureWs(nowMs) {
+function ensureFeatureWs(nowMs, { force = false } = {}) {
+  const now = typeof nowMs === 'number' ? nowMs : performance.now();
+
   // Don't try if already connected or currently connecting
   if (featureWsConnected || featureWsConnecting) return;
 
+  // Reset lockout if the cooldown has expired
+  if (featureWsLockoutUntil && now >= featureWsLockoutUntil) {
+    featureWsLockoutUntil = 0;
+    featureWsLockoutNotifiedAt = 0;
+  }
+
+  // Respect active lockout unless explicitly forced
+  if (!force && featureWsLockoutUntil && now < featureWsLockoutUntil) {
+    return;
+  }
+
+  // After too many consecutive failures, pause attempts for a while
+  if (!force && featureWsAttemptCount >= FEATURE_WS_MAX_ATTEMPTS) {
+    featureWsLockoutUntil = now + FEATURE_WS_LOCKOUT_MS;
+    featureWsAttemptCount = 0;
+    if (!featureWsLockoutNotifiedAt || now - featureWsLockoutNotifiedAt > 1000) {
+      featureWsLockoutNotifiedAt = now;
+      console.warn('[FeatureWS] reached connection attempt limit, pausing retries for 60 seconds');
+      try { showToast('OSC bridge unreachable. Pausing retries for 60s.', 4200); } catch (_) {}
+    }
+    return;
+  }
+
   // Rate limit: don't try too often (respect backoff delay)
-  if (nowMs && nowMs - featureWsLastAttemptMs < featureWsBackoffMs) return;
+  if (!force && now - featureWsLastAttemptMs < featureWsBackoffMs) return;
 
   // Clean up any existing connection before creating new one
   closeFeatureWs();
 
   // Record this attempt
-  featureWsLastAttemptMs = nowMs || performance.now();
+  featureWsLastAttemptMs = now;
+  featureWsAttemptCount += 1;
 
   try {
     featureWsConnecting = true;
@@ -297,6 +318,9 @@ function ensureFeatureWs(nowMs) {
         featureWsConnecting = false;
         featureWsLastSendMs = 0; // Reset send timer
         featureWsBackoffMs = 2500; // Reset backoff on success
+        featureWsAttemptCount = 0;
+        featureWsLockoutUntil = 0;
+        featureWsLockoutNotifiedAt = 0;
       }
     };
 
@@ -404,7 +428,8 @@ const eventHandlers = {
   drop: null,         // Will be set below
   visibilitychange: null, // Will be set below
   beforeunload: null,     // Will be set below
-  systemAudioHelp: null   // Will be set below
+  systemAudioHelp: null,  // Will be set below
+  presetLibraryShortcut: handlePresetLibraryShortcut
 };
 
 // Handle window resize - update the 3D scene to match new window size
@@ -417,6 +442,11 @@ window.addEventListener('mousemove', eventHandlers.mousemove);
 // ======================
 // When the browser tab is hidden, pause audio processing to save resources.
 // When it becomes visible again, resume everything.
+
+// Shortcut handler for preset library toggle
+if (eventHandlers.presetLibraryShortcut) {
+  window.addEventListener('keydown', eventHandlers.presetLibraryShortcut);
+}
 
 let isPaused = false; // Track if we're currently paused
 
@@ -750,6 +780,7 @@ function removeAllEventListeners() {
   if (eventHandlers.dragover) window.removeEventListener('dragover', eventHandlers.dragover);
   if (eventHandlers.dragleave) window.removeEventListener('dragleave', eventHandlers.dragleave);
   if (eventHandlers.drop) window.removeEventListener('drop', eventHandlers.drop);
+  if (eventHandlers.presetLibraryShortcut) window.removeEventListener('keydown', eventHandlers.presetLibraryShortcut);
 
   // Remove document event listeners
   if (eventHandlers.visibilitychange) document.removeEventListener('visibilitychange', eventHandlers.visibilitychange);
@@ -768,7 +799,7 @@ function stopAnimation() {
   }
 
   // Clean up WebSocket connection
-  closeFeatureWs();
+  closeFeatureWs({ resetState: true });
 
   // Clean up sync coordinator
   if (sync && typeof sync.cleanup === 'function') {
@@ -785,15 +816,6 @@ function stopAnimation() {
       performancePads.cleanup();
     } catch (err) {
       console.warn('Error cleaning up performance pads:', err);
-    }
-  }
-
-  // Clean up MIDI controller
-  if (midi && typeof midi.disconnect === 'function') {
-    try {
-      midi.disconnect();
-    } catch (err) {
-      console.warn('Error cleaning up MIDI controller:', err);
     }
   }
 
