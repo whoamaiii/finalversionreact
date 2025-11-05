@@ -319,12 +319,13 @@ export class TimeWindowedBuffer extends SlidingWindow {
     const items = this.getAll();
     if (!items.length) return null;
 
-    // Temporarily swap items for stats calculation
+    // Temporarily swap items for stats calculation (use try/finally for safety)
     const originalItems = this.items;
-    this.items = items;
-    const stats = super.getStats();
-    this.items = originalItems;
-
-    return stats;
+    try {
+      this.items = items;
+      return super.getStats();
+    } finally {
+      this.items = originalItems;
+    }
   }
 }
