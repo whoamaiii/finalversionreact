@@ -4,7 +4,7 @@
 const CHANNEL_NAME = 'reactive-sync-v1';
 const STORAGE_KEY = 'reactive_sync_bridge_v1';
 const FEATURE_INTERVAL_MS = 33;
-const PARAM_PUSH_INTERVAL_MS = 450;
+const PARAM_PUSH_INTERVAL_MS = 1000; // Increased from 450ms to reduce localStorage write frequency for long-runtime stability
 const HEARTBEAT_INTERVAL_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 2 + 800;
 

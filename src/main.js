@@ -45,11 +45,22 @@ const audio = new AudioEngine();
 
 const diagnosticsEnabled = new URLSearchParams(location.search).has('diagnostics');
 const diagnosticsLogIntervalMs = 5000;
+const diagnosticsMaxDurationMs = 300000; // 5 minutes max to prevent unbounded logging
+const diagnosticsMaxLogs = 100; // Stop after 100 samples (8.3 minutes at 5sec intervals)
 let diagnosticsLastLog = typeof performance !== 'undefined' ? performance.now() : Date.now();
+let diagnosticsStartTime = diagnosticsLastLog;
+let diagnosticsLogCount = 0;
+let diagnosticsActive = diagnosticsEnabled;
 if (diagnosticsEnabled) {
   console.info('[Audio Diagnostics] Logging audio analysis metrics every 5 seconds');
+  console.info('[Audio Diagnostics] Auto-disable after 5 minutes or 100 logs to prevent memory accumulation');
   try { window.__audioDiagnostics = audio; } catch (_) {}
 }
+
+// Auto-stutter mode: automatically adjust stutter window based on BPM/patterns
+const autoStutterUpdateIntervalMs = 500; // Recalculate every 500ms (smooth without being too reactive)
+let autoStutterLastUpdate = 0;
+let autoStutterCurrentValue = 180; // Start with default value, will sync with actual on first update
 
 // Create the sync coordinator for multi-window synchronization
 // This allows multiple browser windows to stay in sync (control + projector mode)
@@ -627,9 +638,48 @@ function animate() {
     console.warn('Performance pads update error:', err);
   }
 
-  if (diagnosticsEnabled && now - diagnosticsLastLog >= diagnosticsLogIntervalMs) {
+  // Auto-stutter mode: Automatically adjust stutter window based on music tempo/pattern
+  // This makes visuals adapt to different BPMs without manual tweaking
+  if (features && sceneApi.state?.params?.visuals?.dispersion?.autoStutterMode) {
+    // Only recalculate periodically (every 500ms) to avoid jitter
+    if (now - autoStutterLastUpdate > autoStutterUpdateIntervalMs) {
+      autoStutterLastUpdate = now;
+
+      // Calculate optimal window size based on current BPM and pattern
+      const optimalWindow = audio.calculateOptimalStutterWindow(features);
+
+      // Smoothly interpolate towards target (prevents sudden jumps)
+      const lerpFactor = 0.15; // Smooth transition over ~2-3 updates
+      autoStutterCurrentValue = autoStutterCurrentValue * (1 - lerpFactor) + optimalWindow * lerpFactor;
+
+      // Update the dispersion parameter (rounded to nearest 10ms for stability)
+      const roundedValue = Math.round(autoStutterCurrentValue / 10) * 10;
+      sceneApi.state.params.visuals.dispersion.stutterWindowMs = roundedValue;
+    }
+  } else {
+    // When auto mode is off, sync our tracked value with the manual setting
+    // This prevents jumps when re-enabling auto mode
+    if (sceneApi.state?.params?.visuals?.dispersion?.stutterWindowMs) {
+      autoStutterCurrentValue = sceneApi.state.params.visuals.dispersion.stutterWindowMs;
+    }
+  }
+
+  // Auto-disable diagnostics after time/count limits to prevent memory accumulation
+  if (diagnosticsActive) {
+    const diagnosticsElapsed = now - diagnosticsStartTime;
+    if (diagnosticsElapsed > diagnosticsMaxDurationMs || diagnosticsLogCount >= diagnosticsMaxLogs) {
+      diagnosticsActive = false;
+      console.warn('[Audio Diagnostics] Auto-disabled after',
+        Math.floor(diagnosticsElapsed / 1000), 'seconds /',
+        diagnosticsLogCount, 'logs to prevent console memory accumulation');
+      console.info('[Audio Diagnostics] Reload with ?diagnostics to re-enable');
+    }
+  }
+
+  if (diagnosticsActive && now - diagnosticsLastLog >= diagnosticsLogIntervalMs) {
     const summary = audio.getDiagnosticsSummary({ includeCurrent: true, reset: true });
     if (summary) {
+      diagnosticsLogCount++;
       const fmt = (value) => (typeof value === 'number' && Number.isFinite(value)
         ? Number(value).toFixed(3)
         : 'n/a');

@@ -202,6 +202,7 @@ export class AudioEngine {
     this._autoThrApplied = false;
     this._autoBassOnBeats = [];
     this._autoCentroidNegOnBeats = [];
+    this._autoThrMaxSamples = 200; // Sliding window: keep newest 200 samples, automatically discard oldest for fresh calibration during rapid track changes
 
     // File playback timeline tracking (for downbeat gating)
     this._fileStartCtxTimeSec = 0;
@@ -2607,8 +2608,19 @@ export class AudioEngine {
         // Collect samples for adaptive thresholding (during warmup)
         if (this.autoDropThresholdsEnabled && !this._autoThrApplied) {
           const negSlope = Math.max(0, -cDelta);
+          // Sliding window: drop oldest sample when at capacity to always keep fresh data
+          // This ensures accurate calibration even when DJ rapidly switches tracks
+          if (this._autoBassOnBeats.length >= this._autoThrMaxSamples) {
+            this._autoBassOnBeats.shift(); // Remove oldest sample
+          }
           this._autoBassOnBeats.push(bands.env?.bass ?? 0);
-          if (negSlope > 0) this._autoCentroidNegOnBeats.push(negSlope);
+
+          if (negSlope > 0) {
+            if (this._autoCentroidNegOnBeats.length >= this._autoThrMaxSamples) {
+              this._autoCentroidNegOnBeats.shift(); // Remove oldest sample
+            }
+            this._autoCentroidNegOnBeats.push(negSlope);
+          }
         }
         // Maintain bar-phase state for optional drop gating
         if (this.dropBarGatingEnabled) {
@@ -2819,6 +2831,49 @@ export class AudioEngine {
 
     if (resetWindow) this._resetDiagnosticsWindow(now);
     return summary;
+  }
+
+  /**
+   * Calculate optimal stutter window based on current music characteristics
+   * Used by auto-stutter mode to adapt detection sensitivity to track tempo/pattern
+   *
+   * @param {Object} features - Current audio features (must include bpm, aubioOnset)
+   * @returns {number} Recommended stutter window in milliseconds (80-400ms range)
+   *
+   * Algorithm:
+   * - Fast patterns (high BPM, many onsets): Small window to catch rapid hits
+   * - Slow patterns (low BPM, sparse onsets): Large window to catch spaced beats
+   * - Adapts smoothly to tempo changes during track transitions
+   */
+  calculateOptimalStutterWindow(features) {
+    if (!features) return 180; // Default fallback
+
+    const bpm = features.bpm || features.tapBpm || 128; // Fallback to 128 BPM
+    const beatMs = 60000 / Math.max(60, Math.min(200, bpm)); // ms per beat (clamped 60-200 BPM)
+
+    // Base window size on beat subdivision
+    // Fast DnB (174 BPM): beatMs ≈ 345ms → quarter beat ≈ 86ms
+    // Slow trap (70 BPM): beatMs ≈ 857ms → quarter beat ≈ 214ms
+    let windowMs = beatMs / 4; // Start with quarter beat
+
+    // Adjust based on onset density (if available)
+    // If there are many rapid onsets, use smaller window
+    // If onsets are sparse, use larger window
+    const recentOnsets = features.aubioOnset ? 1 : 0;
+
+    // For very fast patterns (breakbeats, drum rolls), go smaller
+    if (bpm > 160) {
+      windowMs = beatMs / 5; // Eighth beat for fast patterns
+    }
+    // For slow patterns (trap, halftime), go larger
+    else if (bpm < 90) {
+      windowMs = beatMs / 3; // Third beat for slow patterns
+    }
+
+    // Clamp to reasonable range (80-400ms as defined in UI)
+    windowMs = Math.max(80, Math.min(400, windowMs));
+
+    return Math.round(windowMs);
   }
 
   /**

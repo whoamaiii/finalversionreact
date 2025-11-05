@@ -577,7 +577,10 @@ export class PresetManager {
     };
     preset.data = deepClone(snapshot);
     preset.versions.unshift(entry);
-    if (preset.versions.length > VERSION_LIMIT) preset.versions = preset.versions.slice(0, VERSION_LIMIT);
+    // Sliding window: remove oldest versions when over limit (more efficient than slice)
+    while (preset.versions.length > VERSION_LIMIT) {
+      preset.versions.pop(); // Remove from end (oldest)
+    }
   }
 
   _ensureFavorite(id, shouldExist) {
@@ -599,7 +602,11 @@ export class PresetManager {
     const now = Date.now();
     const filtered = this._state.recents.filter((entry) => entry.id !== id);
     filtered.unshift({ id, usedAt: now });
-    this._state.recents = filtered.slice(0, RECENT_LIMIT * 2);
+    // Sliding window: remove oldest recents when over limit (more efficient than slice)
+    while (filtered.length > RECENT_LIMIT * 2) {
+      filtered.pop(); // Remove from end (oldest)
+    }
+    this._state.recents = filtered;
   }
 
   _resolvePreset(identifier) {
