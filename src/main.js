@@ -827,6 +827,9 @@ function removeAllEventListeners() {
   if (helpButton && eventHandlers.systemAudioHelp) {
     helpButton.removeEventListener('click', eventHandlers.systemAudioHelp);
   }
+
+  // Reset drag-drop listener flag to allow re-initialization
+  window.__dragDropListenersAdded = false;
 }
 
 function stopAnimation() {
@@ -937,15 +940,15 @@ eventHandlers.dragover = handleDragEnterOver;
 eventHandlers.dragleave = handleDragLeaveOrDrop;
 eventHandlers.drop = handleFileDrop;
 
-// Show overlay when dragging files over the window
-window.addEventListener('dragenter', eventHandlers.dragenter);
-window.addEventListener('dragover', eventHandlers.dragover);
-
-// Hide overlay when dragging leaves
-window.addEventListener('dragleave', eventHandlers.dragleave);
-
-// Handle file drop
-window.addEventListener('drop', eventHandlers.drop);
+// Add drag-and-drop listeners only if not already added (prevent duplication)
+// These handlers are stored in eventHandlers object and removed in removeAllEventListeners()
+if (!window.__dragDropListenersAdded) {
+  window.addEventListener('dragenter', eventHandlers.dragenter);
+  window.addEventListener('dragover', eventHandlers.dragover);
+  window.addEventListener('dragleave', eventHandlers.dragleave);
+  window.addEventListener('drop', eventHandlers.drop);
+  window.__dragDropListenersAdded = true;
+}
 
 // System Audio Help Button
 // ========================

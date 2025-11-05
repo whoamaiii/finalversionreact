@@ -163,10 +163,10 @@ const pointMaterialShader = {
 
 /**
  * Creates a radial gradient texture for particle glow effects.
- * 
+ *
  * This generates a canvas-based texture with a radial gradient from white
  * in the center to transparent at the edges. Used for making particles glow.
- * 
+ *
  * @param {number} [size=256] - Texture size in pixels (square)
  * @returns {THREE.Texture|null} The glow texture, or null if canvas creation fails
  */
@@ -189,6 +189,8 @@ function createGlowTexture(size = 256) {
   try {
     texture.colorSpace = THREE.SRGBColorSpace;
   } catch (_) {}
+  // Store canvas reference for proper cleanup later
+  texture.userData._sourceCanvas = canvas;
   return texture;
 }
 
@@ -1090,7 +1092,15 @@ export function initScene() {
     sprite.renderOrder = 5;
     sprite.position.set(0, 0, 0);
     sprite.userData.dispose = () => {
-      try { texture.dispose(); } catch (_) {}
+      try {
+        // Clear canvas reference to allow garbage collection
+        if (texture.userData._sourceCanvas) {
+          texture.userData._sourceCanvas.width = 0;
+          texture.userData._sourceCanvas.height = 0;
+          texture.userData._sourceCanvas = null;
+        }
+        texture.dispose();
+      } catch (_) {}
       try { material.dispose(); } catch (_) {}
     };
     state.centralGlow = sprite;
