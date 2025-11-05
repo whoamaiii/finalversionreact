@@ -726,6 +726,9 @@ export class AudioEngine {
       this._essentiaPendingJobId = 0;
 
       try {
+        // Clear message handlers before terminating to prevent stale callbacks
+        this._essentiaWorker.onmessage = null;
+        this._essentiaWorker.onerror = null;
         this._essentiaWorker.terminate();
       } catch (_) {}
       this._essentiaWorker = null;
@@ -2871,6 +2874,9 @@ export class AudioEngine {
         this._essentiaWorkerTerminationTimer = setTimeout(() => {
           if (workerRef) {
             try {
+              // Clear message handlers before terminating to prevent stale callbacks
+              workerRef.onmessage = null;
+              workerRef.onerror = null;
               workerRef.terminate();
             } catch (_) {}
           }
