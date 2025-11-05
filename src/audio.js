@@ -286,6 +286,7 @@ export class AudioEngine {
     this._essentiaReadyResolver = null;
     this._essentiaCurrentJobId = 0;
     this._essentiaPendingJobId = 0;
+    this._essentiaWorkerTerminationTimer = null; // Track timeout for worker termination
     this.beatGrid = {
       bpm: 0,
       confidence: 0,
@@ -2840,17 +2841,24 @@ export class AudioEngine {
     }
 
     // Clean up Essentia Worker (graceful shutdown with delayed termination)
+    // Clear any existing termination timer first
+    if (this._essentiaWorkerTerminationTimer) {
+      clearTimeout(this._essentiaWorkerTerminationTimer);
+      this._essentiaWorkerTerminationTimer = null;
+    }
+
     if (this._essentiaWorker) {
       try {
         this._essentiaWorker.postMessage({ type: 'shutdown' });
         // Give worker 100ms to clean up before force-terminating
         const workerRef = this._essentiaWorker;
-        setTimeout(() => {
+        this._essentiaWorkerTerminationTimer = setTimeout(() => {
           if (workerRef) {
             try {
               workerRef.terminate();
             } catch (_) {}
           }
+          this._essentiaWorkerTerminationTimer = null;
         }, 100);
         this._essentiaWorker = null;
         this._essentiaReady = false;
