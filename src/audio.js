@@ -1518,6 +1518,18 @@ export class AudioEngine {
     this._liveBufferSec = this._clampLiveBufferSeconds(this._liveBufferSec);
     const desiredLength = Math.max(1, Math.floor(sr * this._liveBufferSec));
     if (!this._liveBuffer || this._liveBuffer.length !== desiredLength) {
+      // Explicitly null old buffer before creating new one to prevent memory leak
+      const oldBuffer = this._liveBuffer;
+      this._liveBuffer = null;
+
+      // For large buffers (> 1M samples ~4MB), suggest GC to release old buffer immediately
+      if (oldBuffer && oldBuffer.length > 1000000) {
+        if (typeof globalThis !== 'undefined' && typeof globalThis.gc === 'function') {
+          try { globalThis.gc(); } catch (_) {}
+        }
+      }
+
+      // Create new buffer
       this._liveBuffer = new Float32Array(desiredLength);
       this._liveBufferWrite = 0;
       this._liveBufferFilled = 0;
@@ -1811,6 +1823,13 @@ export class AudioEngine {
     const size = buffer.length;
     let pool = this._aubioBufferPool.get(size);
     if (!pool) {
+      // Limit total number of different buffer sizes to prevent unbounded growth
+      const MAX_POOL_SIZES = 10;
+      if (this._aubioBufferPool.size >= MAX_POOL_SIZES) {
+        // Remove least recently used size (first entry in Map)
+        const firstKey = this._aubioBufferPool.keys().next().value;
+        this._aubioBufferPool.delete(firstKey);
+      }
       pool = [];
       this._aubioBufferPool.set(size, pool);
     }
@@ -2923,15 +2942,16 @@ export class AudioEngine {
 
     if (this._essentiaWorker) {
       try {
+        // Clear message handlers immediately to prevent memory leak
+        this._essentiaWorker.onmessage = null;
+        this._essentiaWorker.onerror = null;
+
         this._essentiaWorker.postMessage({ type: 'shutdown' });
         // Give worker 100ms to clean up before force-terminating
         const workerRef = this._essentiaWorker;
         this._essentiaWorkerTerminationTimer = setTimeout(() => {
           if (workerRef) {
             try {
-              // Clear message handlers before terminating to prevent stale callbacks
-              workerRef.onmessage = null;
-              workerRef.onerror = null;
               workerRef.terminate();
             } catch (_) {}
           }
@@ -3060,9 +3080,42 @@ export class AudioEngine {
     this.bassFlux = 0;
     this.beatGrid = 0;
 
-    // Clear meyda instances
-    this._meydaInstance = null;
-    this._meydaInstanceStereo = null;
+    // Clear meyda instances with proper cleanup
+    if (this._meydaInstance) {
+      try {
+        // Meyda instances may have stop() method
+        if (typeof this._meydaInstance.stop === 'function') {
+          this._meydaInstance.stop();
+        }
+        // Break circular references to audio context and source
+        if (this._meydaInstance.source) {
+          this._meydaInstance.source = null;
+        }
+        if (this._meydaInstance.audioContext) {
+          this._meydaInstance.audioContext = null;
+        }
+      } catch (err) {
+        console.warn('Error disposing Meyda instance:', err);
+      }
+      this._meydaInstance = null;
+    }
+
+    if (this._meydaInstanceStereo) {
+      try {
+        if (typeof this._meydaInstanceStereo.stop === 'function') {
+          this._meydaInstanceStereo.stop();
+        }
+        if (this._meydaInstanceStereo.source) {
+          this._meydaInstanceStereo.source = null;
+        }
+        if (this._meydaInstanceStereo.audioContext) {
+          this._meydaInstanceStereo.audioContext = null;
+        }
+      } catch (err) {
+        console.warn('Error disposing Meyda stereo instance:', err);
+      }
+      this._meydaInstanceStereo = null;
+    }
 
     // Clear lazy-loaded module cache to free memory
     clearModuleCache('aubio');

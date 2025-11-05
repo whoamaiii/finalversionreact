@@ -535,11 +535,16 @@ export class PerformanceController {
       this._hudModeText = null;
     }
 
-    // Remove HUD styles to prevent accumulation
+    // Remove HUD styles to prevent accumulation (defensive cleanup)
     try {
       const hudStyles = document.getElementById('perf-hud-styles');
-      if (hudStyles && hudStyles.parentNode) {
-        hudStyles.parentNode.removeChild(hudStyles);
+      if (hudStyles) {
+        // Use remove() if available, otherwise removeChild
+        if (hudStyles.remove) {
+          hudStyles.remove();
+        } else if (hudStyles.parentNode) {
+          hudStyles.parentNode.removeChild(hudStyles);
+        }
       }
     } catch (_) {
       // Style removal is optional; continue if it fails
