@@ -44,11 +44,32 @@ export class PresetLibraryWindow {
     };
     this.detach = null;
     this.elements = {};
+    // Track event listeners for cleanup
+    this._eventListeners = [];
+  }
+
+  _addTrackedListener(element, event, handler, options) {
+    element.addEventListener(event, handler, options);
+    this._eventListeners.push({ element, event, handler, options });
+  }
+
+  _removeAllTrackedListeners() {
+    for (const { element, event, handler, options } of this._eventListeners) {
+      try {
+        element.removeEventListener(event, handler, options);
+      } catch (err) {
+        // Element may be inaccessible, ignore
+      }
+    }
+    this._eventListeners = [];
   }
 
   _cleanup() {
     // Centralized cleanup to prevent race conditions
-    // Remove event listeners first
+    // Remove all tracked event listeners first
+    this._removeAllTrackedListeners();
+
+    // Remove beforeunload listener
     if (this.win && this._beforeUnloadHandler) {
       try {
         this.win.removeEventListener('beforeunload', this._beforeUnloadHandler);
@@ -182,10 +203,11 @@ export class PresetLibraryWindow {
     searchInput.type = 'search';
     searchInput.placeholder = 'Search presets or tags';
     searchInput.value = this.state.search;
-    searchInput.addEventListener('input', () => {
+    const searchHandler = () => {
       this.state.search = searchInput.value || '';
       this.render();
-    });
+    };
+    this._addTrackedListener(searchInput, 'input', searchHandler);
     this.elements.searchInput = searchInput;
     searchWrap.appendChild(searchInput);
     bar.appendChild(searchWrap);
@@ -200,10 +222,11 @@ export class PresetLibraryWindow {
     const favCheckbox = doc.createElement('input');
     favCheckbox.type = 'checkbox';
     favCheckbox.checked = this.state.favoritesOnly;
-    favCheckbox.addEventListener('change', () => {
+    const favHandler = () => {
       this.state.favoritesOnly = favCheckbox.checked;
       this.render();
-    });
+    };
+    this._addTrackedListener(favCheckbox, 'change', favHandler);
     favToggle.appendChild(favCheckbox);
     favToggle.appendChild(doc.createTextNode('Favorites only'));
     bar.appendChild(favToggle);
@@ -216,6 +239,8 @@ export class PresetLibraryWindow {
 
   render() {
     if (!this.win || this.win.closed) return;
+    // Remove old event listeners before re-rendering to prevent memory leaks
+    this._removeAllTrackedListeners();
     this._renderTags();
     this._renderLists();
     this._renderDetail();
@@ -238,11 +263,12 @@ export class PresetLibraryWindow {
       const btn = doc.createElement('button');
       btn.className = `pl-tag ${this.state.activeTags.has(tag) ? 'active' : ''}`;
       btn.textContent = `#${tag}`;
-      btn.addEventListener('click', () => {
+      const handler = () => {
         if (this.state.activeTags.has(tag)) this.state.activeTags.delete(tag);
         else this.state.activeTags.add(tag);
         this.render();
-      });
+      };
+      this._addTrackedListener(btn, 'click', handler);
       wrap.appendChild(btn);
     });
   }
@@ -294,10 +320,11 @@ export class PresetLibraryWindow {
     presets.forEach((preset) => {
       const row = doc.createElement('button');
       row.className = `pl-row ${preset.id === this.state.selectedId ? 'active' : ''}`;
-      row.addEventListener('click', () => {
+      const rowHandler = () => {
         this.state.selectedId = preset.id;
         this.render();
-      });
+      };
+      this._addTrackedListener(row, 'click', rowHandler);
       const name = doc.createElement('div');
       name.className = 'pl-row-name';
       name.textContent = preset.name;
@@ -414,11 +441,12 @@ export class PresetLibraryWindow {
     checkbox.type = 'checkbox';
     const enabled = params.every((param) => this.manager.isAudioModulationEnabled(param));
     checkbox.checked = enabled;
-    checkbox.addEventListener('change', () => {
+    const checkboxHandler = () => {
       params.forEach((param) => this.manager.enableAudioModulation(param, checkbox.checked));
       this._setStatus(`${label} modulation ${checkbox.checked ? 'enabled' : 'locked'}`);
       this.render();
-    });
+    };
+    this._addTrackedListener(checkbox, 'change', checkboxHandler);
     row.appendChild(checkbox);
     row.appendChild(doc.createTextNode(`${label} modulation`));
     return row;

@@ -158,6 +158,15 @@ try {
           input.onchange = async () => {
             const f = input.files?.[0]; // Get the selected file
             if (f) await audio.loadFile(f); // Load it
+            // Clean up: remove event handler and element to prevent memory leak
+            input.onchange = null;
+            input.remove();
+          };
+          // Also handle cancel case (user closes picker without selecting)
+          input.oncancel = () => {
+            input.onchange = null;
+            input.oncancel = null;
+            input.remove();
           };
           input.click(); // Trigger the file picker
         } else {
