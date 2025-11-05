@@ -535,6 +535,16 @@ export class PerformanceController {
       this._hudModeText = null;
     }
 
+    // Remove HUD styles to prevent accumulation
+    try {
+      const hudStyles = document.getElementById('perf-hud-styles');
+      if (hudStyles && hudStyles.parentNode) {
+        hudStyles.parentNode.removeChild(hudStyles);
+      }
+    } catch (_) {
+      // Style removal is optional; continue if it fails
+    }
+
     // Clear any remaining state
     this.panic();
   }

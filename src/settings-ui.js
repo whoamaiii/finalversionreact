@@ -611,7 +611,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       const v = props[k];
       if (k === 'class') el.className = v;
       else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
-      else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
+      else if (k.startsWith('on') && typeof v === 'function') {
+        const eventType = k.slice(2).toLowerCase();
+        el.addEventListener(eventType, v);
+        // Track event listener for cleanup to prevent memory leaks
+        trackDomListener(el, eventType, v);
+      }
       else if (k === 'value') el.value = v;
       else el.setAttribute(k, v);
     }
@@ -679,7 +684,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       return units ? `${base}${units}` : base;
     };
     const valueChip = h('span', { class: 'value-chip' }, formatNumber(value));
-    input.addEventListener('input', () => {
+    // Track slider listeners for cleanup to prevent memory leaks
+    trackDomListener(input, 'input', () => {
       const v = parseFloat(input.value);
       // Validate and use default value if invalid
       const validValue = Number.isFinite(v) ? v : value;
@@ -687,7 +693,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       if (typeof oninput === 'function') oninput(validValue);
     });
     if (typeof onchange === 'function') {
-      input.addEventListener('change', () => {
+      trackDomListener(input, 'change', () => {
         const v = parseFloat(input.value);
         // Validate and use default value if invalid
         const validValue = Number.isFinite(v) ? v : value;
@@ -700,14 +706,15 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       const toNum = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? n : d; };
       const minus = h('button', { class: 'stepper minus' }, '−');
       const plus = h('button', { class: 'stepper plus' }, '+');
-      minus.addEventListener('click', () => {
+      // Track stepper button listeners for cleanup
+      trackDomListener(minus, 'click', () => {
         const s = toNum(step, 1);
         const next = Math.max(toNum(min, -Infinity), toNum(input.value, 0) - s);
         input.value = String(next);
         valueChip.textContent = formatNumber(next);
         if (typeof oninput === 'function') oninput(next);
       });
-      plus.addEventListener('click', () => {
+      trackDomListener(plus, 'click', () => {
         const s = toNum(step, 1);
         const next = Math.min(toNum(max, Infinity), toNum(input.value, 0) + s);
         input.value = String(next);
@@ -719,7 +726,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
     if (resetValue !== undefined) {
       const resetBtn = h('button', { class: 'reset-btn ghost', title: 'Reset to default' }, '↺');
-      resetBtn.addEventListener('click', () => {
+      // Track reset button listener for cleanup
+      trackDomListener(resetBtn, 'click', () => {
         input.value = String(resetValue);
         valueChip.textContent = formatNumber(resetValue);
         if (typeof oninput === 'function') oninput(resetValue);
@@ -733,7 +741,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   function select(opts, value, onchange) {
     const s = h('select');
     for (const { label, value: val } of opts) s.appendChild(h('option', { value: String(val), selected: val === value ? 'true' : undefined }, label));
-    s.addEventListener('change', () => onchange(s.value));
+    // Track select listener for cleanup
+    trackDomListener(s, 'change', () => onchange(s.value));
     return s;
   }
 
@@ -780,7 +789,17 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
             if (f) await audioEngine.loadFile(f);
           } catch(e) {
             showToast(e.message || 'File load failed');
+          } finally {
+            // Clean up input element and handler to prevent memory leak
+            input.onchange = null;
+            input.remove();
           }
+        };
+        input.oncancel = () => {
+          // Clean up if user cancels file selection
+          input.onchange = null;
+          input.oncancel = null;
+          input.remove();
         };
         input.click();
       } catch(e) {

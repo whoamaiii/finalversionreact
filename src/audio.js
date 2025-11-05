@@ -530,6 +530,8 @@ export class AudioEngine {
             this.stop();
           }
         };
+        // Store handler reference on track for cleanup later
+        track._endedHandler = handler;
         track.addEventListener('ended', handler);
       };
 
@@ -680,9 +682,16 @@ export class AudioEngine {
       }
     } catch(_){}
     
-    // Stop media stream tracks (microphone/system audio)
+    // Stop media stream tracks (microphone/system audio) and clean up event listeners
     if (this.activeStream) {
-      for (const t of this.activeStream.getTracks()) t.stop();
+      for (const t of this.activeStream.getTracks()) {
+        // Remove ended listener to prevent memory leak
+        if (t._endedHandler) {
+          try { t.removeEventListener('ended', t._endedHandler); } catch (_) {}
+          t._endedHandler = null;
+        }
+        t.stop();
+      }
     }
     
     // Clear source references
@@ -717,6 +726,9 @@ export class AudioEngine {
       this._essentiaPendingJobId = 0;
 
       try {
+        // Clear message handlers before terminating to prevent stale callbacks
+        this._essentiaWorker.onmessage = null;
+        this._essentiaWorker.onerror = null;
         this._essentiaWorker.terminate();
       } catch (_) {}
       this._essentiaWorker = null;
@@ -737,9 +749,16 @@ export class AudioEngine {
       return;
     }
 
-    // Stop existing stream
+    // Stop existing stream and clean up event listeners
     if (this.activeStream) {
-      for (const t of this.activeStream.getTracks()) t.stop();
+      for (const t of this.activeStream.getTracks()) {
+        // Remove ended listener to prevent memory leak
+        if (t._endedHandler) {
+          try { t.removeEventListener('ended', t._endedHandler); } catch (_) {}
+          t._endedHandler = null;
+        }
+        t.stop();
+      }
     }
 
     this.activeStream = stream;
@@ -2855,6 +2874,9 @@ export class AudioEngine {
         this._essentiaWorkerTerminationTimer = setTimeout(() => {
           if (workerRef) {
             try {
+              // Clear message handlers before terminating to prevent stale callbacks
+              workerRef.onmessage = null;
+              workerRef.onerror = null;
               workerRef.terminate();
             } catch (_) {}
           }
