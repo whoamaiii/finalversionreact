@@ -57,6 +57,11 @@ if (diagnosticsEnabled) {
   try { window.__audioDiagnostics = audio; } catch (_) {}
 }
 
+// Auto-stutter mode: automatically adjust stutter window based on BPM/patterns
+const autoStutterUpdateIntervalMs = 500; // Recalculate every 500ms (smooth without being too reactive)
+let autoStutterLastUpdate = 0;
+let autoStutterCurrentValue = 180; // Start with default value, will sync with actual on first update
+
 // Create the sync coordinator for multi-window synchronization
 // This allows multiple browser windows to stay in sync (control + projector mode)
 const sync = new SyncCoordinator({ role: 'control', sceneApi });
@@ -631,6 +636,32 @@ function animate() {
   }
   try { performancePads.update(dt, now, features); } catch (err) {
     console.warn('Performance pads update error:', err);
+  }
+
+  // Auto-stutter mode: Automatically adjust stutter window based on music tempo/pattern
+  // This makes visuals adapt to different BPMs without manual tweaking
+  if (features && sceneApi.state?.params?.visuals?.dispersion?.autoStutterMode) {
+    // Only recalculate periodically (every 500ms) to avoid jitter
+    if (now - autoStutterLastUpdate > autoStutterUpdateIntervalMs) {
+      autoStutterLastUpdate = now;
+
+      // Calculate optimal window size based on current BPM and pattern
+      const optimalWindow = audio.calculateOptimalStutterWindow(features);
+
+      // Smoothly interpolate towards target (prevents sudden jumps)
+      const lerpFactor = 0.15; // Smooth transition over ~2-3 updates
+      autoStutterCurrentValue = autoStutterCurrentValue * (1 - lerpFactor) + optimalWindow * lerpFactor;
+
+      // Update the dispersion parameter (rounded to nearest 10ms for stability)
+      const roundedValue = Math.round(autoStutterCurrentValue / 10) * 10;
+      sceneApi.state.params.visuals.dispersion.stutterWindowMs = roundedValue;
+    }
+  } else {
+    // When auto mode is off, sync our tracked value with the manual setting
+    // This prevents jumps when re-enabling auto mode
+    if (sceneApi.state?.params?.visuals?.dispersion?.stutterWindowMs) {
+      autoStutterCurrentValue = sceneApi.state.params.visuals.dispersion.stutterWindowMs;
+    }
   }
 
   // Auto-disable diagnostics after time/count limits to prevent memory accumulation

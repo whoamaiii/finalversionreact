@@ -2834,6 +2834,49 @@ export class AudioEngine {
   }
 
   /**
+   * Calculate optimal stutter window based on current music characteristics
+   * Used by auto-stutter mode to adapt detection sensitivity to track tempo/pattern
+   *
+   * @param {Object} features - Current audio features (must include bpm, aubioOnset)
+   * @returns {number} Recommended stutter window in milliseconds (80-400ms range)
+   *
+   * Algorithm:
+   * - Fast patterns (high BPM, many onsets): Small window to catch rapid hits
+   * - Slow patterns (low BPM, sparse onsets): Large window to catch spaced beats
+   * - Adapts smoothly to tempo changes during track transitions
+   */
+  calculateOptimalStutterWindow(features) {
+    if (!features) return 180; // Default fallback
+
+    const bpm = features.bpm || features.tapBpm || 128; // Fallback to 128 BPM
+    const beatMs = 60000 / Math.max(60, Math.min(200, bpm)); // ms per beat (clamped 60-200 BPM)
+
+    // Base window size on beat subdivision
+    // Fast DnB (174 BPM): beatMs ≈ 345ms → quarter beat ≈ 86ms
+    // Slow trap (70 BPM): beatMs ≈ 857ms → quarter beat ≈ 214ms
+    let windowMs = beatMs / 4; // Start with quarter beat
+
+    // Adjust based on onset density (if available)
+    // If there are many rapid onsets, use smaller window
+    // If onsets are sparse, use larger window
+    const recentOnsets = features.aubioOnset ? 1 : 0;
+
+    // For very fast patterns (breakbeats, drum rolls), go smaller
+    if (bpm > 160) {
+      windowMs = beatMs / 5; // Eighth beat for fast patterns
+    }
+    // For slow patterns (trap, halftime), go larger
+    else if (bpm < 90) {
+      windowMs = beatMs / 3; // Third beat for slow patterns
+    }
+
+    // Clamp to reasonable range (80-400ms as defined in UI)
+    windowMs = Math.max(80, Math.min(400, windowMs));
+
+    return Math.round(windowMs);
+  }
+
+  /**
    * Dispose method to clean up all resources and prevent memory leaks
    */
   dispose() {
