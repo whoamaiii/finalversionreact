@@ -222,6 +222,25 @@ export class AudioEngine {
       rolloff: 0,
     };
 
+    // Diagnostics capture for baseline performance measurements
+    this._diagnostics = {
+      enabled: true,
+      windowDurationMs: 5000,
+      windowStartMs: 0,
+      windowCount: 0,
+      windowTotalMs: 0,
+      windowMinMs: Infinity,
+      windowMaxMs: 0,
+      windowUtilizationTotal: 0,
+      windowUtilizationSamples: 0,
+      workletLatencyTotal: 0,
+      workletLatencyCount: 0,
+      workletLatencyMin: Infinity,
+      workletLatencyMax: 0,
+      lastUpdateEndMs: 0,
+      lastSummary: null,
+    };
+
     this.workletNode = null;
     this.workletEnabled = false;
     this._workletInitPromise = null;
@@ -2442,7 +2461,8 @@ export class AudioEngine {
   update() {
     // Must have analyser node to extract data
     if (!this.analyser) return null;
-    
+    const updateStart = typeof performance !== 'undefined' ? performance.now() : Date.now();
+
     // Get current audio data from analyser
     // These update the timeData and freqData arrays with current values
     this.analyser.getByteTimeDomainData(this.timeData);   // Waveform data (time domain)
@@ -2624,7 +2644,7 @@ export class AudioEngine {
       }
     }
 
-    return {
+    const features = {
       rms: rms,
       rmsNorm: Math.min(1, rms * 2.0),
       bands,
@@ -2656,6 +2676,129 @@ export class AudioEngine {
       aubioOnset: aubioOnsetPulse,
       beatGrid: this.beatGrid,
     };
+    const updateEnd = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    let workletLatency = null;
+    if (this.workletEnabled && Number.isFinite(this._workletFrameTimestamp) && this._workletFrameTimestamp > 0) {
+      workletLatency = Math.max(0, updateEnd - this._workletFrameTimestamp);
+    }
+    this._recordDiagnostics(updateStart, updateEnd, workletLatency);
+    return features;
+  }
+
+  setDiagnosticsEnabled(enabled) {
+    if (!this._diagnostics) return;
+    this._diagnostics.enabled = !!enabled;
+  }
+
+  resetDiagnostics() {
+    if (!this._diagnostics) return;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this._resetDiagnosticsWindow(now);
+    this._diagnostics.lastSummary = null;
+  }
+
+  getDiagnosticsSummary(options = {}) {
+    const diag = this._diagnostics;
+    if (!diag || !diag.enabled) return null;
+    const { includeCurrent = true, reset = false } = options;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+    let summary = null;
+    if (includeCurrent && diag.windowCount > 0) {
+      summary = this._makeDiagnosticsSnapshot(now, reset);
+    } else if (diag.lastSummary) {
+      summary = { ...diag.lastSummary };
+      if (reset) this._resetDiagnosticsWindow(now);
+    }
+    if (summary && reset) {
+      diag.lastSummary = { ...summary };
+    }
+    return summary;
+  }
+
+  _recordDiagnostics(updateStartMs, updateEndMs, workletLatencyMs) {
+    const diag = this._diagnostics;
+    if (!diag || !diag.enabled) return;
+    if (!Number.isFinite(updateStartMs) || !Number.isFinite(updateEndMs)) return;
+
+    const durationMs = Math.max(0, updateEndMs - updateStartMs);
+    if (!Number.isFinite(durationMs)) return;
+
+    if (!diag.windowStartMs) this._resetDiagnosticsWindow(updateEndMs);
+
+    diag.windowCount += 1;
+    diag.windowTotalMs += durationMs;
+    diag.windowMinMs = Math.min(diag.windowMinMs, durationMs);
+    diag.windowMaxMs = Math.max(diag.windowMaxMs, durationMs);
+
+    if (diag.lastUpdateEndMs > 0) {
+      const deltaMs = updateEndMs - diag.lastUpdateEndMs;
+      if (deltaMs > 0) {
+        const utilization = durationMs / deltaMs;
+        diag.windowUtilizationTotal += utilization;
+        diag.windowUtilizationSamples += 1;
+      }
+    }
+    diag.lastUpdateEndMs = updateEndMs;
+
+    if (Number.isFinite(workletLatencyMs) && workletLatencyMs >= 0) {
+      diag.workletLatencyTotal += workletLatencyMs;
+      diag.workletLatencyCount += 1;
+      diag.workletLatencyMin = Math.min(diag.workletLatencyMin, workletLatencyMs);
+      diag.workletLatencyMax = Math.max(diag.workletLatencyMax, workletLatencyMs);
+    }
+
+    const windowElapsed = updateEndMs - diag.windowStartMs;
+    if (windowElapsed >= diag.windowDurationMs && diag.windowCount > 0) {
+      const summary = this._makeDiagnosticsSnapshot(updateEndMs, true);
+      if (summary) diag.lastSummary = summary;
+    }
+  }
+
+  _resetDiagnosticsWindow(startMs) {
+    const diag = this._diagnostics;
+    if (!diag) return;
+    const now = Number.isFinite(startMs) ? startMs : (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    diag.windowStartMs = now;
+    diag.windowCount = 0;
+    diag.windowTotalMs = 0;
+    diag.windowMinMs = Infinity;
+    diag.windowMaxMs = 0;
+    diag.windowUtilizationTotal = 0;
+    diag.windowUtilizationSamples = 0;
+    diag.workletLatencyTotal = 0;
+    diag.workletLatencyCount = 0;
+    diag.workletLatencyMin = Infinity;
+    diag.workletLatencyMax = 0;
+  }
+
+  _makeDiagnosticsSnapshot(now, resetWindow) {
+    const diag = this._diagnostics;
+    if (!diag || diag.windowCount === 0) return null;
+    const windowMs = Math.max(1, now - diag.windowStartMs);
+    const avgUpdateMs = diag.windowTotalMs / diag.windowCount;
+    const avgUtilization = diag.windowUtilizationSamples > 0
+      ? diag.windowUtilizationTotal / diag.windowUtilizationSamples
+      : 0;
+    const avgWorkletLatency = diag.workletLatencyCount > 0
+      ? diag.workletLatencyTotal / diag.workletLatencyCount
+      : null;
+
+    const summary = {
+      windowMs,
+      sampleCount: diag.windowCount,
+      avgUpdateMs,
+      minUpdateMs: diag.windowMinMs === Infinity ? 0 : diag.windowMinMs,
+      maxUpdateMs: diag.windowMaxMs,
+      avgUtilization,
+      avgWorkletLatencyMs: avgWorkletLatency,
+      minWorkletLatencyMs: diag.workletLatencyCount > 0 ? diag.workletLatencyMin : null,
+      maxWorkletLatencyMs: diag.workletLatencyCount > 0 ? diag.workletLatencyMax : null,
+      timestamp: now,
+    };
+
+    if (resetWindow) this._resetDiagnosticsWindow(now);
+    return summary;
   }
 
   /**

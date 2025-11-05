@@ -43,6 +43,14 @@ const sceneApi = initScene();
 // Create the audio engine that processes audio and extracts features
 const audio = new AudioEngine();
 
+const diagnosticsEnabled = new URLSearchParams(location.search).has('diagnostics');
+const diagnosticsLogIntervalMs = 5000;
+let diagnosticsLastLog = typeof performance !== 'undefined' ? performance.now() : Date.now();
+if (diagnosticsEnabled) {
+  console.info('[Audio Diagnostics] Logging audio analysis metrics every 5 seconds');
+  try { window.__audioDiagnostics = audio; } catch (_) {}
+}
+
 // Create the sync coordinator for multi-window synchronization
 // This allows multiple browser windows to stay in sync (control + projector mode)
 const sync = new SyncCoordinator({ role: 'control', sceneApi });
@@ -609,7 +617,35 @@ function animate() {
   try { performancePads.update(dt, now, features); } catch (err) {
     console.warn('Performance pads update error:', err);
   }
-  
+
+  if (diagnosticsEnabled && now - diagnosticsLastLog >= diagnosticsLogIntervalMs) {
+    const summary = audio.getDiagnosticsSummary({ includeCurrent: true, reset: true });
+    if (summary) {
+      const fmt = (value) => (typeof value === 'number' && Number.isFinite(value)
+        ? Number(value).toFixed(3)
+        : 'n/a');
+      const utilPct = (typeof summary.avgUtilization === 'number' && Number.isFinite(summary.avgUtilization))
+        ? (summary.avgUtilization * 100).toFixed(1)
+        : '0.0';
+      try {
+        console.table({
+          windowMs: fmt(summary.windowMs),
+          samples: summary.sampleCount,
+          avgUpdateMs: fmt(summary.avgUpdateMs),
+          minUpdateMs: fmt(summary.minUpdateMs),
+          maxUpdateMs: fmt(summary.maxUpdateMs),
+          avgUtilizationPct: utilPct,
+          avgWorkletLatencyMs: fmt(summary.avgWorkletLatencyMs),
+          minWorkletLatencyMs: fmt(summary.minWorkletLatencyMs),
+          maxWorkletLatencyMs: fmt(summary.maxWorkletLatencyMs),
+        });
+      } catch (_) {
+        console.log('[Audio Diagnostics]', summary);
+      }
+    }
+    diagnosticsLastLog = now;
+  }
+
   // Update 3D scene with audio features
   // This animates the particles and visuals based on the audio
   sceneApi.update(features);
