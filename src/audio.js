@@ -202,7 +202,7 @@ export class AudioEngine {
     this._autoThrApplied = false;
     this._autoBassOnBeats = [];
     this._autoCentroidNegOnBeats = [];
-    this._autoThrMaxSamples = 200; // Hard limit to prevent unbounded growth over multi-hour sessions
+    this._autoThrMaxSamples = 200; // Sliding window: keep newest 200 samples, automatically discard oldest for fresh calibration during rapid track changes
 
     // File playback timeline tracking (for downbeat gating)
     this._fileStartCtxTimeSec = 0;
@@ -2608,11 +2608,17 @@ export class AudioEngine {
         // Collect samples for adaptive thresholding (during warmup)
         if (this.autoDropThresholdsEnabled && !this._autoThrApplied) {
           const negSlope = Math.max(0, -cDelta);
-          // Bound arrays to prevent unbounded growth over multi-hour sessions
-          if (this._autoBassOnBeats.length < this._autoThrMaxSamples) {
-            this._autoBassOnBeats.push(bands.env?.bass ?? 0);
+          // Sliding window: drop oldest sample when at capacity to always keep fresh data
+          // This ensures accurate calibration even when DJ rapidly switches tracks
+          if (this._autoBassOnBeats.length >= this._autoThrMaxSamples) {
+            this._autoBassOnBeats.shift(); // Remove oldest sample
           }
-          if (negSlope > 0 && this._autoCentroidNegOnBeats.length < this._autoThrMaxSamples) {
+          this._autoBassOnBeats.push(bands.env?.bass ?? 0);
+
+          if (negSlope > 0) {
+            if (this._autoCentroidNegOnBeats.length >= this._autoThrMaxSamples) {
+              this._autoCentroidNegOnBeats.shift(); // Remove oldest sample
+            }
             this._autoCentroidNegOnBeats.push(negSlope);
           }
         }
