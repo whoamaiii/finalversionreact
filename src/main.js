@@ -47,6 +47,7 @@ const diagnosticsEnabled = new URLSearchParams(location.search).has('diagnostics
 const diagnosticsLogIntervalMs = 5000;
 const diagnosticsMaxDurationMs = 300000; // 5 minutes max to prevent unbounded logging
 const diagnosticsMaxLogs = 100; // Stop after 100 samples (8.3 minutes at 5sec intervals)
+const diagnosticsClearIntervalLogs = 20; // Clear console every 20 samples to prevent memory buildup
 let diagnosticsLastLog = typeof performance !== 'undefined' ? performance.now() : Date.now();
 let diagnosticsStartTime = diagnosticsLastLog;
 let diagnosticsLogCount = 0;
@@ -54,6 +55,8 @@ let diagnosticsActive = diagnosticsEnabled;
 if (diagnosticsEnabled) {
   console.info('[Audio Diagnostics] Logging audio analysis metrics every 5 seconds');
   console.info('[Audio Diagnostics] Auto-disable after 5 minutes or 100 logs to prevent memory accumulation');
+  console.warn('[Audio Diagnostics] ⚠️ Console memory warning: Close DevTools when not actively debugging');
+  console.info('[Audio Diagnostics] Console will auto-clear every', diagnosticsClearIntervalLogs, 'samples to reduce memory usage');
   try { window.__audioDiagnostics = audio; } catch (_) {}
 }
 
@@ -166,19 +169,37 @@ try {
           const input = document.createElement('input');
           input.type = 'file';           // File input
           input.accept = 'audio/*';      // Only accept audio files
+
+          // Cleanup helper to ensure proper disposal in all code paths
+          // This prevents memory leaks from orphaned input elements
+          let cleanupCalled = false;
+          const cleanup = () => {
+            if (cleanupCalled) return; // Prevent double cleanup
+            cleanupCalled = true;
+            input.onchange = null;
+            input.oncancel = null;
+            clearTimeout(timeoutId);
+            input.remove();
+          };
+
+          // Safety timeout: cleanup after 5 minutes if user never interacts
+          // This handles edge cases where oncancel doesn't fire (browser quirks)
+          const timeoutId = setTimeout(() => {
+            cleanup();
+            console.warn('[FileInput] Cleanup timeout triggered (5 min)');
+          }, 300000);
+
           input.onchange = async () => {
             const f = input.files?.[0]; // Get the selected file
             if (f) await audio.loadFile(f); // Load it
-            // Clean up: remove event handler and element to prevent memory leak
-            input.onchange = null;
-            input.remove();
+            cleanup(); // Clean up: remove event handler and element
           };
+
           // Also handle cancel case (user closes picker without selecting)
           input.oncancel = () => {
-            input.onchange = null;
-            input.oncancel = null;
-            input.remove();
+            cleanup();
           };
+
           input.click(); // Trigger the file picker
         } else {
           // File was provided (e.g., from drag-and-drop), load it directly
@@ -326,6 +347,10 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   // Rate limit: don't try too often (respect backoff delay)
   if (!force && now - featureWsLastAttemptMs < featureWsBackoffMs) return;
 
+  // CRITICAL: Set connecting flag BEFORE any async operations to prevent race condition
+  // This ensures multiple rapid calls don't create duplicate WebSocket connections
+  featureWsConnecting = true;
+
   // Clean up any existing connection before creating new one
   closeFeatureWs();
 
@@ -334,7 +359,6 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   featureWsAttemptCount += 1;
 
   try {
-    featureWsConnecting = true;
     // Create new WebSocket connection
     const ws = new WebSocket(FEATURE_WS_URL);
     
@@ -686,20 +710,29 @@ function animate() {
       const utilPct = (typeof summary.avgUtilization === 'number' && Number.isFinite(summary.avgUtilization))
         ? (summary.avgUtilization * 100).toFixed(1)
         : '0.0';
-      try {
-        console.table({
-          windowMs: fmt(summary.windowMs),
-          samples: summary.sampleCount,
-          avgUpdateMs: fmt(summary.avgUpdateMs),
-          minUpdateMs: fmt(summary.minUpdateMs),
-          maxUpdateMs: fmt(summary.maxUpdateMs),
-          avgUtilizationPct: utilPct,
-          avgWorkletLatencyMs: fmt(summary.avgWorkletLatencyMs),
-          minWorkletLatencyMs: fmt(summary.minWorkletLatencyMs),
-          maxWorkletLatencyMs: fmt(summary.maxWorkletLatencyMs),
-        });
-      } catch (_) {
-        console.log('[Audio Diagnostics]', summary);
+
+      // Use compact console.log instead of console.table to reduce memory footprint
+      // This prevents large object accumulation in browser devtools memory
+      console.log(
+        `[Audio #${diagnosticsLogCount}]`,
+        `${fmt(summary.avgUpdateMs)}ms avg`,
+        `(${fmt(summary.minUpdateMs)}-${fmt(summary.maxUpdateMs)})`,
+        `| ${utilPct}% util`,
+        `| ${summary.sampleCount} samples`,
+        `| worklet: ${fmt(summary.avgWorkletLatencyMs)}ms`,
+        `(${fmt(summary.minWorkletLatencyMs)}-${fmt(summary.maxWorkletLatencyMs)})`
+      );
+
+      // Periodically clear console to prevent unbounded memory growth
+      // Even with compact logging, browsers accumulate console history
+      if (diagnosticsLogCount % diagnosticsClearIntervalLogs === 0) {
+        try {
+          console.info(`[Audio Diagnostics] Clearing console after ${diagnosticsLogCount} samples to free memory`);
+          console.clear();
+          console.info(`[Audio Diagnostics] Console cleared. Continuing diagnostics...`);
+        } catch (_) {
+          // console.clear() may be blocked in some environments
+        }
       }
     }
     diagnosticsLastLog = now;
