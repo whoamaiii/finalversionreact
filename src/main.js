@@ -173,18 +173,19 @@ try {
           // Cleanup helper to ensure proper disposal in all code paths
           // This prevents memory leaks from orphaned input elements
           let cleanupCalled = false;
+          let timeoutId; // Declare before cleanup function to avoid reference error
           const cleanup = () => {
             if (cleanupCalled) return; // Prevent double cleanup
             cleanupCalled = true;
             input.onchange = null;
             input.oncancel = null;
-            clearTimeout(timeoutId);
+            if (timeoutId) clearTimeout(timeoutId);
             input.remove();
           };
 
           // Safety timeout: cleanup after 5 minutes if user never interacts
           // This handles edge cases where oncancel doesn't fire (browser quirks)
-          const timeoutId = setTimeout(() => {
+          timeoutId = setTimeout(() => {
             cleanup();
             console.warn('[FileInput] Cleanup timeout triggered (5 min)');
           }, 300000);
@@ -347,12 +348,13 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   // Rate limit: don't try too often (respect backoff delay)
   if (!force && now - featureWsLastAttemptMs < featureWsBackoffMs) return;
 
-  // CRITICAL: Set connecting flag BEFORE any async operations to prevent race condition
-  // This ensures multiple rapid calls don't create duplicate WebSocket connections
-  featureWsConnecting = true;
-
   // Clean up any existing connection before creating new one
   closeFeatureWs();
+
+  // CRITICAL: Set connecting flag AFTER cleanup to prevent race condition
+  // This ensures multiple rapid calls don't create duplicate WebSocket connections
+  // Must be AFTER closeFeatureWs() which resets this flag
+  featureWsConnecting = true;
 
   // Record this attempt
   featureWsLastAttemptMs = now;
