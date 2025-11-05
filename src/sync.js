@@ -266,13 +266,10 @@ export class SyncCoordinator {
     }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      // Remove old handlers to prevent accumulation on re-initialization
-      if (this._messageHandler) {
-        window.removeEventListener('message', this._messageHandler);
-      }
-      if (this._storageHandler) {
-        window.removeEventListener('storage', this._storageHandler);
-      }
+      // Always attempt to remove old handlers first (safe even if undefined/null)
+      // This prevents handler duplication on re-initialization
+      window.removeEventListener('message', this._messageHandler);
+      window.removeEventListener('storage', this._storageHandler);
 
       // Store handler references for cleanup
       this._messageHandler = (event) => {
@@ -467,15 +464,11 @@ export class SyncCoordinator {
         // Log quota errors but don't disrupt sync operations
         if (err.name === 'QuotaExceededError') {
           console.warn('[SyncCoordinator] localStorage quota exceeded, sync message dropped');
-          // Show warning toast once per session
+          // Show warning once per session (avoid dynamic import to prevent memory accumulation)
           if (!this._quotaWarningShown) {
             this._quotaWarningShown = true;
-            try {
-              // Import showToast dynamically to avoid circular dependency
-              import('./toast.js').then(({ showToast }) => {
-                showToast('Storage full! Multi-window sync may be affected.', 4000);
-              }).catch(() => {});
-            } catch (_) {}
+            // Use console.error for visibility (toast would require dynamic import)
+            console.error('[SyncCoordinator] Storage quota exceeded! Multi-window sync may be affected. Clear localStorage or close other tabs.');
           }
         }
       }

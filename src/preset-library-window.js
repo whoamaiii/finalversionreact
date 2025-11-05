@@ -15,15 +15,20 @@ const COLOR_PARAMS = [
   'visuals.dispersion.tintMixMax',
 ];
 
-function createButton(doc, label, onClick, { variant = 'primary', title } = {}) {
+function createButton(doc, label, onClick, { variant = 'primary', title, trackListener } = {}) {
   const btn = doc.createElement('button');
   btn.textContent = label;
   btn.className = `pl-btn ${variant}`;
   if (title) btn.title = title;
-  btn.addEventListener('click', (event) => {
+  const clickHandler = (event) => {
     event.preventDefault();
     onClick?.(event);
-  });
+  };
+  btn.addEventListener('click', clickHandler);
+  // Track listener for cleanup if tracking function provided
+  if (typeof trackListener === 'function') {
+    trackListener(btn, 'click', clickHandler);
+  }
   return btn;
 }
 
@@ -184,11 +189,13 @@ export class PresetLibraryWindow {
     header.appendChild(title);
     const actions = doc.createElement('div');
     actions.className = 'pl-header-actions';
-    actions.appendChild(createButton(doc, 'Load', () => this._handleLoad()));
-    actions.appendChild(createButton(doc, 'Save', () => this._handleSave(), { variant: 'ghost', title: 'Overwrite selected preset' }));
-    actions.appendChild(createButton(doc, 'Save As…', () => this._handleSaveAs(), { variant: 'ghost' }));
-    actions.appendChild(createButton(doc, 'Rollback', () => this._handleRollback(), { variant: 'ghost' }));
-    actions.appendChild(createButton(doc, 'Close', () => this.close(), { variant: 'ghost' }));
+    // Track all button listeners for proper cleanup
+    const track = (el, event, handler) => this._addTrackedListener(el, event, handler);
+    actions.appendChild(createButton(doc, 'Load', () => this._handleLoad(), { trackListener: track }));
+    actions.appendChild(createButton(doc, 'Save', () => this._handleSave(), { variant: 'ghost', title: 'Overwrite selected preset', trackListener: track }));
+    actions.appendChild(createButton(doc, 'Save As…', () => this._handleSaveAs(), { variant: 'ghost', trackListener: track }));
+    actions.appendChild(createButton(doc, 'Rollback', () => this._handleRollback(), { variant: 'ghost', trackListener: track }));
+    actions.appendChild(createButton(doc, 'Close', () => this.close(), { variant: 'ghost', trackListener: track }));
     header.appendChild(actions);
     return header;
   }
@@ -231,7 +238,9 @@ export class PresetLibraryWindow {
     favToggle.appendChild(doc.createTextNode('Favorites only'));
     bar.appendChild(favToggle);
 
-    const compareBtn = createButton(doc, 'Quick Compare', () => this._handleQuickCompare(), { variant: 'ghost' });
+    // Track compare button listener for proper cleanup
+    const track = (el, event, handler) => this._addTrackedListener(el, event, handler);
+    const compareBtn = createButton(doc, 'Quick Compare', () => this._handleQuickCompare(), { variant: 'ghost', trackListener: track });
     bar.appendChild(compareBtn);
 
     return bar;
@@ -395,10 +404,12 @@ export class PresetLibraryWindow {
 
     const actionRow = doc.createElement('div');
     actionRow.className = 'pl-detail-actions';
-    actionRow.appendChild(createButton(doc, preset.favorite ? 'Unfavorite' : 'Favorite', () => this._toggleFavorite(preset)));
-    actionRow.appendChild(createButton(doc, 'Duplicate', () => this._handleDuplicate(preset), { variant: 'ghost' }));
-    actionRow.appendChild(createButton(doc, 'Rename', () => this._handleRename(preset), { variant: 'ghost' }));
-    actionRow.appendChild(createButton(doc, 'Delete', () => this._handleDelete(preset), { variant: 'ghost' }));
+    // Track all button listeners for proper cleanup on re-render
+    const track = (el, event, handler) => this._addTrackedListener(el, event, handler);
+    actionRow.appendChild(createButton(doc, preset.favorite ? 'Unfavorite' : 'Favorite', () => this._toggleFavorite(preset), { trackListener: track }));
+    actionRow.appendChild(createButton(doc, 'Duplicate', () => this._handleDuplicate(preset), { variant: 'ghost', trackListener: track }));
+    actionRow.appendChild(createButton(doc, 'Rename', () => this._handleRename(preset), { variant: 'ghost', trackListener: track }));
+    actionRow.appendChild(createButton(doc, 'Delete', () => this._handleDelete(preset), { variant: 'ghost', trackListener: track }));
     detail.appendChild(actionRow);
 
     const guardControls = doc.createElement('div');
@@ -413,6 +424,8 @@ export class PresetLibraryWindow {
       const history = doc.createElement('div');
       history.className = 'pl-history';
       history.appendChild(this._sectionTitle(doc, 'Version History'));
+      // Reuse tracking function for version restore buttons
+      const track = (el, event, handler) => this._addTrackedListener(el, event, handler);
       versions.forEach((version) => {
         const row = doc.createElement('div');
         row.className = `pl-history-row ${version.isCurrent ? 'current' : ''}`;
@@ -420,7 +433,7 @@ export class PresetLibraryWindow {
         label.textContent = `${fmtTime(version.savedAt)} ${version.note || ''}`;
         row.appendChild(label);
         if (!version.isCurrent) {
-          const restore = createButton(doc, 'Restore', () => this._handleRestoreVersion(preset, version), { variant: 'ghost' });
+          const restore = createButton(doc, 'Restore', () => this._handleRestoreVersion(preset, version), { variant: 'ghost', trackListener: track });
           row.appendChild(restore);
         }
         history.appendChild(row);

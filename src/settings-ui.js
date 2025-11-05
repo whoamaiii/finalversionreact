@@ -322,10 +322,11 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   const shaderHudNode = ensureShaderHud();
   const showShaderHud = (label, valueText) => {
     if (!shaderHudNode) return;
-    // Clear existing timer to prevent accumulation
-    if (shaderHudTimer) {
-      clearTrackedTimeout(shaderHudTimer);
-      shaderHudTimer = null;
+    // Atomically clear existing timer to prevent race conditions
+    const oldTimer = shaderHudTimer;
+    shaderHudTimer = null; // Set to null IMMEDIATELY to prevent orphaned timers
+    if (oldTimer) {
+      clearTrackedTimeout(oldTimer);
     }
     shaderHudNode.textContent = label ? `${label}: ${valueText}` : valueText;
     shaderHudNode.style.opacity = '1';

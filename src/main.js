@@ -758,15 +758,7 @@ function animate() {
     // Check every ~3 seconds
     if (autoElapsedMs > 3000 && autoFrames > 0) {
       // Estimate current FPS (guard against division by zero or very small values)
-      // Require at least 100ms of elapsed time to avoid unstable calculations
-      const MIN_ELAPSED_MS = 100;
-      if (autoElapsedMs < MIN_ELAPSED_MS) {
-        // Not enough time elapsed, skip this adjustment cycle
-        autoFrames = 0;
-        autoElapsedMs = 0;
-        return;
-      }
-
+      // Since we require autoElapsedMs > 3000, no need for additional MIN_ELAPSED_MS check
       const fpsApprox = (autoFrames * 1000) / autoElapsedMs;
 
       // Validate FPS calculation is finite and reasonable before using it
