@@ -322,10 +322,11 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   const shaderHudNode = ensureShaderHud();
   const showShaderHud = (label, valueText) => {
     if (!shaderHudNode) return;
-    // Clear existing timer to prevent accumulation
-    if (shaderHudTimer) {
-      clearTrackedTimeout(shaderHudTimer);
-      shaderHudTimer = null;
+    // Atomically clear existing timer to prevent race conditions
+    const oldTimer = shaderHudTimer;
+    shaderHudTimer = null; // Set to null IMMEDIATELY to prevent orphaned timers
+    if (oldTimer) {
+      clearTrackedTimeout(oldTimer);
     }
     shaderHudNode.textContent = label ? `${label}: ${valueText}` : valueText;
     shaderHudNode.style.opacity = '1';
@@ -2501,6 +2502,35 @@ export function cleanupSettingsUI() {
   runTrackedCleanup();
   clearTrackedDomListeners();
   clearAllTrackedTimeouts();
+
+  // Remove dynamically created DOM elements to prevent accumulation
+  try {
+    const shaderHud = document.getElementById('shader-hud-overlay');
+    if (shaderHud && shaderHud.parentNode) {
+      shaderHud.parentNode.removeChild(shaderHud);
+    }
+  } catch (_) {}
+
+  try {
+    const pinnedHud = document.getElementById('shader-pinned-hud');
+    if (pinnedHud && pinnedHud.parentNode) {
+      pinnedHud.parentNode.removeChild(pinnedHud);
+    }
+  } catch (_) {}
+
+  try {
+    const hotkeyHelp = document.getElementById('settings-hotkey-help');
+    if (hotkeyHelp && hotkeyHelp.parentNode) {
+      hotkeyHelp.parentNode.removeChild(hotkeyHelp);
+    }
+  } catch (_) {}
+
+  try {
+    const injectedStyles = document.getElementById('settings-ui-injected-styles');
+    if (injectedStyles && injectedStyles.parentNode) {
+      injectedStyles.parentNode.removeChild(injectedStyles);
+    }
+  } catch (_) {}
 
   // Reset initialization flag
   _settingsUIInitialized = false;
