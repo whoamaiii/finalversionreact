@@ -2503,6 +2503,35 @@ export function cleanupSettingsUI() {
   clearTrackedDomListeners();
   clearAllTrackedTimeouts();
 
+  // Remove dynamically created DOM elements to prevent accumulation
+  try {
+    const shaderHud = document.getElementById('shader-hud-overlay');
+    if (shaderHud && shaderHud.parentNode) {
+      shaderHud.parentNode.removeChild(shaderHud);
+    }
+  } catch (_) {}
+
+  try {
+    const pinnedHud = document.getElementById('shader-pinned-hud');
+    if (pinnedHud && pinnedHud.parentNode) {
+      pinnedHud.parentNode.removeChild(pinnedHud);
+    }
+  } catch (_) {}
+
+  try {
+    const hotkeyHelp = document.getElementById('settings-hotkey-help');
+    if (hotkeyHelp && hotkeyHelp.parentNode) {
+      hotkeyHelp.parentNode.removeChild(hotkeyHelp);
+    }
+  } catch (_) {}
+
+  try {
+    const injectedStyles = document.getElementById('settings-ui-injected-styles');
+    if (injectedStyles && injectedStyles.parentNode) {
+      injectedStyles.parentNode.removeChild(injectedStyles);
+    }
+  } catch (_) {}
+
   // Reset initialization flag
   _settingsUIInitialized = false;
 }
