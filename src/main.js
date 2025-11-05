@@ -45,9 +45,15 @@ const audio = new AudioEngine();
 
 const diagnosticsEnabled = new URLSearchParams(location.search).has('diagnostics');
 const diagnosticsLogIntervalMs = 5000;
+const diagnosticsMaxDurationMs = 300000; // 5 minutes max to prevent unbounded logging
+const diagnosticsMaxLogs = 100; // Stop after 100 samples (8.3 minutes at 5sec intervals)
 let diagnosticsLastLog = typeof performance !== 'undefined' ? performance.now() : Date.now();
+let diagnosticsStartTime = diagnosticsLastLog;
+let diagnosticsLogCount = 0;
+let diagnosticsActive = diagnosticsEnabled;
 if (diagnosticsEnabled) {
   console.info('[Audio Diagnostics] Logging audio analysis metrics every 5 seconds');
+  console.info('[Audio Diagnostics] Auto-disable after 5 minutes or 100 logs to prevent memory accumulation');
   try { window.__audioDiagnostics = audio; } catch (_) {}
 }
 
@@ -627,9 +633,22 @@ function animate() {
     console.warn('Performance pads update error:', err);
   }
 
-  if (diagnosticsEnabled && now - diagnosticsLastLog >= diagnosticsLogIntervalMs) {
+  // Auto-disable diagnostics after time/count limits to prevent memory accumulation
+  if (diagnosticsActive) {
+    const diagnosticsElapsed = now - diagnosticsStartTime;
+    if (diagnosticsElapsed > diagnosticsMaxDurationMs || diagnosticsLogCount >= diagnosticsMaxLogs) {
+      diagnosticsActive = false;
+      console.warn('[Audio Diagnostics] Auto-disabled after',
+        Math.floor(diagnosticsElapsed / 1000), 'seconds /',
+        diagnosticsLogCount, 'logs to prevent console memory accumulation');
+      console.info('[Audio Diagnostics] Reload with ?diagnostics to re-enable');
+    }
+  }
+
+  if (diagnosticsActive && now - diagnosticsLastLog >= diagnosticsLogIntervalMs) {
     const summary = audio.getDiagnosticsSummary({ includeCurrent: true, reset: true });
     if (summary) {
+      diagnosticsLogCount++;
       const fmt = (value) => (typeof value === 'number' && Number.isFinite(value)
         ? Number(value).toFixed(3)
         : 'n/a');

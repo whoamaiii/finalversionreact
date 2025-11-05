@@ -202,6 +202,7 @@ export class AudioEngine {
     this._autoThrApplied = false;
     this._autoBassOnBeats = [];
     this._autoCentroidNegOnBeats = [];
+    this._autoThrMaxSamples = 200; // Hard limit to prevent unbounded growth over multi-hour sessions
 
     // File playback timeline tracking (for downbeat gating)
     this._fileStartCtxTimeSec = 0;
@@ -2607,8 +2608,13 @@ export class AudioEngine {
         // Collect samples for adaptive thresholding (during warmup)
         if (this.autoDropThresholdsEnabled && !this._autoThrApplied) {
           const negSlope = Math.max(0, -cDelta);
-          this._autoBassOnBeats.push(bands.env?.bass ?? 0);
-          if (negSlope > 0) this._autoCentroidNegOnBeats.push(negSlope);
+          // Bound arrays to prevent unbounded growth over multi-hour sessions
+          if (this._autoBassOnBeats.length < this._autoThrMaxSamples) {
+            this._autoBassOnBeats.push(bands.env?.bass ?? 0);
+          }
+          if (negSlope > 0 && this._autoCentroidNegOnBeats.length < this._autoThrMaxSamples) {
+            this._autoCentroidNegOnBeats.push(negSlope);
+          }
         }
         // Maintain bar-phase state for optional drop gating
         if (this.dropBarGatingEnabled) {
