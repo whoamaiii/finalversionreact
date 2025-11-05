@@ -773,6 +773,34 @@ export class PresetManager {
       console.info('[PresetManager]', action, detail || {});
     } catch (_) {}
   }
+
+  /**
+   * Cleanup method to remove all event listeners and prevent memory leaks
+   * CRITICAL: Call this when disposing of the PresetManager instance
+   */
+  cleanup() {
+    // Clear all event listeners to prevent memory leaks
+    this._listeners.clear();
+
+    // Clear references that might prevent garbage collection
+    this._previousSnapshot = null;
+    this._compareSnapshot = null;
+    this._activePresetId = null;
+
+    // Remove global reference
+    if (typeof window !== 'undefined' && window.__presetManager === this) {
+      window.__presetManager = null;
+    }
+
+    this._log('cleanup', { listenersCleared: true });
+  }
+
+  /**
+   * Alias for cleanup() to match common disposal pattern
+   */
+  dispose() {
+    this.cleanup();
+  }
 }
 
 function getByPath(obj, path) {

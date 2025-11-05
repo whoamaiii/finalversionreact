@@ -2348,6 +2348,14 @@ export function initScene() {
 
     // Dispose of post-processing
     try {
+      // CRITICAL: Dispose dispersion layer first (has timers and WebGL resources)
+      if (state.dispersion && state.dispersion.layer) {
+        if (typeof state.dispersion.layer.dispose === 'function') {
+          state.dispersion.layer.dispose();
+        }
+        state.dispersion.layer = null;
+      }
+
       if (state.composer) {
         state.composer.dispose();
         state.composer = null;

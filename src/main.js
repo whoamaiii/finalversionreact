@@ -859,6 +859,15 @@ function stopAnimation() {
     }
   }
 
+  // Clean up preset manager
+  if (presetManager && typeof presetManager.cleanup === 'function') {
+    try {
+      presetManager.cleanup();
+    } catch (err) {
+      console.warn('Error cleaning up preset manager:', err);
+    }
+  }
+
   // Clean up audio engine
   if (audio && typeof audio.dispose === 'function') {
     try {
