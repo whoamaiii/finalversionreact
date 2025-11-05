@@ -18,7 +18,11 @@ const STORAGE_KEYS = {
   backup: 'cosmicPresetLibrary.v1.bak',
 };
 
-const VERSION_LIMIT = 15;
+// VERSION_LIMIT reduced from 15 to 5 to prevent localStorage quota exhaustion
+// Each preset snapshot is ~50-100KB; with 20 presets, 15 versions = 15-30MB
+// Typical localStorage quota is 5-10MB, causing frequent quota errors
+// 5 versions still provides adequate rollback safety for live performance
+const VERSION_LIMIT = 5;
 const RECENT_LIMIT = 12;
 
 const DEFAULT_LOCK_PARAMS = [
@@ -602,8 +606,9 @@ export class PresetManager {
     const now = Date.now();
     const filtered = this._state.recents.filter((entry) => entry.id !== id);
     filtered.unshift({ id, usedAt: now });
-    // Sliding window: remove oldest recents when over limit (more efficient than slice)
-    while (filtered.length > RECENT_LIMIT * 2) {
+    // Sliding window: trim to exact limit to reduce localStorage write overhead
+    // Previous implementation used RECENT_LIMIT * 2, causing excessive storage churn
+    while (filtered.length > RECENT_LIMIT) {
       filtered.pop(); // Remove from end (oldest)
     }
     this._state.recents = filtered;
