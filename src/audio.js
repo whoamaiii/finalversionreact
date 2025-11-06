@@ -753,6 +753,12 @@ export class AudioEngine {
       this._essentiaCurrentJobId = 0;
       this._essentiaPendingJobId = 0;
 
+      // Clear any pending termination timer to prevent orphaned timeouts
+      if (this._essentiaWorkerTerminationTimer) {
+        clearTimeout(this._essentiaWorkerTerminationTimer);
+        this._essentiaWorkerTerminationTimer = null;
+      }
+
       try {
         // Clear message handlers before terminating to prevent stale callbacks
         this._essentiaWorker.onmessage = null;
