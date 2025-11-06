@@ -277,6 +277,7 @@ try {
 let featureWs = null;                    // The WebSocket connection object
 let featureWsConnected = false;          // Is the connection currently open?
 let featureWsConnecting = false;         // Are we currently trying to connect?
+let featureWsInstanceId = 0;             // Monotonic counter to identify WebSocket instances
 let featureWsLastAttemptMs = 0;          // Timestamp of last connection attempt
 let featureWsLastSendMs = 0;             // Timestamp of last feature send
 let featureWsBackoffMs = 2500;           // Delay before retrying (exponential backoff, capped)
@@ -376,13 +377,15 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   featureWsAttemptCount += 1;
 
   try {
-    // Create new WebSocket connection
+    // Create new WebSocket connection with unique instance ID
     const ws = new WebSocket(FEATURE_WS_URL);
-    
+    const instanceId = ++featureWsInstanceId;
+    ws._instanceId = instanceId; // Tag for validation
+
     // Connection opened successfully
     ws.onopen = () => {
-      // Only update state if this is still the current WebSocket
-      if (ws === featureWs) {
+      // Only update state if this is still the current WebSocket instance
+      if (ws === featureWs && ws._instanceId === featureWsInstanceId) {
         featureWsConnected = true;
         featureWsConnecting = false;
         featureWsLastSendMs = 0; // Reset send timer
@@ -395,8 +398,8 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
 
     // Connection closed (will retry with backoff)
     ws.onclose = () => {
-      // Only update state if this is still the current WebSocket
-      if (ws === featureWs) {
+      // Only update state if this is still the current WebSocket instance
+      if (ws === featureWs && ws._instanceId === featureWsInstanceId) {
         featureWsConnected = false;
         featureWsConnecting = false;
         featureWs = null;
@@ -406,10 +409,13 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
     };
 
     // Connection error - close it cleanly
+    // Only close if this is still the current instance to avoid interfering with new connections
     ws.onerror = () => {
-      try { ws.close(); } catch(_) {}
+      if (ws === featureWs && ws._instanceId === featureWsInstanceId) {
+        try { ws.close(); } catch(_) {}
+      }
     };
-    
+
     featureWs = ws;
   } catch (_) {
     // If connection fails, reset state
