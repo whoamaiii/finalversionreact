@@ -292,7 +292,31 @@
         background: rgba(255,255,255,0.2);    /* Brighter on hover */
         transform: scale(1.1);                /* Slightly larger */
       }
-      
+
+      /* Diagnostics warning banner - prominent warning when diagnostics mode is active */
+      #diagnostics-warning {
+        padding: 10px 12px;                   /* Internal spacing */
+        background: linear-gradient(135deg, rgba(255,152,0,0.25), rgba(255,87,34,0.25)); /* Orange gradient */
+        border-top: 1px solid rgba(255,152,0,0.5);    /* Orange top border */
+        border-bottom: 1px solid rgba(255,152,0,0.5); /* Orange bottom border */
+        color: #fff;                          /* White text */
+        font-size: 13px;                      /* Medium-small text */
+        animation: diagnosticsPulse 2s ease-in-out infinite; /* Subtle pulse animation */
+      }
+      #diagnostics-warning code {
+        background: rgba(0,0,0,0.3);          /* Dark code background */
+        padding: 2px 6px;                     /* Small padding */
+        border-radius: 4px;                   /* Rounded corners */
+        font-family: 'Courier New', monospace; /* Monospace font */
+        font-size: 11px;                      /* Smaller text for code */
+        color: #ffa726;                       /* Light orange text */
+      }
+      /* Pulse animation for diagnostics warning */
+      @keyframes diagnosticsPulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.85; }
+      }
+
       /* Settings content area - scrollable area containing all the controls */
       #settings-content { 
         overflow: auto;                       /* Enable scrolling if content is too tall */
@@ -563,7 +587,20 @@
           <!-- Close button (× symbol) -->
           <button id="settings-close">✕</button>
         </div>
-        
+
+        <!-- Diagnostics mode warning banner - shown when ?diagnostics is in URL -->
+        <div id="diagnostics-warning" style="display: none;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 20px;" aria-hidden="true">⚠️</span>
+            <div style="flex: 1;">
+              <strong>Diagnostics Mode Active</strong>
+              <div style="font-size: 11px; opacity: 0.9; margin-top: 2px;">
+                Console logging enabled. Remove <code>?diagnostics</code> from URL to disable.
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Tab navigation - switches between different setting categories -->
         <!-- Populated dynamically by JavaScript in settings-ui.js -->
         <div id="settings-tabs"></div>

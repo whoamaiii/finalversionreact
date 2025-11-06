@@ -130,6 +130,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   const btnReset = document.getElementById('settings-reset');
   const btnSaveSettings = document.getElementById('settings-save-settings');
   const btnSavePreset = document.getElementById('settings-save-preset');
+  const diagnosticsWarning = document.getElementById('diagnostics-warning');
+
+  // Show diagnostics warning banner if ?diagnostics is in URL
+  const diagnosticsEnabled = new URLSearchParams(window.location.search).has('diagnostics');
+  if (diagnosticsEnabled && diagnosticsWarning) {
+    diagnosticsWarning.style.display = 'block';
+    console.warn('[SettingsUI] Diagnostics mode is active - warning banner displayed');
+  }
 
   // Inject minimal layout/sticky styles once
   (function ensureSettingsUiStyles(){
