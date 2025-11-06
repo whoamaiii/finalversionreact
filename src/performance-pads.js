@@ -46,11 +46,11 @@ export class PerformanceController {
       zoomAmount: 6.0,             // gentler additive zoom
       travelBoost: 0.18,           // gentler forward motion
       // Release snap (quick zoom pulse when button released)
-      releaseSnapMs: 140,
+      releaseSnapMs: 140,          // ~9 frames at 60fps: short enough for snappy feel, long enough for smooth cubic easing
       releaseSnapStrength: 0.8,    // scales snap amount
       releaseSnapZoom: -5.0,       // negative pushes back out briefly
       // Damped bounce after release
-      releaseBounceBeats: 0.45,    // shorter musical bounce
+      releaseBounceBeats: 0.45,    // 0.45 beats ≈ 1/16th + 1/32nd note at 120-160 BPM: creates tight rhythmic bounce that stays on-grid
       releaseBounceAmp: 3.2,       // smaller oscillation
       shiftMultiplier: 1.5,
       _snapRemainMs: 0,

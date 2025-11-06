@@ -279,7 +279,7 @@ let featureWsConnected = false;          // Is the connection currently open?
 let featureWsConnecting = false;         // Are we currently trying to connect?
 let featureWsLastAttemptMs = 0;          // Timestamp of last connection attempt
 let featureWsLastSendMs = 0;             // Timestamp of last feature send
-let featureWsBackoffMs = 2500;           // Delay before retrying (exponential backoff, capped)
+let featureWsBackoffMs = 2500;           // Initial 2.5s backoff: long enough to avoid hammering unresponsive server, short enough for quick recovery when bridge starts
 let featureWsAttemptCount = 0;           // Attempts made in current window
 let featureWsLockoutUntil = 0;           // Timestamp when we're allowed to try again after repeated failures
 let featureWsLockoutNotifiedAt = 0;      // Last time we notified the user about lockout
@@ -400,8 +400,11 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
         featureWsConnected = false;
         featureWsConnecting = false;
         featureWs = null;
-        // Increase backoff delay (exponential backoff, capped at 20 seconds)
-        featureWsBackoffMs = Math.min(20000, Math.max(2500, featureWsBackoffMs * 1.6));
+        // Exponential backoff: multiply by 1.6 each failure (2.5s → 4s → 6.4s → 10.2s → 16.4s → 20s cap)
+        // Floor at 2500ms ensures minimum retry delay even after successful connections
+        const MIN_BACKOFF_MS = 2500;
+        const MAX_BACKOFF_MS = 20000;
+        featureWsBackoffMs = Math.min(MAX_BACKOFF_MS, Math.max(MIN_BACKOFF_MS, featureWsBackoffMs * 1.6));
       }
     };
 

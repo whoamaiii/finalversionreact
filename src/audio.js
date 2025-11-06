@@ -191,8 +191,8 @@ export class AudioEngine {
     // Bass-only spectral flux (for build detection)
     this.dropUseBassFlux = false; // can be enabled via presets (Rave Mode)
     this.bassFluxHistory = [];
-    this.bassFluxWindow = 43;
-    this._maxBassFluxHistoryLength = 512;
+    this.bassFluxWindow = 43; // ~0.5s history at 86fps (empirically tuned: balance responsiveness vs noise rejection for drum & bass build-up detection)
+    this._maxBassFluxHistoryLength = 512; // Hard limit to prevent unbounded growth during extended sessions (512 samples ≈ 6 seconds at 86fps)
     this._prevMagBass = null;
 
     // Adaptive thresholds (learn per-track in warmup period)
