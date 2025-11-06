@@ -665,18 +665,27 @@ export class AudioEngine {
 
     // Process results in order of completion, giving priority to Essentia
     // which is generally more accurate but slower
+    // Wrap with timeout to prevent indefinite hangs (10 second max)
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('BPM analysis timeout after 10 seconds')), 10000);
+    });
+
     Promise.race([
       bpmPromise.then(result => ({ type: 'bpm', result })),
-      essentiaPromise.then(result => ({ type: 'essentia', result }))
-    ]).then(firstResult => {
+      essentiaPromise.then(result => ({ type: 'essentia', result })),
+      timeoutPromise
+    ])
+    .then(firstResult => {
       // Store the first result but wait for both to complete for best accuracy
-      Promise.all([bpmPromise, essentiaPromise]).then(() => {
-        // Both analyses complete - Essentia takes priority if successful
-      }).catch(err => {
-        console.warn('Error waiting for all analyses:', err);
-      });
-    }).catch(err => {
-      console.warn('Error in BPM analysis race:', err);
+      return Promise.all([bpmPromise, essentiaPromise]);
+    })
+    .then(() => {
+      // Both analyses complete - Essentia takes priority if successful
+    })
+    .catch(err => {
+      // Graceful degradation: log error but don't crash audio analysis
+      console.warn('[Audio] BPM analysis failed or timed out:', err);
+      // Analysis will continue with manual tap tempo or previous BPM estimate
     });
   }
 
@@ -743,6 +752,12 @@ export class AudioEngine {
       // Clear pending job IDs to prevent processing stale results
       this._essentiaCurrentJobId = 0;
       this._essentiaPendingJobId = 0;
+
+      // Clear any pending termination timer to prevent orphaned timeouts
+      if (this._essentiaWorkerTerminationTimer) {
+        clearTimeout(this._essentiaWorkerTerminationTimer);
+        this._essentiaWorkerTerminationTimer = null;
+      }
 
       try {
         // Clear message handlers before terminating to prevent stale callbacks
