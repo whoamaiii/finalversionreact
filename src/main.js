@@ -981,6 +981,12 @@ function stopAnimation() {
     animationFrameId = null;
   }
 
+  // Clean up storage quota check interval
+  if (_quotaCheckIntervalId !== null) {
+    clearInterval(_quotaCheckIntervalId);
+    _quotaCheckIntervalId = null;
+  }
+
   // Clean up WebSocket connection
   closeFeatureWs({ resetState: true });
 
@@ -1109,6 +1115,7 @@ if (!window.__dragDropListenersAdded) {
 
 let _lastQuotaCheck = 0;
 let _quotaWarningShown = false;
+let _quotaCheckIntervalId = null; // Store interval ID for cleanup
 const QUOTA_CHECK_INTERVAL_MS = 300000; // Check every 5 minutes
 const QUOTA_WARNING_THRESHOLD = 0.80; // Warn at 80% capacity
 
@@ -1153,7 +1160,7 @@ async function checkStorageQuota() {
 // First check happens after 30 seconds to avoid startup overhead
 setTimeout(() => {
   checkStorageQuota();
-  setInterval(checkStorageQuota, QUOTA_CHECK_INTERVAL_MS);
+  _quotaCheckIntervalId = setInterval(checkStorageQuota, QUOTA_CHECK_INTERVAL_MS);
 }, 30000);
 
 // System Audio Help Button
