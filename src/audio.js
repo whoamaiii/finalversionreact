@@ -152,7 +152,7 @@ export class AudioEngine {
     this.beatEnergyFloor = 0.28; // 0..1 energy floor on bass env to accept beat
     this.noiseGateEnabled = false; // attenuate low-level noise before extraction
     this.noiseGateThreshold = 0.10; // 0..1 amplitude/energy threshold for gate
-    this._noiseGateCalibrating = false; // guard concurrent calibrations
+    this._noiseGateCalibrationPromise = null; // Promise-based lock for calibration
     this._lastBeatMs = -99999;
 
     // Tap tempo configuration
@@ -525,6 +525,18 @@ export class AudioEngine {
 
       const attachEndedHandler = (track) => {
         if (!track || typeof track.addEventListener !== 'function') return;
+
+        // Remove any existing handler first to prevent accumulation
+        // This is critical when tracks are reused across multiple audio sources
+        if (track._endedHandler) {
+          try {
+            track.removeEventListener('ended', track._endedHandler);
+          } catch (_) {
+            // Removal may fail if handler wasn't attached, ignore
+          }
+          track._endedHandler = null;
+        }
+
         const handler = () => {
           track.removeEventListener('ended', handler);
           if (this.activeStream === stream) {
@@ -709,9 +721,15 @@ export class AudioEngine {
     this._flushAubioQueue();
     this._disposeLiveBuffer();
 
-    // Reset worklet state
+    // Reset worklet state and clear port handler to prevent message accumulation
     if (this.workletNode) {
-      try { this.workletNode.port.postMessage({ type: 'reset' }); } catch (_) {}
+      try {
+        this.workletNode.port.postMessage({ type: 'reset' });
+        // Clear port message handler to prevent accumulation during pause/resume cycles
+        if (this.workletNode.port) {
+          this.workletNode.port.onmessage = null;
+        }
+      } catch (_) {}
     }
 
     // Terminate Essentia worker to prevent memory leak
@@ -865,10 +883,27 @@ export class AudioEngine {
    * @returns {Promise<number>} resolved gate threshold (0..1)
    */
   async calibrateNoiseGate(durationMs = 5000) {
-    if (this._noiseGateCalibrating) return this.noiseGateThreshold;
+    // Use Promise-based locking to prevent concurrent calibration loops
+    // If calibration is already running, wait for it to complete
+    if (this._noiseGateCalibrationPromise) {
+      return await this._noiseGateCalibrationPromise;
+    }
+
+    // Start new calibration and store the Promise
+    this._noiseGateCalibrationPromise = this._doNoiseGateCalibration(durationMs);
+
+    try {
+      return await this._noiseGateCalibrationPromise;
+    } finally {
+      // Always clear the Promise when done (success or failure)
+      this._noiseGateCalibrationPromise = null;
+    }
+  }
+
+  async _doNoiseGateCalibration(durationMs) {
     await this.ensureContext();
     if (!this.analyser || !this.sampleRate) return 0;
-    this._noiseGateCalibrating = true;
+
     const wasEnabled = !!this.noiseGateEnabled;
     const scratch = new Uint8Array(this.analyser.frequencyBinCount);
     const sr = this.sampleRate || 44100;
@@ -895,7 +930,6 @@ export class AudioEngine {
     }
 
     this.noiseGateEnabled = wasEnabled;
-    this._noiseGateCalibrating = false;
     if (!samples.length) return this.noiseGateThreshold;
     // Create a copy to avoid mutating the original array
     const sortedSamples = samples.slice().sort((a, b) => a - b);
@@ -2943,6 +2977,13 @@ export class AudioEngine {
       } catch (err) {
         console.warn('Error terminating Essentia worker:', err);
       }
+    }
+
+    // Clear Essentia analysis job map to prevent memory accumulation
+    // Critical for multi-hour live events with frequent beat grid analysis
+    if (this._essentiaAnalysisByJobId) {
+      this._essentiaAnalysisByJobId.clear();
+      this._essentiaAnalysisByJobId = null;
     }
 
     // Clean up Aubio instances
