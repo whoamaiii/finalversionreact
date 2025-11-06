@@ -177,10 +177,25 @@ try {
           const cleanup = () => {
             if (cleanupCalled) return; // Prevent double cleanup
             cleanupCalled = true;
+
+            // Clear event handlers
             input.onchange = null;
             input.oncancel = null;
-            if (timeoutId) clearTimeout(timeoutId);
-            input.remove();
+
+            // Clear and nullify timeout to prevent race conditions
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
+            }
+
+            // Safely remove element (may already be removed)
+            try {
+              if (input.parentNode) {
+                input.remove();
+              }
+            } catch (_) {
+              // Element already removed or detached, ignore
+            }
           };
 
           // Safety timeout: cleanup after 5 minutes if user never interacts
@@ -899,11 +914,27 @@ function animate() {
             sceneApi.setPixelRatioCap(clampedPR);
           }
         }
+      } else if (!Number.isFinite(fpsApprox)) {
+        // Diagnostic logging for invalid FPS calculations to catch root cause
+        console.error('[AutoRes] Invalid FPS calculation detected', {
+          fpsApprox,
+          autoFrames,
+          autoElapsedMs,
+          autoMs: now - autoLast,
+          now,
+          autoLast
+        });
+        // Force reset to recover from invalid state
+        autoFrames = 0;
+        autoElapsedMs = 0;
+        autoLast = now;
       }
 
-      // Reset counters (always reset even if calculation failed)
-      autoFrames = 0;
-      autoElapsedMs = 0;
+      // Reset counters (always reset even if calculation succeeded)
+      if (Number.isFinite(fpsApprox)) {
+        autoFrames = 0;
+        autoElapsedMs = 0;
+      }
     }
   }
 }
@@ -1070,6 +1101,60 @@ if (!window.__dragDropListenersAdded) {
   window.addEventListener('drop', eventHandlers.drop);
   window.__dragDropListenersAdded = true;
 }
+
+// localStorage Quota Monitoring
+// ==============================
+// Proactively warn users when storage is approaching capacity
+// This prevents silent failures during live performances
+
+let _lastQuotaCheck = 0;
+let _quotaWarningShown = false;
+const QUOTA_CHECK_INTERVAL_MS = 300000; // Check every 5 minutes
+const QUOTA_WARNING_THRESHOLD = 0.80; // Warn at 80% capacity
+
+/**
+ * Check localStorage quota and warn if approaching limit.
+ * Uses Storage API when available, falls back to error-based detection.
+ */
+async function checkStorageQuota() {
+  const now = performance.now();
+  if (now - _lastQuotaCheck < QUOTA_CHECK_INTERVAL_MS) return;
+  _lastQuotaCheck = now;
+
+  try {
+    // Modern browsers with Storage API
+    if (navigator.storage && navigator.storage.estimate) {
+      const estimate = await navigator.storage.estimate();
+      const percentUsed = (estimate.usage / estimate.quota) * 100;
+
+      if (percentUsed >= QUOTA_WARNING_THRESHOLD * 100 && !_quotaWarningShown) {
+        _quotaWarningShown = true;
+        const usedMB = (estimate.usage / 1024 / 1024).toFixed(1);
+        const quotaMB = (estimate.quota / 1024 / 1024).toFixed(1);
+        showToast(
+          `Storage ${percentUsed.toFixed(0)}% full (${usedMB}MB / ${quotaMB}MB). Consider clearing old presets to avoid save failures.`,
+          6000
+        );
+        console.warn('[Storage] Quota warning:', { percentUsed, usage: estimate.usage, quota: estimate.quota });
+      }
+
+      // Reset warning flag if usage drops below threshold (allows re-warning if it fills up again)
+      if (percentUsed < (QUOTA_WARNING_THRESHOLD - 0.1) * 100) {
+        _quotaWarningShown = false;
+      }
+    }
+  } catch (err) {
+    // Storage API not available or failed, silently continue
+    console.debug('[Storage] Quota check failed:', err);
+  }
+}
+
+// Start periodic quota monitoring (will check every 5 minutes during playback)
+// First check happens after 30 seconds to avoid startup overhead
+setTimeout(() => {
+  checkStorageQuota();
+  setInterval(checkStorageQuota, QUOTA_CHECK_INTERVAL_MS);
+}, 30000);
 
 // System Audio Help Button
 // ========================

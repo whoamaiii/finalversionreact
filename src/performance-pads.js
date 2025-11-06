@@ -280,15 +280,47 @@ export class PerformanceController {
   }
 
   panic() {
+    // Pad 1: Clear all state including quantize pending flags
     const p = this.pad1;
     p.isDown = false;
     p.latched = false;
     p.intensity = 0;
-    // Clear quantize pending flags to prevent stale triggers
     p._pendingEngage = false;
     p._pendingRelease = false;
-    if (this.pad2) this.pad2._pending = false;
-    if (this.pad4) this.pad4._pending = false;
+    p._snapRemainMs = 0;
+    p._bounceRemainMs = 0;
+
+    // Pad 2: Clear shot pending flag
+    if (this.pad2) {
+      this.pad2._pending = false;
+      this.pad2._active = false;
+    }
+
+    // Pad 3: Clear hold state
+    if (this.pad3) {
+      this.pad3.isDown = false;
+      this.pad3.latched = false;
+      this.pad3.intensity = 0;
+      this.pad3._active = false;
+      this.pad3._releasing = false;
+    }
+
+    // Pad 4: Clear dual-pulse state
+    if (this.pad4) {
+      this.pad4._pending = false;
+      this.pad4._active = false;
+    }
+
+    // Pad 5: Clear swirl state
+    if (this.pad5) {
+      this.pad5.isDown = false;
+      this.pad5.latched = false;
+      this.pad5.intensity = 0;
+      this.pad5._active = false;
+      this.pad5._releasing = false;
+    }
+
+    // Clear HUD indication
     if (this._hud) this._hud.classList.remove('on');
   }
 

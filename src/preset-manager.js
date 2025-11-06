@@ -760,10 +760,32 @@ export class PresetManager {
   }
 
   _notify(event, detail) {
+    let errorCount = 0;
+    const errors = [];
+
     for (const listener of this._listeners) {
       if (listener.event === event || listener.event === '*') {
-        try { listener.handler({ event, detail }); } catch (err) { console.error('PresetManager listener error', err); }
+        try {
+          listener.handler({ event, detail });
+        } catch (err) {
+          errorCount++;
+          errors.push(err);
+          // Log with context for debugging which listener failed
+          console.error('[PresetManager] Listener error:', {
+            event,
+            detail,
+            error: err,
+            listenerEvent: listener.event,
+            // Include handler function name if available (helpful for debugging)
+            handlerName: listener.handler?.name || 'anonymous'
+          });
+        }
       }
+    }
+
+    // If multiple listeners failed, log summary (indicates systemic issue)
+    if (errorCount > 1) {
+      console.error(`[PresetManager] ${errorCount} listeners failed for event '${event}'`, errors);
     }
   }
 

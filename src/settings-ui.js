@@ -1579,24 +1579,46 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         const overflowBtn = button('⋯', (ev) => {
           ev.stopPropagation();
           const isOpen = menu.style.display === 'block';
-          menu.style.display = isOpen ? 'none' : 'block';
-          if (!isOpen) {
-            const handleOutside = (e) => {
-              const t = e.target;
-              const inMenu = (menu.contains && menu.contains(t));
-              const onBtn = (overflowBtn === t) || (overflowBtn.contains && overflowBtn.contains(t));
-              if (!inMenu && !onBtn) {
-                menu.style.display = 'none';
-                document.removeEventListener('click', handleOutside, true);
-                // Remove from active listeners array
-                const idx = _activeOverflowListeners.indexOf(handleOutside);
-                if (idx !== -1) _activeOverflowListeners.splice(idx, 1);
-              }
-            };
-            document.addEventListener('click', handleOutside, true);
-            // Track this listener for cleanup
-            _activeOverflowListeners.push(handleOutside);
+
+          // Close menu
+          if (isOpen) {
+            menu.style.display = 'none';
+            // Clean up existing handler if present
+            if (menu._handleOutside) {
+              document.removeEventListener('click', menu._handleOutside, true);
+              const idx = _activeOverflowListeners.indexOf(menu._handleOutside);
+              if (idx !== -1) _activeOverflowListeners.splice(idx, 1);
+              menu._handleOutside = null;
+            }
+            return;
           }
+
+          // Open menu - remove any stale handler first
+          if (menu._handleOutside) {
+            document.removeEventListener('click', menu._handleOutside, true);
+            const idx = _activeOverflowListeners.indexOf(menu._handleOutside);
+            if (idx !== -1) _activeOverflowListeners.splice(idx, 1);
+          }
+
+          // Create and attach new handler
+          const handleOutside = (e) => {
+            const t = e.target;
+            const inMenu = (menu.contains && menu.contains(t));
+            const onBtn = (overflowBtn === t) || (overflowBtn.contains && overflowBtn.contains(t));
+            if (!inMenu && !onBtn) {
+              menu.style.display = 'none';
+              document.removeEventListener('click', handleOutside, true);
+              // Remove from active listeners array
+              const idx = _activeOverflowListeners.indexOf(handleOutside);
+              if (idx !== -1) _activeOverflowListeners.splice(idx, 1);
+              menu._handleOutside = null;
+            }
+          };
+
+          menu._handleOutside = handleOutside;
+          document.addEventListener('click', handleOutside, true);
+          _activeOverflowListeners.push(handleOutside);
+          menu.style.display = 'block';
         }, { class: 'ghost overflow-btn', 'aria-label': 'Section actions' });
         const menu = h('div', { class: 'section-overflow-menu' });
         menu.style.display = 'none';
