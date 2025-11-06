@@ -504,6 +504,47 @@ if (eventHandlers.presetLibraryShortcut) {
 
 let isPaused = false; // Track if we're currently paused
 
+// Audio Context Resume Race Condition Protection
+// ===============================================
+// Atomic flag to prevent multiple simultaneous resume attempts that can cause
+// audio to get stuck in suspended state during rapid tab switching or interaction.
+let _audioResumeInProgress = false;
+
+/**
+ * Safely resume audio context with atomic locking to prevent race conditions.
+ * Multiple event handlers (visibility, focus, pointerdown, watchdog) can trigger
+ * resume simultaneously. This function ensures only one resume happens at a time.
+ *
+ * @param {string} context - Description of what triggered the resume (for debugging)
+ * @returns {Promise<boolean>} True if resumed successfully, false otherwise
+ */
+async function safeResumeAudioContext(context = 'unknown') {
+  // Already resuming, skip to prevent race
+  if (_audioResumeInProgress) {
+    return false;
+  }
+
+  // No audio context or already running
+  if (!audio.ctx || audio.ctx.state !== 'suspended') {
+    return false;
+  }
+
+  // Acquire lock
+  _audioResumeInProgress = true;
+
+  try {
+    await audio.ctx.resume();
+    _audioResumeFailureCount = 0; // Reset on success
+    return true;
+  } catch (err) {
+    handleAudioResumeError(err, context);
+    return false;
+  } finally {
+    // Always release lock
+    _audioResumeInProgress = false;
+  }
+}
+
 // Named handler for visibility changes (tab hidden/shown)
 async function handleVisibilityChange() {
   if (document.visibilityState === 'hidden') {
@@ -517,9 +558,7 @@ async function handleVisibilityChange() {
     // Tab became visible - resume everything
     isPaused = false;
     lastTime = performance.now(); // Reset time tracking
-    try { await audio.ctx?.resume?.(); } catch (err) {
-      console.warn('Failed to resume audio context:', err);
-    } // Resume audio context
+    await safeResumeAudioContext('visibility change');
   }
 }
 
@@ -560,23 +599,13 @@ function handleAudioResumeError(err, context) {
 
 // Resume on window focus (user clicks back into the tab)
 eventHandlers.focus = async () => {
-  try {
-    await audio.ctx?.resume?.();
-    _audioResumeFailureCount = 0; // Reset on success
-  } catch (err) {
-    handleAudioResumeError(err, 'focus');
-  }
+  await safeResumeAudioContext('focus');
 };
 window.addEventListener('focus', eventHandlers.focus);
 
 // Resume on pointer down (user clicks/taps anywhere)
 eventHandlers.pointerdown = async () => {
-  try {
-    await audio.ctx?.resume?.();
-    _audioResumeFailureCount = 0; // Reset on success
-  } catch (err) {
-    handleAudioResumeError(err, 'pointer down');
-  }
+  await safeResumeAudioContext('pointer down');
 };
 window.addEventListener('pointerdown', eventHandlers.pointerdown);
 
@@ -641,9 +670,7 @@ function animate() {
   if (document.visibilityState === 'visible' && audio.ctx && audio.ctx.state === 'suspended') {
     if (now - resumeWatchLastAttempt > 400) {
       resumeWatchLastAttempt = now;
-      try { audio.ctx.resume(); } catch (err) {
-        console.warn('Failed to resume audio context in watchdog:', err);
-      }
+      safeResumeAudioContext('watchdog');
     }
   }
   
