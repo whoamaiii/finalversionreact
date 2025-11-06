@@ -39,6 +39,23 @@ import { withDispersionDefaults } from './dispersion-config.js';
 // This provides smooth, interactive camera controls
 CameraControls.install({ THREE });
 
+// Singleton RGBELoader to prevent memory leak from creating multiple loaders
+let _rgbeLoader = null;
+
+function getRGBELoader() {
+  if (!_rgbeLoader) {
+    _rgbeLoader = new RGBELoader();
+  }
+  return _rgbeLoader;
+}
+
+function disposeRGBELoader() {
+  if (_rgbeLoader) {
+    // Clear any internal caches if available
+    _rgbeLoader = null;
+  }
+}
+
 const TMP_VEC3_A = new THREE.Vector3();
 const TMP_VEC3_B = new THREE.Vector3();
 const TMP_VEC3_C = new THREE.Vector3();
@@ -189,8 +206,29 @@ function createGlowTexture(size = 256) {
   try {
     texture.colorSpace = THREE.SRGBColorSpace;
   } catch (_) {}
-  // Store canvas reference for proper cleanup later
+
+  // Store canvas reference and override dispose to prevent memory leak
   texture.userData._sourceCanvas = canvas;
+  const originalDispose = texture.dispose.bind(texture);
+  texture.dispose = function() {
+    // Clean up canvas context and element to release memory
+    if (this.userData._sourceCanvas) {
+      const canvas = this.userData._sourceCanvas;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        // Clear canvas to release GPU memory
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      // Set dimensions to 0 to release canvas memory
+      canvas.width = 0;
+      canvas.height = 0;
+      // Remove from userData
+      delete this.userData._sourceCanvas;
+    }
+    // Call original Three.js dispose
+    originalDispose();
+  };
+
   return texture;
 }
 
@@ -1190,7 +1228,7 @@ export function initScene() {
       return;
     }
     try {
-      const loader = new RGBELoader();
+      const loader = getRGBELoader();
       // Try local asset first, then fallback to theme.hdr remote URL
       let texture = null;
       const fileName = (theme.hdr || '').split('/').pop();
@@ -2314,6 +2352,13 @@ export function initScene() {
       }
     } catch(err) {
       console.error('Error disposing HDR texture:', err);
+    }
+
+    // Dispose of RGBELoader singleton to prevent memory leak
+    try {
+      disposeRGBELoader();
+    } catch(err) {
+      console.error('Error disposing RGBE loader:', err);
     }
 
     // Dispose of lights

@@ -600,8 +600,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
   };
 
-  // Add the new handler
-  window.addEventListener('keydown', _globalKeydownHandler);
+  // Add the new handler (tracked for cleanup)
+  trackDomListener(window, 'keydown', _globalKeydownHandler);
 
   // Helpers: showToast centralized in toast.js
 
@@ -613,7 +613,6 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
       else if (k.startsWith('on') && typeof v === 'function') {
         const eventType = k.slice(2).toLowerCase();
-        el.addEventListener(eventType, v);
         // Track event listener for cleanup to prevent memory leaks
         trackDomListener(el, eventType, v);
       }
@@ -1029,7 +1028,10 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   }
 
   function checkbox(value, onchange) {
-    const c = h('input', { type: 'checkbox' }); c.checked = !!value; c.addEventListener('change', ()=> onchange(!!c.checked)); return c;
+    const c = h('input', { type: 'checkbox' });
+    c.checked = !!value;
+    trackDomListener(c, 'change', () => onchange(!!c.checked));
+    return c;
   }
 
   function buildMapping() {
@@ -1215,7 +1217,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     const helpPill = h('div', { class: 'shader-toolbar-item help' }, 'Tip: Hover any label for what it does. Double-click to reset.');
     toolbar.appendChild(helpPill);
     const searchInput = h('input', { type: 'search', placeholder: 'Search controls…', value: shaderState.searchQuery || '' });
-    searchInput.addEventListener('input', () => {
+    trackDomListener(searchInput, 'input', () => {
       shaderState.searchQuery = searchInput.value || '';
       renderSections(true); // Force rebuild on search query change
     });
@@ -1253,12 +1255,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       const control = h('div', { class: 'control shader-macro-control' });
       const sliderEl = h('input', { type: 'range', min: '0', max: '1', step: '0.01', value: String(shaderState.macroValues[macro.id] ?? macro.defaultValue) });
       const valueBadge = h('span', { class: 'shader-value-display' }, `${Math.round((shaderState.macroValues[macro.id] ?? macro.defaultValue) * 100)}%`);
-      sliderEl.addEventListener('input', () => {
+      trackDomListener(sliderEl, 'input', () => {
         const val = clamp01(parseFloat(sliderEl.value));
         valueBadge.textContent = `${Math.round(val * 100)}%`;
         updateMacro(macro.id, val, { showHud: false });
       });
-      sliderEl.addEventListener('change', () => {
+      trackDomListener(sliderEl, 'change', () => {
         const val = clamp01(parseFloat(sliderEl.value));
         valueBadge.textContent = `${Math.round(val * 100)}%`;
         updateMacro(macro.id, val);
@@ -1335,7 +1337,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       const chevron = collapsed ? '▸' : '▾';
       header.textContent = `${chevron} Snapshots (Shift=save, Alt=clear)`;
       header.style.cursor = 'pointer';
-      header.addEventListener('click', () => {
+      trackDomListener(header, 'click', () => {
         const next = !collapsed; collapsed = next;
         try { localStorage.setItem(SNAPSHOTS_COLLAPSED_KEY, JSON.stringify(!!next)); } catch(_) {}
         renderSnapshots();
@@ -1414,23 +1416,23 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
           valueDisplay.textContent = formatValue(schema, defVal);
           setParamValue(schema.key, defVal);
         }, { class: 'ghost reset-btn', title: 'Reset to default' });
-        sliderEl.addEventListener('input', () => {
+        trackDomListener(sliderEl, 'input', () => {
           shaderState.activeSection = schema.section;
           const next = parseFloat(sliderEl.value);
           valueDisplay.textContent = formatValue(schema, next);
           numberEl.value = String(next);
           setParamValue(schema.key, next, { showHud: false, refresh: false });
         });
-        sliderEl.addEventListener('change', () => {
+        trackDomListener(sliderEl, 'change', () => {
           shaderState.activeSection = schema.section;
           const next = parseFloat(sliderEl.value);
           numberEl.value = String(next);
           setParamValue(schema.key, next, { showHud: true, refresh: false });
         });
-        sliderEl.addEventListener('focus', () => {
+        trackDomListener(sliderEl, 'focus', () => {
           shaderState.activeSection = schema.section;
         });
-        sliderEl.addEventListener('keydown', (event) => {
+        trackDomListener(sliderEl, 'keydown', (event) => {
           if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
           event.preventDefault();
           shaderState.activeSection = schema.section;
@@ -1446,7 +1448,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
           numberEl.value = String(next);
           setParamValue(schema.key, next, { showHud: false, refresh: false });
         });
-        numberEl.addEventListener('input', () => {
+        trackDomListener(numberEl, 'input', () => {
           shaderState.activeSection = schema.section;
           const rawStr = String(numberEl.value || '');
           const normalized = rawStr.replace(',', '.');
@@ -1457,7 +1459,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
           valueDisplay.textContent = formatValue(schema, next);
           setParamValue(schema.key, next, { showHud: false, refresh: false });
         });
-        numberEl.addEventListener('change', () => {
+        trackDomListener(numberEl, 'change', () => {
           shaderState.activeSection = schema.section;
           const rawStr = String(numberEl.value || '');
           const normalized = rawStr.replace(',', '.');
@@ -1493,7 +1495,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         row.appendChild(controlWrap);
         registerInstance(schema.key, { select: selectEl, schema });
       }
-      row.addEventListener('pointerdown', (ev) => {
+      trackDomListener(row, 'pointerdown', (ev) => {
         if (ev.target && (ev.target.closest && ev.target.closest('.control'))) return;
         shaderState.activeSection = schema.section; persistActiveSection();
       });
@@ -1654,7 +1656,7 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         actions.appendChild(overflowBtn);
         actions.appendChild(menu);
         header.appendChild(actions);
-        header.addEventListener('click', (ev) => {
+        trackDomListener(header, 'click', (ev) => {
           if (ev.target && (ev.target.closest && ev.target.closest('.actions'))) return;
           shaderState.activeSection = section.id; persistActiveSection();
           renderSections(true); // Force rebuild on section change
@@ -2396,9 +2398,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   // Store reference for cleanup
   _shaderHotkeysHandler = handleShaderHotkeys;
 
-  // Remove before adding to prevent duplicates if initSettingsUI is called multiple times
-  window.removeEventListener('keydown', _shaderHotkeysHandler, true);
-  window.addEventListener('keydown', _shaderHotkeysHandler, true);
+  // Track handler for cleanup (prevents duplicates on re-initialization)
+  trackDomListener(window, 'keydown', _shaderHotkeysHandler, true);
 
   // external labels update (FPS etc.)
   function updateFpsLabel(v) {
