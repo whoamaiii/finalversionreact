@@ -11,6 +11,7 @@
 
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
 import { showToast } from './toast.js';
+import { deepClone } from './utils.js';
 
 const STORAGE_KEYS = {
   primary: 'cosmicPresetLibrary.v1',
@@ -190,16 +191,6 @@ const DEFAULT_PRESETS = [
     }),
   },
 ];
-
-function deepClone(value) {
-  if (value === null || value === undefined) return value;
-  try {
-    if (typeof structuredClone === 'function') return structuredClone(value);
-  } catch (_) {
-    // structuredClone not available or failed, fall back to JSON
-  }
-  return JSON.parse(JSON.stringify(value));
-}
 
 function createEmptyState() {
   return {

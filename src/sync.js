@@ -1,6 +1,8 @@
 // SyncCoordinator orchestrates control↔projector state sharing with BroadcastChannel,
 // postMessage, and localStorage heartbeat fallbacks.
 
+import { deepClone } from './utils.js';
+
 const CHANNEL_NAME = 'reactive-sync-v1';
 const STORAGE_KEY = 'reactive_sync_bridge_v1';
 const FEATURE_INTERVAL_MS = 33;
@@ -10,15 +12,6 @@ const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 2 + 800;
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-function deepClone(value) {
-  try {
-    if (typeof structuredClone === 'function') return structuredClone(value);
-  } catch (_) {
-    // structuredClone not available or failed, fall back to JSON
-  }
-  return JSON.parse(JSON.stringify(value));
 }
 
 function deepMerge(target, source, seen = new WeakSet()) {
