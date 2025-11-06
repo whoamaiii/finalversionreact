@@ -1,15 +1,24 @@
 /**
  * Performance Pads Controller
  *
- * Lightweight, self-contained controller to trigger short visual bursts from the keyboard.
- * Phase 1 implements Pad "1 — Warp Zoom + RGB split" only, with:
+ * Lightweight, self-contained controller to trigger visual effects from keyboard.
+ * Implements 5 performance pads with distinct visual effects:
+ *
+ * Pad 1 (key "1"): Warp Zoom + RGB split — momentary with envelope, double-tap latch
+ * Pad 2 (key "2"): Shutter Shot — brief zoom pulse, quantized to 1/4 beats
+ * Pad 3 (key "3"): Smear — gentle forward drag, momentary or latched
+ * Pad 4 (key "4"): Stutter Shot — dual micro-pulses, quantized to 1/8 beats
+ * Pad 5 (key "5"): Swirl — twist effect, momentary or latched
+ *
+ * Controls:
  * - Hold: momentary envelope (attack/decay)
- * - Double-tap: latch toggle
+ * - Double-tap (pad 1): latch toggle
+ * - Arrow Up/Down or Wheel (while holding): adjust intensity
  * - Panic: key "0" to clear all pads
  * - Global toggle: key "P" to enable/disable performance mode
  *
  * The controller exposes a uniform deltas provider so the renderer can blend these
- * bursts non-destructively with the audio-reactive baseline.
+ * effects non-destructively with the audio-reactive baseline.
  */
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));

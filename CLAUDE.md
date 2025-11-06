@@ -125,7 +125,7 @@ main.js animation loop
 | `src/lazy.js` | Lazy module loading with CDN fallbacks |
 | `src/feature.js` | Browser capability detection |
 | `src/toast.js` | Notification system |
-| `src/performance-pads.js` | Live performance pad controls (Phase 1: Pad 1 only) |
+| `src/performance-pads.js` | Live performance pad controls (5 pads: Warp, Shutter, Smear, Stutter, Swirl) |
 | `src/midi-launchpad.js` | Launchpad MIDI controller integration (optional) |
 | `tools/osc-bridge.js` | WebSocket → OSC bridge for TouchDesigner |
 
