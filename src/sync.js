@@ -1,6 +1,8 @@
 // SyncCoordinator orchestrates control↔projector state sharing with BroadcastChannel,
 // postMessage, and localStorage heartbeat fallbacks.
 
+import { ReadinessGate } from './readiness-gate.js';
+
 const CHANNEL_NAME = 'reactive-sync-v1';
 const STORAGE_KEY = 'reactive_sync_bridge_v1';
 const FEATURE_INTERVAL_MS = 33;
@@ -214,6 +216,15 @@ export class SyncCoordinator {
     this._statusListeners = new Set();
     if (typeof onStatusChange === 'function') this._statusListeners.add(onStatusChange);
 
+    // Readiness gate for coordinating initialization
+    this._readiness = new ReadinessGate('SyncCoordinator');
+    this._readiness.register('sceneApi');
+
+    // Mark sceneApi as ready if already provided
+    if (this.sceneApi) {
+      this._readiness.setReady('sceneApi');
+    }
+
     this.channel = null;
     this.projectorWindow = null;
     this.controlWindow = null;
@@ -321,7 +332,11 @@ export class SyncCoordinator {
       this._setConnected(true);
       if (this.role === 'control') {
         this._sendMessage('hello', { role: this.role }, { target: 'receiver', useStorage: true });
-        this.pushNow();
+        try {
+          this.pushNow();
+        } catch (err) {
+          console.error('[Sync] Error pushing on hello:', err);
+        }
       }
       return;
     }
@@ -333,7 +348,13 @@ export class SyncCoordinator {
     }
 
     if (type === 'requestSnapshot') {
-      if (this.role === 'control') this.pushNow();
+      if (this.role === 'control') {
+        try {
+          this.pushNow();
+        } catch (err) {
+          console.error('[Sync] Error pushing on requestSnapshot:', err);
+        }
+      }
       return;
     }
 
@@ -485,18 +506,57 @@ export class SyncCoordinator {
     if (this.autoSync === next) return;
     this.autoSync = next;
     this._emitStatus();
-    if (next) this.pushNow();
+    if (next) {
+      try {
+        this.pushNow();
+      } catch (err) {
+        console.error('[Sync] Error pushing on setAutoSync:', err);
+      }
+    }
   }
 
   pushNow() {
-    if (this.role !== 'control' || !this.sceneApi) return;
-    const snapshot = collectSceneSnapshot(this.sceneApi);
-    if (!snapshot) return;
-    const serialized = JSON.stringify(snapshot);
-    this._lastParamSerialized = serialized;
-    this._lastSnapshot = snapshot;
-    this._lastParamPushAt = typeof performance !== 'undefined' ? performance.now() : 0;
-    this._sendMessage('paramsSnapshot', { params: snapshot }, { target: 'receiver', useStorage: true });
+    if (this.role !== 'control') return;
+
+    // Check readiness before proceeding
+    if (!this._readiness.isReady('sceneApi')) {
+      console.warn('[Sync] Cannot push: sceneApi not ready');
+      return;
+    }
+
+    if (!this.sceneApi) {
+      console.warn('[Sync] Cannot push: sceneApi is null');
+      return;
+    }
+
+    try {
+      const snapshot = collectSceneSnapshot(this.sceneApi);
+      if (!snapshot) {
+        console.warn('[Sync] Cannot push: snapshot collection returned null');
+        return;
+      }
+
+      const serialized = JSON.stringify(snapshot);
+      this._lastParamSerialized = serialized;
+      this._lastSnapshot = snapshot;
+      this._lastParamPushAt = typeof performance !== 'undefined' ? performance.now() : 0;
+      this._sendMessage('paramsSnapshot', { params: snapshot }, { target: 'receiver', useStorage: true });
+    } catch (err) {
+      console.error('[Sync] Error in pushNow():', err);
+      // Gracefully degrade - don't crash the app
+    }
+  }
+
+  /**
+   * Set sceneApi after construction
+   */
+  setSceneApi(sceneApi) {
+    this.sceneApi = sceneApi;
+    if (sceneApi) {
+      this._readiness.setReady('sceneApi');
+    } else {
+      this._readiness.setNotReady('sceneApi');
+    }
   }
 
   handleLocalFeatures(features, now) {

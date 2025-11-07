@@ -28,6 +28,8 @@
 import { AudioContext as StdAudioContext } from 'standardized-audio-context';
 import { loadAubio, loadMeyda, clearModuleCache } from './lazy.js';
 import { showToast } from './toast.js';
+import { ResourceLifecycle, STATES } from './resource-lifecycle.js';
+import { AsyncOperationRegistry } from './async-registry.js';
 
 /**
  * Cache for the beat detector function to avoid re-loading from CDN
@@ -125,6 +127,10 @@ export class AudioEngine {
    * The actual audio context and nodes are created lazily when audio starts.
    */
   constructor() {
+    // Lifecycle management for AudioContext (prevents race conditions)
+    this._contextLifecycle = new ResourceLifecycle('AudioContext');
+    this._asyncRegistry = new AsyncOperationRegistry('AudioEngine');
+
     // Core audio nodes (created when ensureContext() is called)
     this.ctx = null;                    // AudioContext - the audio processing environment
     this.source = null;                 // MediaStreamAudioSourceNode or AudioBufferSourceNode - the audio input
@@ -354,22 +360,31 @@ export class AudioEngine {
    * @returns {Promise<void>} Resolves when context is ready
    */
   async ensureContext() {
+    // Wait if context is closing
+    if (this._contextLifecycle.state === 'closing') {
+      console.log('[AudioEngine] Waiting for context to finish closing...');
+      await this._contextLifecycle.waitFor('closed', 3000);
+    }
+
     // Create AudioContext if it doesn't exist
     if (!this.ctx) {
-      let Ctor = StdAudioContext;
-      if (typeof Ctor !== 'function') {
-        // Fallback to native contexts if standardized-audio-context isn't available
-        Ctor = window.AudioContext || window.webkitAudioContext;
-      }
-      this.ctx = new Ctor();
-      this.sampleRate = this.ctx.sampleRate;
-      
-      // Expose for Safari/iOS unlock helper to resume
-      // Safari requires a user gesture to start audio, so we store contexts globally
-      try {
-        window.__reactiveCtxs = window.__reactiveCtxs || [];
-        if (!window.__reactiveCtxs.includes(this.ctx)) window.__reactiveCtxs.push(this.ctx);
-      } catch(_) {}
+      // Use lifecycle to track initialization
+      await this._contextLifecycle.initialize(async () => {
+        let Ctor = StdAudioContext;
+        if (typeof Ctor !== 'function') {
+          // Fallback to native contexts if standardized-audio-context isn't available
+          Ctor = window.AudioContext || window.webkitAudioContext;
+        }
+        this.ctx = new Ctor();
+        this.sampleRate = this.ctx.sampleRate;
+
+        // Expose for Safari/iOS unlock helper to resume
+        // Safari requires a user gesture to start audio, so we store contexts globally
+        try {
+          window.__reactiveCtxs = window.__reactiveCtxs || [];
+          if (!window.__reactiveCtxs.includes(this.ctx)) window.__reactiveCtxs.push(this.ctx);
+        } catch(_) {}
+      });
     }
     
     // Try to resume context on user gestures; harmless if already running
@@ -650,42 +665,59 @@ export class AudioEngine {
     this._analysisPromises.essentia = essentiaAnalysis;
 
     // Fire-and-forget BPM estimation for tempo assist
-    // This runs in the background and updates bpmEstimate when done
-    const bpmPromise = this._estimateBpmFromBuffer(audioBuf, bpmAnalysis, monoForAnalysis).catch((err) => {
-      console.warn('BPM estimation failed:', err);
-      return null;
-    });
+    // Use AsyncOperationRegistry to handle cancellation and timeouts elegantly
+    const bpmToken = this._asyncRegistry.register('bpm-analysis', { timeout: 10000 });
+    const essentiaToken = this._asyncRegistry.register('essentia-analysis', { timeout: 10000 });
 
-    // Run Essentia analysis for beat grid detection
-    // This provides precise beat tracking and tempo information
-    const essentiaPromise = this._runEssentiaAnalysis(audioBuf, essentiaAnalysis, monoForAnalysis).catch((err) => {
-      console.warn('Essentia analysis failed', err);
-      return null;
-    });
+    // Wrap BPM estimation with cancellation support
+    const bpmPromise = this._estimateBpmFromBuffer(audioBuf, bpmAnalysis, monoForAnalysis)
+      .catch((err) => {
+        console.warn('[AudioEngine] BPM estimation failed:', err);
+        return null;
+      });
 
-    // Process results in order of completion, giving priority to Essentia
-    // which is generally more accurate but slower
-    // Wrap with timeout to prevent indefinite hangs (10 second max)
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('BPM analysis timeout after 10 seconds')), 10000);
-    });
+    // Wrap Essentia analysis with cancellation support
+    const essentiaPromise = this._runEssentiaAnalysis(audioBuf, essentiaAnalysis, monoForAnalysis)
+      .catch((err) => {
+        console.warn('[AudioEngine] Essentia analysis failed', err);
+        return null;
+      });
 
-    Promise.race([
-      bpmPromise.then(result => ({ type: 'bpm', result })),
-      essentiaPromise.then(result => ({ type: 'essentia', result })),
-      timeoutPromise
-    ])
-    .then(firstResult => {
-      // Store the first result but wait for both to complete for best accuracy
-      return Promise.all([bpmPromise, essentiaPromise]);
-    })
-    .then(() => {
-      // Both analyses complete - Essentia takes priority if successful
-    })
-    .catch(err => {
-      // Graceful degradation: log error but don't crash audio analysis
-      console.warn('[Audio] BPM analysis failed or timed out:', err);
-      // Analysis will continue with manual tap tempo or previous BPM estimate
+    // Use tokens to handle timeouts without losing late results
+    Promise.allSettled([
+      bpmToken.wrap(bpmPromise, 10000)
+        .catch(err => {
+          if (err.isTimeout) {
+            console.warn('[AudioEngine] BPM analysis timed out, waiting for late result...');
+            // Continue waiting for the actual promise in background
+            bpmPromise.then(result => {
+              if (result && bpmToken.id === this._asyncRegistry._activeCategory.get('bpm-analysis')) {
+                console.log('[AudioEngine] Late BPM result accepted:', result);
+              }
+            });
+          } else if (err.isCancelled) {
+            console.log('[AudioEngine] BPM analysis cancelled:', err.reason);
+          }
+          return null;
+        }),
+
+      essentiaToken.wrap(essentiaPromise, 10000)
+        .catch(err => {
+          if (err.isTimeout) {
+            console.warn('[AudioEngine] Essentia analysis timed out, waiting for late result...');
+            // Continue waiting for the actual promise in background
+            essentiaPromise.then(result => {
+              if (result && essentiaToken.id === this._asyncRegistry._activeCategory.get('essentia-analysis')) {
+                console.log('[AudioEngine] Late Essentia result accepted:', result);
+              }
+            });
+          } else if (err.isCancelled) {
+            console.log('[AudioEngine] Essentia analysis cancelled:', err.reason);
+          }
+          return null;
+        })
+    ]).then(() => {
+      console.log('[AudioEngine] BPM analysis complete (or timed out gracefully)');
     });
   }
 
@@ -2946,8 +2978,9 @@ export class AudioEngine {
 
   /**
    * Dispose method to clean up all resources and prevent memory leaks
+   * Now async to properly handle AudioContext closure
    */
-  dispose() {
+  async dispose() {
     // Stop any active streams
     this.stop();
     this._releaseWorkletFrameBuffer();
@@ -3065,43 +3098,57 @@ export class AudioEngine {
     this.analyserR = null;
     this.splitterNode = null;
 
-    // Close AudioContext
+    // Close AudioContext using lifecycle to prevent race conditions
     if (this.ctx) {
       const ctx = this.ctx;
-      try {
-        // Remove from global context array first
-        if (typeof window !== 'undefined' && window.__reactiveCtxs && Array.isArray(window.__reactiveCtxs)) {
-          const idx = window.__reactiveCtxs.indexOf(ctx);
-          if (idx !== -1) {
-            window.__reactiveCtxs.splice(idx, 1);
-          }
-        }
 
-        // First suspend to stop processing
-        ctx.suspend().then(() => {
-          // Then close the context
-          if (ctx.state !== 'closed') {
-            ctx.close().catch(err => {
-              console.warn('Error closing audio context:', err);
-            });
+      try {
+        // Use lifecycle to coordinate closure
+        await this._contextLifecycle.close(async () => {
+          // Remove from global context array first
+          if (typeof window !== 'undefined' && window.__reactiveCtxs && Array.isArray(window.__reactiveCtxs)) {
+            const idx = window.__reactiveCtxs.indexOf(ctx);
+            if (idx !== -1) {
+              window.__reactiveCtxs.splice(idx, 1);
+            }
           }
-        }).catch(err => {
-          console.warn('Error suspending audio context:', err);
+
+          // Suspend then close - properly awaited
+          if (ctx.state !== 'closed') {
+            try {
+              await ctx.suspend();
+              console.log('[AudioEngine] AudioContext suspended');
+            } catch (err) {
+              console.warn('[AudioEngine] Error suspending context:', err);
+            }
+
+            try {
+              await ctx.close();
+              console.log('[AudioEngine] AudioContext closed successfully');
+            } catch (err) {
+              console.warn('[AudioEngine] Error closing context:', err);
+            }
+          }
         });
+
+        // NOW it's safe to clear state (after context is fully closed)
+        this.ctx = null;
+        this.sampleRate = 48000;
+        this.workletEnabled = false;
+        this._workletInitAttempted = false;
+        this._workletInitPromise = null;
+        this._workletFrame = null;
+        this._workletFrameId = -1;
+        this._lastFluxFrameId = -1;
+        this._workletFrameTimestamp = 0;
+        this._workletFeatures = { rms: 0, flux: 0, fluxMean: 0, fluxStd: 0 };
+
       } catch (err) {
-        console.warn('Error closing audio context:', err);
+        console.error('[AudioEngine] Fatal error during context closure:', err);
+        // Force cleanup even on error
+        this.ctx = null;
+        this._contextLifecycle.reset();
       }
-      // Clear context-related state after scheduling close
-      this.ctx = null;
-      this.sampleRate = 48000;
-      this.workletEnabled = false;
-      this._workletInitAttempted = false;
-      this._workletInitPromise = null;
-      this._workletFrame = null;
-      this._workletFrameId = -1;
-      this._lastFluxFrameId = -1;
-      this._workletFrameTimestamp = 0;
-      this._workletFeatures = { rms: 0, flux: 0, fluxMean: 0, fluxStd: 0 };
     }
 
     // Clear large data arrays
