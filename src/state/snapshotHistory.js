@@ -8,8 +8,8 @@
  * - Tag-based filtering (preset-change, pre-crash, etc.)
  */
 
-import { StateSnapshot } from './state-snapshot.js';
-import { SessionPersistence } from './storage/sessionPersistence.js';
+import { StateSnapshot } from '../state-snapshot.js';
+import { SessionPersistence } from '../storage/sessionPersistence.js';
 
 const STORAGE_KEY = 'cosmicSessionHistory.v1';
 const MAX_SNAPSHOTS = 20; // Circular buffer size
@@ -56,8 +56,21 @@ export class SnapshotHistory {
     // Enforce circular buffer limit
     if (this._snapshots.length > MAX_SNAPSHOTS) {
       // Remove oldest non-bookmark snapshot
+      // Note: item.snapshot may be null for loaded snapshots that haven't been decompressed yet
       const nonBookmarkIndex = this._snapshots.findIndex(
-        item => !item.snapshot.hasTag('bookmark')
+        item => {
+          // If snapshot is null, decompress it to check tags
+          if (!item.snapshot) {
+            try {
+              item.snapshot = StateSnapshot.decompress(item.compressed);
+            } catch (err) {
+              console.warn('[SnapshotHistory] Failed to decompress snapshot for pruning:', err);
+              // If decompression fails, consider it non-bookmark (safe to remove)
+              return true;
+            }
+          }
+          return !item.snapshot.hasTag('bookmark');
+        }
       );
       if (nonBookmarkIndex >= 0) {
         this._snapshots.splice(nonBookmarkIndex, 1);

@@ -35,6 +35,8 @@ import { AsyncOperationRegistry } from './async-registry.js';
  * Cache for the beat detector function to avoid re-loading from CDN
  */
 let _guessBpmFn = null;
+let _guessBpmFnFailed = false; // Track if all attempts failed (allows retry on next call)
+let _guessBpmFnLastError = null; // Store last error for diagnostics
 
 /**
  * Lazy-load web-audio-beat-detector at runtime with graceful fallbacks.
@@ -42,18 +44,33 @@ let _guessBpmFn = null;
  * Instead of bundling this library (which can fail to load from CDNs), we load it
  * dynamically when needed. This keeps the app working even if the CDN is down.
  * 
- * We try multiple CDN sources to increase reliability.
+ * We try multiple CDN sources to increase reliability. Unlike before, we don't
+ * cache failures permanently - each call will retry if previous attempts failed.
  * 
+ * @param {boolean} forceRetry - Force retry even if previous attempt failed
  * @returns {Promise<Function>} A promise that resolves to the BPM detection function
  */
-async function getBeatDetectorGuess() {
-  // If we've already loaded it, return the cached function
-  if (_guessBpmFn) return _guessBpmFn;
+async function getBeatDetectorGuess(forceRetry = false) {
+  // If we've already loaded it successfully, return the cached function
+  if (_guessBpmFn && !_guessBpmFnFailed) return _guessBpmFn;
+  
+  // If previous attempt failed but we're not forcing retry, return the no-op
+  // This allows the system to continue working while still allowing retries
+  if (_guessBpmFnFailed && !forceRetry) {
+    return _guessBpmFn || (async () => ({ bpm: null }));
+  }
+  
+  // Reset failure state for retry
+  _guessBpmFnFailed = false;
+  _guessBpmFnLastError = null;
+  
   const candidates = [
     'https://esm.sh/web-audio-beat-detector@6.3.2',
     'https://cdn.jsdelivr.net/npm/web-audio-beat-detector@6.3.2/+esm',
     'https://cdn.skypack.dev/web-audio-beat-detector@6.3.2',
   ];
+  
+  let lastError = null;
   for (const url of candidates) {
     try {
       const mod = await import(/* @vite-ignore */ url);
@@ -67,16 +84,46 @@ async function getBeatDetectorGuess() {
       else if (mod?.default && typeof mod.default.guess === 'function') fn = mod.default.guess;
       if (typeof fn === 'function') {
         _guessBpmFn = fn;
+        _guessBpmFnFailed = false;
+        _guessBpmFnLastError = null;
+        console.log('[AudioEngine] Beat detector loaded successfully from:', url);
         return _guessBpmFn;
       }
-    } catch (_) {
-      // try next candidate
+    } catch (err) {
+      lastError = err;
+      // Log but continue to next candidate
+      console.debug('[AudioEngine] Failed to load beat detector from', url, err.message);
     }
   }
-  // Final fallback: no-op estimator that resolves to null bpm
-  // This ensures the app continues working even if all CDNs fail
+  
+  // All candidates failed - store error and return no-op
+  _guessBpmFnFailed = true;
+  _guessBpmFnLastError = lastError;
   _guessBpmFn = async () => ({ bpm: null });
+  
+  // Log warning but don't throw - system continues with native fallback
+  console.warn('[AudioEngine] Beat detector unavailable (all CDNs failed). BPM detection will use native fallback only.');
+  if (lastError) {
+    console.warn('[AudioEngine] Last error:', lastError.message);
+  }
+  
   return _guessBpmFn;
+}
+
+/**
+ * Get the last error from beat detector loading attempts (for diagnostics)
+ * @returns {Error|null} Last error or null if none
+ */
+function getBeatDetectorLastError() {
+  return _guessBpmFnLastError;
+}
+
+/**
+ * Check if beat detector is available
+ * @returns {boolean} True if detector is loaded and working
+ */
+function isBeatDetectorAvailable() {
+  return _guessBpmFn && !_guessBpmFnFailed && typeof _guessBpmFn === 'function';
 }
 
 /**
@@ -267,6 +314,7 @@ export class AudioEngine {
 
     this._aubioPromise = null;
     this._aubioModule = null;
+    this._aubioLoadFailedAt = null; // Timestamp when aubio loading failed (to prevent spam retries)
     this._aubio = { onset: null, tempo: null, pitch: null };
     this._aubioQueue = [];
     this._aubioBufferPool = new Map();
@@ -1024,19 +1072,108 @@ export class AudioEngine {
   getBpm() { return this.bpmEstimate || 0; }
   getBpmConfidence() { return this.bpmEstimateConfidence || 0; }
   getBpmSource() { return this.bpmEstimateSource || ''; }
+  
+  /**
+   * Get diagnostics about BPM detection system status
+   * @returns {Object} Diagnostics object with status information
+   */
+  getBpmDiagnostics() {
+    return {
+      currentBpm: this.bpmEstimate || 0,
+      confidence: this.bpmEstimateConfidence || 0,
+      source: this.bpmEstimateSource || 'none',
+      beatDetectorAvailable: isBeatDetectorAvailable(),
+      beatDetectorLastError: getBeatDetectorLastError()?.message || null,
+      hasFileBuffer: !!(this._lastMonoBuffer && this._lastMonoBuffer.length),
+      fileBufferDuration: this._lastMonoBuffer && this._lastMonoSampleRate 
+        ? (this._lastMonoBuffer.length / this._lastMonoSampleRate).toFixed(1) + 's'
+        : '0s',
+      liveBufferFilled: this._liveBufferFilled > 0 
+        ? (this._liveBufferFilled / (this.sampleRate || 44100)).toFixed(1) + 's'
+        : '0s',
+      essentiaReady: this._essentiaReady || false,
+      aubioReady: !!(this._aubioModule && this._aubio.tempo),
+    };
+  }
+  
+  /**
+   * Recalculate BPM from current audio source (file or live).
+   * This creates a proper analysis token so results get saved.
+   * Also forces retry of beat detector if it previously failed.
+   */
   async recalcBpm() {
-    if (this._lastMonoBuffer && this._lastMonoBuffer.length) {
-      await this._estimateBpmFromBuffer(null, undefined, this._lastMonoBuffer, this._lastMonoSampleRate);
-      // Also compute/refresh beat grid via Essentia to backfill BPM if guess failed
-      try { this._runEssentiaAnalysis(null, undefined, this._lastMonoBuffer); } catch(_) {}
-      return;
+    // Create a proper analysis token for this recalculation
+    if (!this._analysisIdCounter) {
+      this._analysisIdCounter = 0;
     }
-    const live = this._buildLiveAudioBuffer(12);
-    if (live) {
-      await this._estimateBpmFromBuffer(live);
-      try { this._runEssentiaAnalysis(live); } catch(_) {}
-    } else {
-      try { showToast('Need a few seconds of live audio before recalculating BPM.'); } catch(_) {}
+    const analysisId = ++this._analysisIdCounter;
+    const bpmAnalysis = { id: analysisId, timestamp: performance.now(), manual: true };
+    const essentiaAnalysis = { id: analysisId, timestamp: performance.now(), manual: true };
+    
+    // Set as current analysis promises so results get saved
+    if (!this._analysisPromises) {
+      this._analysisPromises = { bpm: null, essentia: null };
+    }
+    this._analysisPromises.bpm = bpmAnalysis;
+    this._analysisPromises.essentia = essentiaAnalysis;
+    
+    // Force retry of beat detector if it previously failed
+    const forceRetry = true;
+    
+    try {
+      if (this._lastMonoBuffer && this._lastMonoBuffer.length) {
+        // Recalculate from file buffer
+        await this._estimateBpmFromBuffer(null, bpmAnalysis, this._lastMonoBuffer, this._lastMonoSampleRate, forceRetry);
+        // Also compute/refresh beat grid via Essentia to backfill BPM if guess failed
+        try { 
+          await this._runEssentiaAnalysis(null, essentiaAnalysis, this._lastMonoBuffer); 
+        } catch(err) {
+          console.warn('[AudioEngine] Essentia analysis failed during recalc:', err);
+        }
+        
+        // Show feedback
+        if (this.bpmEstimate && this.bpmEstimate > 0) {
+          try { 
+            showToast(`BPM recalculated: ${Math.round(this.bpmEstimate)} BPM (${this.bpmEstimateSource})`); 
+          } catch(_) {}
+        } else {
+          try { 
+            showToast('BPM recalculation completed but no tempo detected. Try tapping tempo manually.'); 
+          } catch(_) {}
+        }
+        return;
+      }
+      
+      // Recalculate from live buffer
+      const live = this._buildLiveAudioBuffer(12);
+      if (live) {
+        await this._estimateBpmFromBuffer(live, bpmAnalysis, null, null, forceRetry);
+        try { 
+          await this._runEssentiaAnalysis(live, essentiaAnalysis); 
+        } catch(err) {
+          console.warn('[AudioEngine] Essentia analysis failed during recalc:', err);
+        }
+        
+        // Show feedback
+        if (this.bpmEstimate && this.bpmEstimate > 0) {
+          try { 
+            showToast(`Live BPM recalculated: ${Math.round(this.bpmEstimate)} BPM (${this.bpmEstimateSource})`); 
+          } catch(_) {}
+        } else {
+          try { 
+            showToast('Live BPM recalculation completed but no tempo detected.'); 
+          } catch(_) {}
+        }
+      } else {
+        try { 
+          showToast('Need a few seconds of live audio before recalculating BPM.'); 
+        } catch(_) {}
+      }
+    } catch (err) {
+      console.error('[AudioEngine] BPM recalculation failed:', err);
+      try { 
+        showToast('BPM recalculation failed. Check console for details.'); 
+      } catch(_) {}
     }
   }
 
@@ -1295,11 +1432,12 @@ export class AudioEngine {
     return flux;
   }
 
-  async _estimateBpmFromBuffer(buffer, thisAnalysis = {}, monoData = null, monoSampleRate = null) {
+  async _estimateBpmFromBuffer(buffer, thisAnalysis = {}, monoData = null, monoSampleRate = null, forceRetry = false) {
     if (!buffer && (!monoData || !monoData.length)) return null;
 
     // Use provided analysis reference for race condition checking
     // (passed from loadFile to ensure atomicity)
+    // Manual recalculations (thisAnalysis.manual === true) always update state
 
     const sampleRate = buffer?.sampleRate || monoSampleRate || this._lastMonoSampleRate || this.sampleRate || 44100;
     const mono = (monoData && monoData.length) ? monoData : this._extractMonoBuffer(buffer);
@@ -1317,8 +1455,10 @@ export class AudioEngine {
 
     let guessFn = null;
     try {
-      guessFn = await getBeatDetectorGuess();
-    } catch (_) {
+      // Pass forceRetry to allow retry of beat detector if it previously failed
+      guessFn = await getBeatDetectorGuess(forceRetry);
+    } catch (err) {
+      console.warn('[AudioEngine] Failed to load beat detector:', err);
       guessFn = null;
     }
 
@@ -1327,9 +1467,12 @@ export class AudioEngine {
         try {
           const result = await guessFn(segment.audioBuffer);
           const bpmVal = this._extractBpmValue(result);
-          recordCandidate(bpmVal, 'detector', segment.weight ?? 1);
-        } catch (_) {
+          if (bpmVal && bpmVal > 0) {
+            recordCandidate(bpmVal, 'detector', segment.weight ?? 1);
+          }
+        } catch (err) {
           // per-segment failures are expected for very short/quiet slices
+          console.debug('[AudioEngine] Beat detector failed on segment:', err.message);
         }
       }
     }
@@ -1337,28 +1480,49 @@ export class AudioEngine {
     for (const segment of segments) {
       try {
         const nativeBpm = this._estimateBpmNativeFromMono(segment.mono, sampleRate);
-        recordCandidate(nativeBpm, 'native', (segment.weight ?? 1) * 0.75);
-      } catch (_) {
+        if (nativeBpm && nativeBpm > 0) {
+          recordCandidate(nativeBpm, 'native', (segment.weight ?? 1) * 0.75);
+        }
+      } catch (err) {
         // ignore native estimator failures on individual slices
+        console.debug('[AudioEngine] Native BPM estimator failed on segment:', err.message);
       }
     }
 
     const selection = this._selectBestBpmCandidate(candidates);
     if (selection && selection.bpm && selection.bpm > 0) {
-      // Only update if this analysis is still current (prevent race condition)
-      // Compare IDs instead of object identity for reliable tracking
-      if (this._analysisPromises &&
-          thisAnalysis &&
-          thisAnalysis.id &&
-          this._analysisPromises.bpm &&
-          this._analysisPromises.bpm.id === thisAnalysis.id) {
+      // Update if:
+      // 1. This is a manual recalculation (always update)
+      // 2. OR this analysis is still current (prevent race condition)
+      const shouldUpdate = thisAnalysis.manual === true || 
+        (this._analysisPromises &&
+         thisAnalysis &&
+         thisAnalysis.id &&
+         this._analysisPromises.bpm &&
+         this._analysisPromises.bpm.id === thisAnalysis.id);
+      
+      if (shouldUpdate) {
         this.bpmEstimate = selection.bpm;
         this.tempoIntervalMs = safeBpmToInterval(selection.bpm);
         this._lastTempoMs = performance.now();
         this.bpmEstimateConfidence = selection.confidence;
         this.bpmEstimateSource = selection.source;
+        console.log(`[AudioEngine] BPM updated: ${Math.round(selection.bpm)} BPM (${selection.source}, confidence: ${(selection.confidence * 100).toFixed(1)}%)`);
+      } else {
+        console.debug('[AudioEngine] BPM result discarded (stale analysis)', {
+          resultBpm: selection.bpm,
+          currentAnalysisId: this._analysisPromises?.bpm?.id,
+          resultAnalysisId: thisAnalysis.id
+        });
       }
       return selection.bpm;
+    }
+
+    // Log when no BPM could be detected
+    if (candidates.length === 0) {
+      console.warn('[AudioEngine] No BPM candidates found. Audio may be too quiet or too short.');
+    } else {
+      console.warn('[AudioEngine] BPM candidates found but none passed normalization:', candidates.length);
     }
 
     return null;
@@ -1838,12 +2002,36 @@ export class AudioEngine {
     return this._meydaPromise;
   }
 
-  _ensureAubioLoaded() {
+  _ensureAubioLoaded(forceRetry = false) {
+    // If loading recently failed, don't retry immediately (prevent spam)
+    // Only retry if forced or if enough time has passed (30 seconds)
+    if (!forceRetry && this._aubioLoadFailedAt) {
+      const timeSinceFailure = performance.now() - this._aubioLoadFailedAt;
+      const RETRY_DELAY_MS = 30000; // 30 seconds
+      if (timeSinceFailure < RETRY_DELAY_MS) {
+        // If we don't have a cached promise yet, create one to prevent repeated attempts
+        if (!this._aubioPromise) {
+          // Cache a resolved promise to prevent repeated attempts
+          // This avoids error spam while still allowing code to check _aubioModule
+          this._aubioPromise = Promise.resolve(null);
+        }
+        return this._aubioPromise;
+      }
+      // Enough time has passed, clear the failure timestamp and retry
+      this._aubioLoadFailedAt = null;
+      // Clear any cached null promise so we can retry
+      this._aubioPromise = null;
+    }
+    
+    // If we have an active promise (and we're not in retry delay), return it
     if (this._aubioPromise) {
       return this._aubioPromise;
     }
+    
     this._aubioPromise = loadAubio()
       .then(async (factory) => {
+        // Success - clear any failure state
+        this._aubioLoadFailedAt = null;
         if (typeof factory === 'function') {
           const module = await factory();
           this._aubioModule = module;
@@ -1855,9 +2043,13 @@ export class AudioEngine {
         return factory;
       })
       .catch((err) => {
-        console.warn('Aubio failed to load', err);
+        // Log warning only once per failure period (not every frame)
+        if (!this._aubioLoadFailedAt) {
+          console.warn('Aubio failed to load', err);
+        }
         this._aubioModule = null;
         this._aubioPromise = null;
+        this._aubioLoadFailedAt = performance.now();
         return null;
       });
     return this._aubioPromise;

@@ -12,7 +12,7 @@
  * - Background saving (non-blocking)
  */
 
-import { StateSnapshot } from './state-snapshot.js';
+import { StateSnapshot } from '../state-snapshot.js';
 import { SessionPersistence } from '../storage/sessionPersistence.js';
 import { SnapshotHistory } from './snapshotHistory.js';
 
@@ -20,6 +20,9 @@ const SAVE_INTERVAL_MS = 5000; // Save every 5 seconds during active use
 const IDLE_THRESHOLD_MS = 300000; // 5 minutes of inactivity
 const MAX_SAVE_FREQUENCY_MS = 1000; // Max 1 save per second
 const DEBOUNCE_MS = 200; // Debounce rapid changes
+const ERROR_LOG_THROTTLE_MS = 60000; // Only log same error once per minute
+const CIRCUIT_BREAKER_THRESHOLD = 5; // Disable saves after 5 consecutive errors
+const CIRCUIT_BREAKER_RESET_MS = 60000; // Re-enable after 1 minute
 
 export class AutoSaveCoordinator {
   constructor(context, options = {}) {
@@ -41,6 +44,12 @@ export class AutoSaveCoordinator {
     // Performance tracking
     this._saveCount = 0;
     this._saveErrors = 0;
+    
+    // Error throttling and circuit breaker
+    this._lastErrorLogTime = new Map(); // Track when we last logged each error type
+    this._consecutiveErrors = 0;
+    this._circuitBreakerOpen = false;
+    this._circuitBreakerOpenTime = 0;
   }
 
   /**
@@ -126,6 +135,18 @@ export class AutoSaveCoordinator {
     
     const now = Date.now();
     
+    // Check circuit breaker
+    if (this._circuitBreakerOpen) {
+      // Try to reset circuit breaker after timeout
+      if (now - this._circuitBreakerOpenTime > CIRCUIT_BREAKER_RESET_MS) {
+        this._circuitBreakerOpen = false;
+        this._consecutiveErrors = 0;
+        this._throttledLog('info', '[AutoSaveCoordinator] Circuit breaker reset, retrying saves');
+      } else {
+        return; // Circuit breaker is open, skip save
+      }
+    }
+    
     // Check if we're idle
     if (now - this._lastActivityTime > IDLE_THRESHOLD_MS) {
       if (!this._isIdle) {
@@ -152,6 +173,8 @@ export class AutoSaveCoordinator {
       const success = this.persistence.save(compressed);
       
       if (success) {
+        // Reset error tracking on success
+        this._consecutiveErrors = 0;
         this._lastSaveTime = now;
         this._saveCount++;
         
@@ -161,23 +184,62 @@ export class AutoSaveCoordinator {
           try {
             this.history.add(snapshot, { bookmark: false });
           } catch (err) {
-            console.warn('[AutoSaveCoordinator] Failed to add to history:', err);
+            this._throttledLog('warn', '[AutoSaveCoordinator] Failed to add to history:', err);
           }
         }
         
         const duration = performance.now() - startTime;
         if (duration > 50) {
-          console.warn(`[AutoSaveCoordinator] Save took ${duration.toFixed(1)}ms (slow)`);
+          this._throttledLog('warn', `[AutoSaveCoordinator] Save took ${duration.toFixed(1)}ms (slow)`);
         }
       } else {
-        this._saveErrors++;
-        console.warn('[AutoSaveCoordinator] Save failed');
+        this._handleSaveError('Save failed', null);
       }
     } catch (err) {
-      this._saveErrors++;
-      console.error('[AutoSaveCoordinator] Save error:', err);
+      this._handleSaveError('Save error', err);
     } finally {
       this._isSaving = false;
+    }
+  }
+
+  /**
+   * Handle save errors with throttling and circuit breaker
+   * @private
+   */
+  _handleSaveError(message, err) {
+    this._saveErrors++;
+    this._consecutiveErrors++;
+    
+    // Throttle error logging to prevent console spam
+    const errorKey = err ? `${err.name}:${err.message}` : message;
+    this._throttledLog('error', `[AutoSaveCoordinator] ${message}:`, err || '');
+    
+    // Open circuit breaker if too many consecutive errors
+    if (this._consecutiveErrors >= CIRCUIT_BREAKER_THRESHOLD && !this._circuitBreakerOpen) {
+      this._circuitBreakerOpen = true;
+      this._circuitBreakerOpenTime = Date.now();
+      console.warn(`[AutoSaveCoordinator] Circuit breaker opened after ${this._consecutiveErrors} consecutive errors. Saves disabled for ${CIRCUIT_BREAKER_RESET_MS / 1000}s`);
+    }
+  }
+
+  /**
+   * Throttled logging to prevent console spam
+   * @private
+   */
+  _throttledLog(level, ...args) {
+    const now = Date.now();
+    const key = args.join('|');
+    const lastLogTime = this._lastErrorLogTime.get(key) || 0;
+    
+    if (now - lastLogTime > ERROR_LOG_THROTTLE_MS) {
+      this._lastErrorLogTime.set(key, now);
+      if (level === 'error') {
+        console.error(...args);
+      } else if (level === 'warn') {
+        console.warn(...args);
+      } else {
+        console.log(...args);
+      }
     }
   }
 
@@ -286,10 +348,12 @@ export class AutoSaveCoordinator {
       if (success) {
         this.history.add(snapshot, { bookmark: true, bookmarkLabel: label });
         this._lastSaveTime = Date.now();
+        // Reset error tracking on successful bookmark
+        this._consecutiveErrors = 0;
         return snapshot;
       }
     } catch (err) {
-      console.error('[AutoSaveCoordinator] Failed to create bookmark:', err);
+      this._throttledLog('error', '[AutoSaveCoordinator] Failed to create bookmark:', err);
     }
     
     return null;
@@ -303,6 +367,8 @@ export class AutoSaveCoordinator {
     return {
       saveCount: this._saveCount,
       saveErrors: this._saveErrors,
+      consecutiveErrors: this._consecutiveErrors,
+      circuitBreakerOpen: this._circuitBreakerOpen,
       isIdle: this._isIdle,
       lastSaveTime: this._lastSaveTime,
       lastActivityTime: this._lastActivityTime,

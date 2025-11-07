@@ -18,6 +18,11 @@
 // Think of it like a bookshelf - once you get a book, you keep it
 const cache = new Map();
 
+// Cache for failed loads to prevent repeated attempts
+// Key: module name, Value: timestamp of last failure
+const failureCache = new Map();
+const FAILURE_CACHE_DURATION_MS = 60000; // Don't retry failed loads for 60 seconds
+
 /**
  * Clear the module cache to free memory
  * This should be called when modules are no longer needed
@@ -26,8 +31,10 @@ const cache = new Map();
 export function clearModuleCache(key) {
   if (key) {
     cache.delete(key);
+    failureCache.delete(key);
   } else {
     cache.clear();
+    failureCache.clear();
   }
 }
 
@@ -43,6 +50,19 @@ export function clearModuleCache(key) {
  * @returns {Promise} A promise that resolves to the loaded library
  */
 function loadOnce(key, importer, transform = (value) => value) {
+  // Check if this module recently failed to load
+  const lastFailure = failureCache.get(key);
+  if (lastFailure) {
+    const timeSinceFailure = Date.now() - lastFailure;
+    if (timeSinceFailure < FAILURE_CACHE_DURATION_MS) {
+      // Return a rejected promise immediately to prevent repeated attempts
+      return Promise.reject(new Error(`Module '${key}' failed to load recently, retry after ${Math.ceil((FAILURE_CACHE_DURATION_MS - timeSinceFailure) / 1000)}s`));
+    } else {
+      // Enough time has passed, clear the failure cache
+      failureCache.delete(key);
+    }
+  }
+
   // If we've already loaded this library, return the cached version
   if (!cache.has(key)) {
     // Load it and transform it, then store in cache
@@ -50,15 +70,21 @@ function loadOnce(key, importer, transform = (value) => value) {
       .then(mod => {
         // Wrap transform in try-catch for defensive error handling
         try {
-          return transform(mod);
+          const result = transform(mod);
+          // Clear failure cache on success
+          failureCache.delete(key);
+          return result;
         } catch (err) {
           console.error(`[LazyLoader] Failed to transform module '${key}':`, err);
+          failureCache.set(key, Date.now());
           throw err;
         }
       })
       .catch(err => {
         // If loading or transformation fails, remove from cache so we can retry later
         cache.delete(key);
+        // Cache the failure to prevent repeated attempts
+        failureCache.set(key, Date.now());
         console.error(`[LazyLoader] Failed to load/initialize module '${key}':`, err);
         throw err; // Re-throw to propagate the error
       })

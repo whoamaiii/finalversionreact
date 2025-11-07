@@ -621,6 +621,15 @@ export class PresetManager {
     return byName || null;
   }
 
+  getPreset(identifier) {
+    const preset = this._resolvePreset(identifier);
+    if (!preset) return null;
+    return {
+      id: preset.id,
+      name: preset.name,
+    };
+  }
+
   _findByName(name) {
     if (!name) return null;
     const lower = name.trim().toLowerCase();
