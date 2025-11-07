@@ -248,6 +248,12 @@ export class SyncCoordinator {
     // Store timer IDs for cleanup
     this._helloTimerId = null;
 
+    // Recovery system integration
+    this._onRecoveryRequest = null; // Callback when projector requests recovery
+    this._onRecoveryApply = null; // Callback when recovery snapshot should be applied
+    this._projectorHealthCheck = null; // Health check timer for projector window
+    this._lastProjectorResponse = 0; // Last time projector responded to ping
+
     this._initTransports();
 
     // Clear any existing hello timer before setting new one (prevents overlap)
@@ -391,6 +397,42 @@ export class SyncCoordinator {
       }
       return;
     }
+
+    if (type === 'recovery') {
+      this._handleRecovery(payload);
+      return;
+    }
+
+    if (type === 'recoveryRequest') {
+      if (this.role === 'control') {
+        // Control window received request for recovery snapshot
+        if (this._onRecoveryRequest && typeof this._onRecoveryRequest === 'function') {
+          try {
+            this._onRecoveryRequest();
+          } catch (err) {
+            console.error('[Sync] Error handling recovery request:', err);
+          }
+        }
+      }
+      return;
+    }
+
+    if (type === 'healthPing') {
+      if (this.role === 'receiver') {
+        // Respond to health ping
+        const target = 'control';
+        this._sendMessage('healthPong', { timestamp: payload.timestamp }, { target });
+      }
+      return;
+    }
+
+    if (type === 'healthPong') {
+      if (this.role === 'control') {
+        // Received health pong from projector
+        this._lastProjectorResponse = Date.now();
+      }
+      return;
+    }
   }
 
   _handleCommand(payload) {
@@ -432,6 +474,26 @@ export class SyncCoordinator {
     if (cmd === 'eye-predator-off') {
       this.sceneApi.setEyePredatorMode?.(false);
       return;
+    }
+  }
+
+  _handleRecovery(payload) {
+    if (this.role !== 'receiver') return;
+    
+    // Decompress and apply recovery snapshot
+    if (payload.snapshot && this._onRecoveryApply) {
+      try {
+        // Snapshot is sent as serialized JSON
+        const snapshotData = typeof payload.snapshot === 'string' 
+          ? JSON.parse(payload.snapshot)
+          : payload.snapshot;
+        
+        if (this._onRecoveryApply && typeof this._onRecoveryApply === 'function') {
+          this._onRecoveryApply(snapshotData);
+        }
+      } catch (err) {
+        console.error('[Sync] Failed to handle recovery:', err);
+      }
     }
   }
 
@@ -652,6 +714,82 @@ export class SyncCoordinator {
     this._sendMessage('padEvent', { event }, { target });
   }
 
+  // Recovery system methods
+  setRecoveryRequestHandler(handler) {
+    this._onRecoveryRequest = typeof handler === 'function' ? handler : null;
+  }
+
+  setRecoveryApplyHandler(handler) {
+    this._onRecoveryApply = typeof handler === 'function' ? handler : null;
+  }
+
+  setProjectorCrashHandler(handler) {
+    this._onProjectorCrash = typeof handler === 'function' ? handler : null;
+  }
+
+  broadcastRecovery(snapshot) {
+    if (this.role !== 'control') return;
+    
+    try {
+      // Serialize snapshot for transmission
+      const serialized = typeof snapshot.serialize === 'function' 
+        ? snapshot.serialize()
+        : JSON.stringify(snapshot);
+      
+      this._sendMessage('recovery', { snapshot: serialized }, { target: 'receiver', useStorage: true });
+    } catch (err) {
+      console.error('[Sync] Failed to broadcast recovery:', err);
+    }
+  }
+
+  requestRecovery() {
+    if (this.role !== 'receiver') return;
+    this._sendMessage('recoveryRequest', {}, { target: 'control', useStorage: true });
+  }
+
+  startHealthCheck() {
+    if (this.role !== 'control') return;
+    if (this._projectorHealthCheck) return; // Already started
+    
+    const HEALTH_CHECK_INTERVAL_MS = 5000; // Check every 5 seconds
+    const HEALTH_TIMEOUT_MS = 15000; // 15 seconds without response = crashed
+    
+    this._projectorHealthCheck = setInterval(() => {
+      if (!this.projectorWindow || this.projectorWindow.closed) {
+        this._lastProjectorResponse = 0;
+        return;
+      }
+      
+      const now = Date.now();
+      
+      // Send health ping
+      this._sendMessage('healthPing', { timestamp: now }, { target: 'receiver' });
+      
+      // Check if projector responded
+      if (this._lastProjectorResponse > 0 && now - this._lastProjectorResponse > HEALTH_TIMEOUT_MS) {
+        // Projector not responding - possible crash
+        if (this._onProjectorCrash) {
+          this._onProjectorCrash();
+        }
+        this._lastProjectorResponse = 0; // Reset to avoid repeated alerts
+      }
+    }, HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  resetAllWindows() {
+    if (this.role !== 'control') return null;
+    
+    // Close existing projector window
+    if (this.projectorWindow && !this.projectorWindow.closed) {
+      try {
+        this.projectorWindow.close();
+      } catch (_) {}
+    }
+    
+    // Open new projector window
+    return this.openProjectorWindow();
+  }
+
   // Cleanup method to remove all event listeners and prevent memory leaks
   cleanup() {
     // Clear any pending timers
@@ -681,9 +819,18 @@ export class SyncCoordinator {
       this.channel = null;
     }
 
+    // Clear health check timer
+    if (this._projectorHealthCheck) {
+      clearInterval(this._projectorHealthCheck);
+      this._projectorHealthCheck = null;
+    }
+
     // Clear any references
     this.projectorWindow = null;
     this.controlWindow = null;
     this._statusListeners.clear();
+    this._onRecoveryRequest = null;
+    this._onRecoveryApply = null;
+    this._onProjectorCrash = null;
   }
 }

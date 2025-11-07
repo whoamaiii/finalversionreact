@@ -24,11 +24,18 @@ import { initScene } from './scene.js';           // 3D scene and rendering
 import { AudioEngine } from './audio.js';          // Audio analysis and processing
 import { initSettingsUI, cleanupSettingsUI } from './settings-ui.js'; // Settings panel UI
 import { SyncCoordinator } from './sync.js';      // Multi-window synchronization
+import { resolveRoleFromUrl } from './sync.js';
 import { printFeatureMatrix } from './feature.js'; // Browser capability detection
 import { showToast, cleanupToast } from './toast.js';           // Temporary notification messages
+import { detectAudioRoutingCapabilities } from './audio-routing-detector.js';
 import { PresetManager } from './preset-manager.js';
 import { openPresetLibraryWindow } from './preset-library-window.js';
 import { PerformanceController } from './performance-pads.js';
+import PerformanceMonitor from './performance-monitor.js';
+import PerformanceHud from './performance-hud.js';
+import { AutoSaveCoordinator } from './state/autoSaveCoordinator.js';
+import { SessionPersistence } from './storage/sessionPersistence.js';
+import { showRecoveryModal } from './recovery-modal.js';
 
 // Debug mode: print browser feature support matrix when ?debug is in the URL
 // This helps developers understand what capabilities are available
@@ -42,6 +49,93 @@ const sceneApi = initScene();
 
 // Create the audio engine that processes audio and extracts features
 const audio = new AudioEngine();
+
+let performanceHud = null;
+
+// Global performance monitor for Guardian system
+const performanceMonitor = (() => {
+  try {
+    const monitor = new PerformanceMonitor({
+      renderer: sceneApi?.state?.renderer ?? null,
+      autoInstrumentRenderer: true,
+      onMetricsUpdated: (metrics) => {
+        try {
+          performanceHud?.update(metrics);
+        } catch (err) {
+          if (metrics && typeof metrics.frameId === 'number' && metrics.frameId % 120 === 0) {
+            console.debug('[PerformanceHud] update failed', err);
+          }
+        }
+      },
+    });
+    try { window.__performanceMonitor = monitor; } catch (_) {}
+    return monitor;
+  } catch (err) {
+    console.warn('[PerformanceMonitor] init failed', err);
+    return null;
+  }
+})();
+
+if (performanceMonitor) {
+  try {
+    performanceHud = new PerformanceHud({
+      targetFpsProvider: () => sceneApi.state?.params?.targetFps || 60,
+      qualityProvider: () => ({
+        pixelRatio: sceneApi.getPixelRatio?.(),
+        pixelRatioCap: sceneApi.state?.params?.pixelRatioCap,
+        minPixelRatio: sceneApi.state?.params?.minPixelRatio,
+        autoResolution: !!sceneApi.state?.params?.autoResolution,
+        profile: sceneApi.state?.params?.effectsProfile,
+      }),
+    });
+    try { window.__performanceHud = performanceHud; } catch (_) {}
+  } catch (err) {
+    console.warn('[PerformanceHud] init failed', err);
+    performanceHud = null;
+  }
+}
+
+async function initAudioRoutingDetection() {
+  try {
+    const capabilities = await detectAudioRoutingCapabilities();
+    try { window.__audioRoutingCapabilities = capabilities; } catch (_) {}
+
+    const { os, capabilityMatrix, devices, enumerateError } = capabilities;
+    const groupLabel = `[Audio Routing] ${os} capability matrix`;
+    try {
+      console.groupCollapsed(groupLabel);
+      console.info('Capabilities', capabilityMatrix);
+      console.info('Audio inputs', devices.audioInputs);
+      console.info('Audio outputs', devices.audioOutputs);
+      if (enumerateError) {
+        console.warn('enumerateDevices error', enumerateError);
+      }
+      console.groupEnd();
+    } catch (_) {
+      console.info(groupLabel, capabilityMatrix);
+    }
+
+    if (!capabilityMatrix.blackhole.available) {
+      const needsPermission = capabilityMatrix.blackhole.needsPermission;
+      let recommendation = 'Install a virtual audio device for low-latency routing. See docs/AUDIO_SETUP.md.';
+      if (os === 'macos') {
+        recommendation = 'BlackHole not detected. Follow docs/AUDIO_SETUP.md to install and enable it.';
+      } else if (os === 'windows') {
+        recommendation = 'VB-Cable not detected. Install it for reliable system audio (docs/AUDIO_SETUP.md).';
+      } else if (os === 'linux') {
+        recommendation = 'PulseAudio virtual sink not detected. Create one using the steps in docs/AUDIO_SETUP.md.';
+      }
+      if (needsPermission) {
+        recommendation += ' Grant microphone permissions so the browser can enumerate audio devices.';
+      }
+      try { showToast(recommendation, 5200); } catch (_) {}
+    }
+  } catch (error) {
+    console.warn('[Audio Routing] Capability detection failed', error);
+  }
+}
+
+initAudioRoutingDetection();
 
 const diagnosticsEnabled = new URLSearchParams(location.search).has('diagnostics');
 const diagnosticsLogIntervalMs = 5000;
@@ -67,11 +161,187 @@ let autoStutterCurrentValue = 180; // Start with default value, will sync with a
 
 // Create the sync coordinator for multi-window synchronization
 // This allows multiple browser windows to stay in sync (control + projector mode)
-const sync = new SyncCoordinator({ role: 'control', sceneApi });
+const sync = new SyncCoordinator({ role: resolveRoleFromUrl(location.search), sceneApi });
 // Webcam feature removed; no global exposure needed
 
 // Preset manager orchestrates capture, persistence, and live preset operations
 const presetManager = new PresetManager({ sceneApi, audioEngine: audio });
+
+// Session Recovery System - Phase 1: Continuous State Snapshotting
+// =================================================================
+const SESSION_ACTIVE_KEY = 'cosmic_session_active';
+const SESSION_START_TIME_KEY = 'cosmic_session_start_time';
+
+// Check for crash on startup
+let crashedSessionDetected = false;
+let crashedSnapshot = null;
+try {
+  const wasActive = localStorage.getItem(SESSION_ACTIVE_KEY) === 'true';
+  if (wasActive) {
+    // Previous session didn't cleanly shut down - crash detected
+    crashedSessionDetected = true;
+    console.warn('[SessionRecovery] Previous session ended unexpectedly (crash detected)');
+    
+    // Try to load the crashed snapshot (async, will be handled later)
+    const persistence = new SessionPersistence();
+    const compressed = persistence.load();
+    if (compressed) {
+      // Load snapshot asynchronously
+      import('./state-snapshot.js').then(({ StateSnapshot }) => {
+        try {
+          crashedSnapshot = StateSnapshot.decompress(compressed);
+          console.log('[SessionRecovery] Loaded crashed snapshot:', crashedSnapshot.getDescription());
+          
+          // Show recovery modal after a brief delay to ensure UI is ready
+          setTimeout(() => {
+            showRecoveryModal({
+              snapshot: crashedSnapshot,
+              context: { sceneApi, audioEngine: audio, presetManager },
+              onRestore: (snapshot, context) => {
+                // Restore snapshot
+                restoreCrashedSession(snapshot, context);
+              },
+              onStartFresh: (snapshot) => {
+                // Archive snapshot to history (Phase 3 will handle this)
+                console.log('[SessionRecovery] Starting fresh, snapshot archived');
+              },
+            });
+          }, 500);
+        } catch (err) {
+          console.error('[SessionRecovery] Failed to decompress crashed snapshot:', err);
+        }
+      }).catch(err => {
+        console.error('[SessionRecovery] Failed to load snapshot module:', err);
+      });
+    } else {
+      // No snapshot available, but crash was detected
+      console.warn('[SessionRecovery] Crash detected but no snapshot found');
+    }
+  }
+  
+  // Mark new session as active
+  localStorage.setItem(SESSION_ACTIVE_KEY, 'true');
+  const sessionStartTime = Date.now();
+  localStorage.setItem(SESSION_START_TIME_KEY, String(sessionStartTime));
+} catch (err) {
+  console.warn('[SessionRecovery] Failed to check session state:', err);
+}
+
+/**
+ * Restore crashed session
+ */
+async function restoreCrashedSession(snapshot, context) {
+  const { sceneApi, audioEngine, presetManager } = context;
+  
+  try {
+    // Restore preset if available
+    if (snapshot.preset?.snapshot) {
+      const { applyPresetSnapshot } = await import('./preset-io.js');
+      applyPresetSnapshot(snapshot.preset.snapshot, { sceneApi, audioEngine, silent: true });
+      
+      // Load preset in manager
+      if (snapshot.preset.id && presetManager) {
+        try {
+          presetManager.load(snapshot.preset.id, { silent: true });
+        } catch (err) {
+          console.warn('[SessionRecovery] Failed to load preset:', err);
+        }
+      }
+    }
+    
+    // Restore audio source
+    if (snapshot.audioSource?.type === 'mic' && snapshot.audioSource.deviceId) {
+      audioEngine.startMic(snapshot.audioSource.deviceId).catch(err => {
+        console.warn('[SessionRecovery] Failed to restore audio:', err);
+      });
+    }
+    
+    console.log('[SessionRecovery] Session restored successfully');
+  } catch (err) {
+    console.error('[SessionRecovery] Restore failed:', err);
+    throw err;
+  }
+}
+
+// Initialize auto-save coordinator
+let autoSaveCoordinator = null;
+try {
+  autoSaveCoordinator = new AutoSaveCoordinator({
+    sceneApi,
+    audioEngine: audio,
+    presetManager,
+    sessionStartTime: parseInt(localStorage.getItem(SESSION_START_TIME_KEY) || '0', 10) || Date.now(),
+  });
+  
+  // Hook into preset manager events
+  if (presetManager && typeof presetManager.on === 'function') {
+    presetManager.on('preset-loaded', () => {
+      autoSaveCoordinator?.handleEvent('preset-changed');
+    });
+    presetManager.on('preset-saved', () => {
+      autoSaveCoordinator?.handleEvent('preset-changed');
+    });
+  }
+  
+  // Start auto-saving
+  autoSaveCoordinator.start();
+  
+  // Expose for debugging
+  try { window.__autoSaveCoordinator = autoSaveCoordinator; } catch (_) {}
+  
+  // Integrate recovery system with sync coordinator (after autoSaveCoordinator is ready)
+  if (sync && sync.role === 'control') {
+    // Control window: broadcast recovery snapshots to projector windows
+    sync.setRecoveryRequestHandler(() => {
+      // Projector requested recovery - send latest snapshot
+      const persistence = new SessionPersistence();
+      const compressed = persistence.load();
+      if (compressed) {
+        import('./state-snapshot.js').then(({ StateSnapshot }) => {
+          try {
+            const snapshot = StateSnapshot.decompress(compressed);
+            sync.broadcastRecovery(snapshot);
+          } catch (err) {
+            console.error('[Sync] Failed to load recovery snapshot:', err);
+          }
+        });
+      }
+    });
+    
+    // Start health check for projector windows
+    sync.startHealthCheck();
+    
+    // Handle projector crash detection
+    sync.setProjectorCrashHandler(() => {
+      console.warn('[Sync] Projector window not responding - possible crash');
+      try {
+        showToast('Projector not responding. Use "Reset All Windows" to restart.', 5000);
+      } catch (_) {}
+    });
+  }
+  
+  // Projector windows: listen for recovery events
+  if (sync && sync.role === 'receiver') {
+    sync.setRecoveryApplyHandler((snapshotData) => {
+      // Deserialize and apply recovery snapshot
+      import('./state-snapshot.js').then(({ StateSnapshot }) => {
+        try {
+          const snapshot = StateSnapshot.deserialize(snapshotData);
+          restoreCrashedSession(snapshot, { sceneApi, audioEngine: audio, presetManager });
+        } catch (err) {
+          console.error('[Sync] Failed to deserialize recovery snapshot:', err);
+        }
+      });
+    });
+    
+    // Request recovery on startup if control window is available
+    setTimeout(() => {
+      sync.requestRecovery();
+    }, 1000);
+  }
+} catch (err) {
+  console.warn('[SessionRecovery] Failed to initialize auto-save:', err);
+}
 
 let presetLibraryUI = null;
 const openPresetLibrary = () => {
@@ -632,6 +902,19 @@ window.addEventListener('pointerdown', eventHandlers.pointerdown);
 
 // Cleanup on page unload to prevent memory leaks
 eventHandlers.beforeunload = () => {
+  // Mark session as cleanly closed (not crashed)
+  try {
+    localStorage.setItem(SESSION_ACTIVE_KEY, 'false');
+    
+    // Save final snapshot before shutdown
+    if (autoSaveCoordinator) {
+      autoSaveCoordinator.saveNow('shutdown', ['pre-crash']);
+      autoSaveCoordinator.stop();
+    }
+  } catch (err) {
+    console.warn('[SessionRecovery] Failed to mark clean shutdown:', err);
+  }
+  
   // Call the comprehensive cleanup function
   stopAnimation();
 };
@@ -673,7 +956,10 @@ function animate() {
   // Schedule the next frame (this creates the loop)
   animationFrameId = requestAnimationFrame(animate);
   
-  const now = performance.now();
+  const frameStart = performance.now();
+  const pm = performanceMonitor;
+  if (pm) pm.beginFrame(frameStart);
+  const now = frameStart;
   
   // If paused, skip updating and reset timers
   if (isPaused) {
@@ -701,41 +987,67 @@ function animate() {
   
   // Update audio engine and get features
   // This analyzes the audio and extracts beat, frequency, tempo, etc.
-  let features = audio.update();
+  let features = null;
+  if (pm) pm.markSectionStart('audio.update');
+  try {
+    features = audio.update();
+  } finally {
+    if (pm) pm.markSectionEnd('audio.update');
+  }
   if (!features) {
     // Receiver windows can render using remote features from sync
-    try { features = sync.getRemoteFeatures(now); } catch (err) {
+    if (pm) pm.markSectionStart('sync.remoteFeatures');
+    try {
+      features = sync.getRemoteFeatures(now);
+    } catch (err) {
       console.warn('Failed to get remote features:', err);
+    } finally {
+      if (pm) pm.markSectionEnd('sync.remoteFeatures');
     }
   }
-  try { performancePads.update(dt, now, features); } catch (err) {
+  if (pm) pm.markSectionStart('performancePads.update');
+  try {
+    performancePads.update(dt, now, features);
+  } catch (err) {
     console.warn('Performance pads update error:', err);
+  } finally {
+    if (pm) pm.markSectionEnd('performancePads.update');
+  }
+
+  const latestWorkletLatency = audio.getLastWorkletLatencyMs?.();
+  if (pm && Number.isFinite(latestWorkletLatency)) {
+    pm.recordAudioWorkletSample(latestWorkletLatency);
   }
 
   // Auto-stutter mode: Automatically adjust stutter window based on music tempo/pattern
   // This makes visuals adapt to different BPMs without manual tweaking
-  if (features && sceneApi.state?.params?.visuals?.dispersion?.autoStutterMode) {
-    // Only recalculate periodically (every 500ms) to avoid jitter
-    if (now - autoStutterLastUpdate > autoStutterUpdateIntervalMs) {
-      autoStutterLastUpdate = now;
+  if (pm) pm.markSectionStart('auto.stutter');
+  try {
+    if (features && sceneApi.state?.params?.visuals?.dispersion?.autoStutterMode) {
+      // Only recalculate periodically (every 500ms) to avoid jitter
+      if (now - autoStutterLastUpdate > autoStutterUpdateIntervalMs) {
+        autoStutterLastUpdate = now;
 
-      // Calculate optimal window size based on current BPM and pattern
-      const optimalWindow = audio.calculateOptimalStutterWindow(features);
+        // Calculate optimal window size based on current BPM and pattern
+        const optimalWindow = audio.calculateOptimalStutterWindow(features);
 
-      // Smoothly interpolate towards target (prevents sudden jumps)
-      const lerpFactor = 0.15; // Smooth transition over ~2-3 updates
-      autoStutterCurrentValue = autoStutterCurrentValue * (1 - lerpFactor) + optimalWindow * lerpFactor;
+        // Smoothly interpolate towards target (prevents sudden jumps)
+        const lerpFactor = 0.15; // Smooth transition over ~2-3 updates
+        autoStutterCurrentValue = autoStutterCurrentValue * (1 - lerpFactor) + optimalWindow * lerpFactor;
 
-      // Update the dispersion parameter (rounded to nearest 10ms for stability)
-      const roundedValue = Math.round(autoStutterCurrentValue / 10) * 10;
-      sceneApi.state.params.visuals.dispersion.stutterWindowMs = roundedValue;
+        // Update the dispersion parameter (rounded to nearest 10ms for stability)
+        const roundedValue = Math.round(autoStutterCurrentValue / 10) * 10;
+        sceneApi.state.params.visuals.dispersion.stutterWindowMs = roundedValue;
+      }
+    } else {
+      // When auto mode is off, sync our tracked value with the manual setting
+      // This prevents jumps when re-enabling auto mode
+      if (sceneApi.state?.params?.visuals?.dispersion?.stutterWindowMs) {
+        autoStutterCurrentValue = sceneApi.state.params.visuals.dispersion.stutterWindowMs;
+      }
     }
-  } else {
-    // When auto mode is off, sync our tracked value with the manual setting
-    // This prevents jumps when re-enabling auto mode
-    if (sceneApi.state?.params?.visuals?.dispersion?.stutterWindowMs) {
-      autoStutterCurrentValue = sceneApi.state.params.visuals.dispersion.stutterWindowMs;
-    }
+  } finally {
+    if (pm) pm.markSectionEnd('auto.stutter');
   }
 
   // Auto-disable diagnostics after time/count limits to prevent memory accumulation
@@ -790,25 +1102,61 @@ function animate() {
 
   // Update 3D scene with audio features
   // This animates the particles and visuals based on the audio
-  sceneApi.update(features);
+  if (pm) pm.markSectionStart('scene.update');
+  try {
+    sceneApi.update(features);
+  } finally {
+    if (pm) pm.markSectionEnd('scene.update');
+  }
   
   // Update synchronization coordinator
   // This handles syncing between multiple windows (control + projector mode)
-  try { sync.tick(now); } catch (_) {}
+  if (pm) pm.markSectionStart('sync.tick');
+  try {
+    sync.tick(now);
+  } catch (_) {
+    // existing best-effort behaviour
+  } finally {
+    if (pm) pm.markSectionEnd('sync.tick');
+  }
   
   // Send local features to sync coordinator
   // This allows other windows to see what's happening here
-  try { if (features) sync.handleLocalFeatures(features, now); } catch (_) {}
+  if (pm) pm.markSectionStart('sync.handleLocalFeatures');
+  try {
+    if (features) sync.handleLocalFeatures(features, now);
+  } catch (_) {
+    // swallow to match prior behaviour
+  } finally {
+    if (pm) pm.markSectionEnd('sync.handleLocalFeatures');
+  }
   
   // Send parameter snapshots periodically
   // This syncs settings changes between windows
-  try { sync.maybeSendParamSnapshot(now); } catch (_) {}
+  if (pm) pm.markSectionStart('sync.maybeSendParamSnapshot');
+  try {
+    sync.maybeSendParamSnapshot(now);
+  } catch (_) {
+    // swallow to keep previous behaviour
+  } finally {
+    if (pm) pm.markSectionEnd('sync.maybeSendParamSnapshot');
+  }
   
   // Maintain WebSocket connection and broadcast features
   // Try to connect if not connected
-  if (!featureWsConnected) ensureFeatureWs(now);
+  if (pm) pm.markSectionStart('network.ws.ensure');
+  try {
+    if (!featureWsConnected) ensureFeatureWs(now);
+  } finally {
+    if (pm) pm.markSectionEnd('network.ws.ensure');
+  }
   // Send features to TouchDesigner if connected
-  if (features) sendFeaturesOverWs(features, now);
+  if (pm) pm.markSectionStart('network.ws.send');
+  try {
+    if (features) sendFeaturesOverWs(features, now);
+  } finally {
+    if (pm) pm.markSectionEnd('network.ws.send');
+  }
   
   // Defensive safety check: ensure core visuals exist
   // If something failed earlier, try to rebuild particles
@@ -825,37 +1173,41 @@ function animate() {
   // Update UI Labels
   // ================
   // These update the settings panel with current values
-  
-  // Update BPM label (shows detected tempo)
-  if (features && ui.updateBpmLabel) {
-    ui.updateBpmLabel({ 
-      bpm: features.bpm, 
-      confidence: features.bpmConfidence, 
-      source: features.bpmSource 
-    });
-  }
-  
-  // Update tap BPM and drift display
-  if (features && ui.updateTapAndDrift) {
-    ui.updateTapAndDrift({ 
-      tapBpm: features.tapBpm, 
-      bpm: features.bpm 
-    });
-  }
-  
-  // Update drift details (more advanced tempo information)
-  if (features && ui.updateDriftDetails) {
-    ui.updateDriftDetails({
-      tapBpm: features.tapBpm,
-      beatGrid: features.beatGrid,
-      aubioTempo: features.aubioTempoBpm,
-      aubioConf: features.aubioTempoConf,
-    });
-  }
-  
-  // Update beat indicator (small pulsing dot in settings header)
-  if (ui.updateBeatIndicator) {
-    ui.updateBeatIndicator(!!(features && features.beat));
+  if (pm) pm.markSectionStart('ui.update');
+  try {
+    // Update BPM label (shows detected tempo)
+    if (features && ui.updateBpmLabel) {
+      ui.updateBpmLabel({ 
+        bpm: features.bpm, 
+        confidence: features.bpmConfidence, 
+        source: features.bpmSource 
+      });
+    }
+    
+    // Update tap BPM and drift display
+    if (features && ui.updateTapAndDrift) {
+      ui.updateTapAndDrift({ 
+        tapBpm: features.tapBpm, 
+        bpm: features.bpm 
+      });
+    }
+    
+    // Update drift details (more advanced tempo information)
+    if (features && ui.updateDriftDetails) {
+      ui.updateDriftDetails({
+        tapBpm: features.tapBpm,
+        beatGrid: features.beatGrid,
+        aubioTempo: features.aubioTempoBpm,
+        aubioConf: features.aubioTempoConf,
+      });
+    }
+    
+    // Update beat indicator (small pulsing dot in settings header)
+    if (ui.updateBeatIndicator) {
+      ui.updateBeatIndicator(!!(features && features.beat));
+    }
+  } finally {
+    if (pm) pm.markSectionEnd('ui.update');
   }
   
   // FPS Tracking
@@ -882,66 +1234,78 @@ function animate() {
   // If FPS is too low, reduce quality. If FPS is high, increase quality.
   // This ensures smooth performance on different hardware.
   
-  if (sceneApi.state.params.autoResolution) {
-    autoFrames += 1; // Increment frame counter
-    const autoMs = (now - autoLast); // Time since last check
-    autoElapsedMs += autoMs; // Accumulate elapsed time
-    autoLast = now;
-    
-    // Check every ~3 seconds
-    if (autoElapsedMs > 3000 && autoFrames > 0) {
-      // Estimate current FPS (guard against division by zero or very small values)
-      // Since we require autoElapsedMs > 3000, no need for additional MIN_ELAPSED_MS check
-      const fpsApprox = (autoFrames * 1000) / autoElapsedMs;
+  if (pm) pm.markSectionStart('auto.resolution');
+  try {
+    if (sceneApi.state.params.autoResolution) {
+      autoFrames += 1; // Increment frame counter
+      const autoMs = (now - autoLast); // Time since last check
+      autoElapsedMs += autoMs; // Accumulate elapsed time
+      autoLast = now;
+      
+      // Check every ~3 seconds
+      if (autoElapsedMs > 3000 && autoFrames > 0) {
+        // Estimate current FPS (guard against division by zero or very small values)
+        // Since we require autoElapsedMs > 3000, no need for additional MIN_ELAPSED_MS check
+        const fpsApprox = (autoFrames * 1000) / autoElapsedMs;
 
-      // Validate FPS calculation is finite and reasonable before using it
-      if (Number.isFinite(fpsApprox) && fpsApprox > 0 && fpsApprox < 1000) {
-        const target = sceneApi.state.params.targetFps || 60; // Target FPS (default 60)
-        const currentPR = sceneApi.getPixelRatio(); // Current pixel ratio (quality)
-        const desiredMaxPR = sceneApi.state.params.pixelRatioCap; // Maximum allowed quality
+        // Validate FPS calculation is finite and reasonable before using it
+        if (Number.isFinite(fpsApprox) && fpsApprox > 0 && fpsApprox < 1000) {
+          const target = sceneApi.state.params.targetFps || 60; // Target FPS (default 60)
+          const currentPR = sceneApi.getPixelRatio(); // Current pixel ratio (quality)
+          const desiredMaxPR = sceneApi.state.params.pixelRatioCap; // Maximum allowed quality
 
-        let newPR = currentPR; // Start with current value
+          let newPR = currentPR; // Start with current value
 
-        // If FPS is too low, reduce quality (lower pixel ratio)
-        if (fpsApprox < target - 8) {
-          newPR = Math.max(sceneApi.state.params.minPixelRatio, currentPR - 0.05);
-        }
-        // If FPS is too high, increase quality (asymmetric hysteresis prevents oscillation)
-        else if (fpsApprox > target + 12) {
-          newPR = Math.min(desiredMaxPR, currentPR + 0.05);
-        }
-
-        // Only update if change is significant (avoids tiny adjustments)
-        // Validate newPR is finite before using it
-        if (Number.isFinite(newPR) && Math.abs(newPR - currentPR) > 0.01) {
-          const clampedPR = parseFloat(newPR.toFixed(2));
-          // Double-check the result is valid
-          if (Number.isFinite(clampedPR)) {
-            sceneApi.setPixelRatioCap(clampedPR);
+          // If FPS is too low, reduce quality (lower pixel ratio)
+          if (fpsApprox < target - 8) {
+            newPR = Math.max(sceneApi.state.params.minPixelRatio, currentPR - 0.05);
           }
-        }
-      } else if (!Number.isFinite(fpsApprox)) {
-        // Diagnostic logging for invalid FPS calculations to catch root cause
-        console.error('[AutoRes] Invalid FPS calculation detected', {
-          fpsApprox,
-          autoFrames,
-          autoElapsedMs,
-          autoMs: now - autoLast,
-          now,
-          autoLast
-        });
-        // Force reset to recover from invalid state
-        autoFrames = 0;
-        autoElapsedMs = 0;
-        autoLast = now;
-      }
+          // If FPS is too high, increase quality (asymmetric hysteresis prevents oscillation)
+          else if (fpsApprox > target + 12) {
+            newPR = Math.min(desiredMaxPR, currentPR + 0.05);
+          }
 
-      // Reset counters (always reset even if calculation succeeded)
-      if (Number.isFinite(fpsApprox)) {
-        autoFrames = 0;
-        autoElapsedMs = 0;
+          // Only update if change is significant (avoids tiny adjustments)
+          // Validate newPR is finite before using it
+          if (Number.isFinite(newPR) && Math.abs(newPR - currentPR) > 0.01) {
+            const clampedPR = parseFloat(newPR.toFixed(2));
+            // Double-check the result is valid
+            if (Number.isFinite(clampedPR)) {
+              sceneApi.setPixelRatioCap(clampedPR);
+            }
+          }
+        } else if (!Number.isFinite(fpsApprox)) {
+          // Diagnostic logging for invalid FPS calculations to catch root cause
+          console.error('[AutoRes] Invalid FPS calculation detected', {
+            fpsApprox,
+            autoFrames,
+            autoElapsedMs,
+            autoMs: now - autoLast,
+            now,
+            autoLast
+          });
+          // Force reset to recover from invalid state
+          autoFrames = 0;
+          autoElapsedMs = 0;
+          autoLast = now;
+        }
+
+        // Reset counters (always reset even if calculation succeeded)
+        if (Number.isFinite(fpsApprox)) {
+          autoFrames = 0;
+          autoElapsedMs = 0;
+        }
       }
     }
+  } finally {
+    if (pm) pm.markSectionEnd('auto.resolution');
+  }
+
+  if (pm) {
+    const frameEnd = performance.now();
+    const targetFps = sceneApi.state?.params?.targetFps || 60;
+    const renderBudgetMs = targetFps > 0 ? 1000 / targetFps : undefined;
+    pm.endFrame({ timestamp: frameEnd, renderBudgetMs });
   }
 }
 
@@ -1011,6 +1375,25 @@ function stopAnimation() {
       performancePads.cleanup();
     } catch (err) {
       console.warn('Error cleaning up performance pads:', err);
+    }
+  }
+
+  if (performanceHud && typeof performanceHud.destroy === 'function') {
+    try {
+      performanceHud.destroy();
+    } catch (err) {
+      console.warn('Error cleaning up performance HUD:', err);
+    }
+    performanceHud = null;
+    try { window.__performanceHud = null; } catch (_) {}
+  }
+
+  // Clean up auto-save coordinator
+  if (autoSaveCoordinator && typeof autoSaveCoordinator.stop === 'function') {
+    try {
+      autoSaveCoordinator.stop();
+    } catch (err) {
+      console.warn('Error cleaning up auto-save coordinator:', err);
     }
   }
 

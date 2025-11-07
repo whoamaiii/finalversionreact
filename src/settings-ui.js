@@ -23,6 +23,8 @@ import {
 } from './dispersion-config.js';
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
 import { showToast } from './toast.js';
+import { StateSnapshot } from './state-snapshot.js';
+import { SnapshotHistory } from './state/snapshotHistory.js';
 
 // Timing constants (in milliseconds)
 const SHADER_HUD_TIMEOUT_MS = 1600;  // How long the shader HUD stays visible
@@ -2119,6 +2121,16 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         syncCoordinator.pushNow();
         showToast('Settings pushed to projector');
       }, { class: 'ghost' }));
+      summaryItems.push(button('Reset All Windows', () => {
+        if (confirm('Reset all projector windows? This will close and reopen them.')) {
+          const newWindow = syncCoordinator.resetAllWindows();
+          if (newWindow) {
+            showToast('Projector windows reset', 2000);
+          } else {
+            showToast('Failed to reset windows. Check pop-up blocker.', 3000);
+          }
+        }
+      }, { class: 'ghost' }));
       const autoCheckbox = checkbox(!!syncCoordinator.autoSync, (checked) => {
         syncCoordinator.setAutoSync(checked);
         updateSyncStatus(syncCoordinator.getStatus());
@@ -2133,6 +2145,136 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }
     const summary = h('div', { class: 'session-summary' }, summaryItems);
     el.appendChild(fieldRow('Session', summary));
+
+    // Session History Section
+    el.appendChild(h('div', { class: 'section-title' }, 'Session History'));
+    
+    // Get auto-save coordinator from window (exposed for debugging)
+    const autoSaveCoordinator = typeof window !== 'undefined' ? window.__autoSaveCoordinator : null;
+    const history = autoSaveCoordinator?.history || new SnapshotHistory();
+    
+    // Bookmark current state button
+    const bookmarkRow = h('div', { class: 'row' });
+    const bookmarkInput = h('input', {
+      type: 'text',
+      placeholder: 'Bookmark name (e.g., "Before experimental preset")',
+      style: 'flex: 1; padding: 6px 10px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: inherit;',
+    });
+    const bookmarkBtn = button('Bookmark Current State', () => {
+      const label = bookmarkInput.value?.trim() || `Bookmark ${new Date().toLocaleTimeString()}`;
+      if (autoSaveCoordinator) {
+        const snapshot = autoSaveCoordinator.createBookmark(label);
+        if (snapshot) {
+          showToast(`Bookmark created: ${label}`, 2000);
+          bookmarkInput.value = '';
+          render('session'); // Refresh to show new bookmark
+        } else {
+          showToast('Failed to create bookmark', 2000);
+        }
+      } else {
+        showToast('Auto-save coordinator unavailable', 2000);
+      }
+    }, { class: 'ghost' });
+    bookmarkRow.appendChild(bookmarkInput);
+    bookmarkRow.appendChild(bookmarkBtn);
+    el.appendChild(bookmarkRow);
+    
+    // History list
+    const historyList = h('div', { style: 'margin-top: 12px;' });
+    const snapshots = history.list();
+    
+    if (snapshots.length === 0) {
+      historyList.appendChild(h('div', { style: 'opacity: 0.6; padding: 20px; text-align: center;' }, 'No snapshots yet. Snapshots are created automatically every 5 seconds.'));
+    } else {
+      snapshots.forEach((snapshot, index) => {
+        const isBookmark = snapshot.hasTag('bookmark');
+        const presetName = snapshot.preset?.name || 'No preset';
+        const timeAgo = snapshot.getTimeAgo();
+        const description = snapshot.bookmarkLabel || snapshot.getDescription();
+        
+        const snapshotRow = h('div', {
+          style: `
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            background: ${isBookmark ? 'rgba(255, 215, 0, 0.1)' : 'rgba(255,255,255,0.04)'};
+            border: 1px solid ${isBookmark ? 'rgba(255, 215, 0, 0.3)' : 'rgba(255,255,255,0.08)'};
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 150ms ease;
+          `,
+          onmouseover: (e) => { e.target.style.background = isBookmark ? 'rgba(255, 215, 0, 0.15)' : 'rgba(255,255,255,0.08)'; },
+          onmouseout: (e) => { e.target.style.background = isBookmark ? 'rgba(255, 215, 0, 0.1)' : 'rgba(255,255,255,0.04)'; },
+        });
+        
+        const left = h('div', { style: 'flex: 1;' });
+        const title = h('div', { style: 'font-weight: 500; margin-bottom: 4px;' }, 
+          isBookmark ? `⭐ ${description}` : description
+        );
+        const meta = h('div', { style: 'font-size: 11px; opacity: 0.7;' }, 
+          `${presetName} • ${timeAgo}`
+        );
+        left.appendChild(title);
+        left.appendChild(meta);
+        
+        const right = h('div', { style: 'display: flex; gap: 6px;' });
+        const restoreBtn = button('Restore', () => {
+          try {
+            restoreSnapshot(snapshot);
+            showToast(`Restored: ${description}`, 2000);
+          } catch (err) {
+            console.error('[SessionHistory] Restore failed:', err);
+            showToast('Restore failed', 2000);
+          }
+        }, { class: 'ghost', style: 'padding: 4px 10px; font-size: 11px;' });
+        
+        if (isBookmark) {
+          const deleteBtn = button('×', () => {
+            if (confirm(`Delete bookmark "${description}"?`)) {
+              history.remove(snapshot.timestamp);
+              showToast('Bookmark deleted', 2000);
+              render('session'); // Refresh
+            }
+          }, { class: 'ghost', style: 'padding: 4px 8px; font-size: 14px; color: rgba(255,100,100,0.8);' });
+          right.appendChild(deleteBtn);
+        }
+        right.appendChild(restoreBtn);
+        
+        snapshotRow.appendChild(left);
+        snapshotRow.appendChild(right);
+        historyList.appendChild(snapshotRow);
+      });
+    }
+    
+    el.appendChild(historyList);
+    
+    // Restore snapshot helper
+    function restoreSnapshot(snapshot) {
+      if (!snapshot) return;
+      
+      // Restore preset
+      if (snapshot.preset?.snapshot) {
+        applyPresetSnapshot(snapshot.preset.snapshot, { sceneApi, audioEngine, silent: true });
+        
+        // Load preset in manager
+        if (snapshot.preset.id && presetManager) {
+          try {
+            presetManager.load(snapshot.preset.id, { silent: true });
+          } catch (err) {
+            console.warn('[SessionHistory] Failed to load preset:', err);
+          }
+        }
+      }
+      
+      // Restore audio source
+      if (snapshot.audioSource?.type === 'mic' && snapshot.audioSource.deviceId) {
+        audioEngine.startMic(snapshot.audioSource.deviceId).catch(err => {
+          console.warn('[SessionHistory] Failed to restore audio:', err);
+        });
+      }
+    }
 
     return el;
   }

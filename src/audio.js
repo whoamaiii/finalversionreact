@@ -248,6 +248,8 @@ export class AudioEngine {
       lastSummary: null,
     };
 
+    this._lastWorkletLatencyMs = null;
+
     this.workletNode = null;
     this.workletEnabled = false;
     this._workletInitPromise = null;
@@ -767,6 +769,8 @@ export class AudioEngine {
     this._releaseWorkletFrameBuffer();
     this._flushAubioQueue();
     this._disposeLiveBuffer();
+
+    this._lastWorkletLatencyMs = null;
 
     // Gracefully drain worklet messages before clearing handler to prevent audio analysis gaps
     if (this.workletNode) {
@@ -2853,8 +2857,13 @@ export class AudioEngine {
     if (this.workletEnabled && Number.isFinite(this._workletFrameTimestamp) && this._workletFrameTimestamp > 0) {
       workletLatency = Math.max(0, updateEnd - this._workletFrameTimestamp);
     }
+    this._lastWorkletLatencyMs = Number.isFinite(workletLatency) ? workletLatency : null;
     this._recordDiagnostics(updateStart, updateEnd, workletLatency);
     return features;
+  }
+
+  getLastWorkletLatencyMs() {
+    return Number.isFinite(this._lastWorkletLatencyMs) ? this._lastWorkletLatencyMs : null;
   }
 
   setDiagnosticsEnabled(enabled) {
