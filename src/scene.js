@@ -352,6 +352,14 @@ function updateSpiralSphere(points, radius, particleCount) {
   if (!positionAttr || !colorAttr || !sizeAttr || !randomDirAttr) return false;
   const capacity = geometry.userData?.capacity ?? positionAttr.count;
   if (capacity < particleCount) return false;
+  
+  // Shrink threshold: if using less than 50% of capacity, signal need to reallocate
+  // This prevents unbounded memory growth when particle count decreases significantly
+  const shrinkThreshold = 0.5;
+  if (particleCount > 0 && capacity > particleCount && particleCount < capacity * shrinkThreshold) {
+    // Return false to trigger reallocation with smaller capacity
+    return false;
+  }
 
   const positions = positionAttr.array;
   const colors = colorAttr.array;
@@ -464,6 +472,14 @@ function updateOrbitRing(points, radius, thickness, particleCount) {
   if (!positionAttr || !colorAttr || !sizeAttr || !randomDirAttr) return false;
   const capacity = geometry.userData?.capacity ?? positionAttr.count;
   if (capacity < particleCount) return false;
+  
+  // Shrink threshold: if using less than 50% of capacity, signal need to reallocate
+  // This prevents unbounded memory growth when particle count decreases significantly
+  const shrinkThreshold = 0.5;
+  if (particleCount > 0 && capacity > particleCount && particleCount < capacity * shrinkThreshold) {
+    // Return false to trigger reallocation with smaller capacity
+    return false;
+  }
   const positions = positionAttr.array;
   const colors = colorAttr.array;
   const sizes = sizeAttr.array;
@@ -518,9 +534,14 @@ function ensureOrbitRings(group, radius, count, thickness, particleCount, mouse)
     if (!updateOrbitRing(ring, radius, thickness, particleCount)) {
       const reuseMaterial = ring.material || null;
       const capacity = ring.geometry?.userData?.capacity || particleCount;
-      const newCapacity = capacity >= particleCount
-        ? capacity
-        : Math.ceil(Math.max(particleCount, capacity * growthFactor));
+      // Shrink if capacity is significantly larger than needed (50% threshold)
+      const shrinkThreshold = 0.5;
+      const shouldShrink = capacity > particleCount && particleCount < capacity * shrinkThreshold;
+      const newCapacity = shouldShrink
+        ? Math.ceil(particleCount * 1.1) // Allocate 10% extra when shrinking
+        : capacity >= particleCount
+          ? capacity
+          : Math.ceil(Math.max(particleCount, capacity * growthFactor));
       const replacement = createOrbitRing(radius, thickness, particleCount, mouse, {
         material: reuseMaterial,
         capacity: newCapacity,
@@ -1341,14 +1362,19 @@ export function initScene() {
         disposePoints(existingCore, { keepMaterial: !!reuseMaterial });
       }
       const prevCapacity = existingCore?.geometry?.userData?.capacity || sphereCount;
-      const newCapacity = prevCapacity >= sphereCount
-        ? prevCapacity
-        : Math.ceil(Math.max(sphereCount, prevCapacity * growthFactor));
+      // Shrink if capacity is significantly larger than needed (50% threshold)
+      const shrinkThreshold = 0.5;
+      const shouldShrink = prevCapacity > sphereCount && sphereCount < prevCapacity * shrinkThreshold;
+      const newCapacity = shouldShrink
+        ? Math.ceil(sphereCount * 1.1) // Allocate 10% extra when shrinking
+        : prevCapacity >= sphereCount
+          ? prevCapacity
+          : Math.ceil(Math.max(sphereCount, prevCapacity * growthFactor));
       const newCore = createSpiralSphere(5, sphereCount, state.mouse, {
         material: reuseMaterial,
         capacity: newCapacity,
       });
-      console.debug('[Scene] Core sphere rebuilt', { requested: sphereCount, capacity: newCapacity });
+      console.debug('[Scene] Core sphere rebuilt', { requested: sphereCount, capacity: newCapacity, shrunk: shouldShrink });
       state.coreSphere = newCore;
       state.mainGroup.add(newCore);
     }
@@ -1366,15 +1392,20 @@ export function initScene() {
           disposePoints(existingOuter, { keepMaterial: !!reuseMaterial });
         }
         const prevCapacity = existingOuter?.geometry?.userData?.capacity || outerCount;
-        const newCapacity = prevCapacity >= outerCount
-          ? prevCapacity
-          : Math.ceil(Math.max(outerCount, prevCapacity * growthFactor));
+        // Shrink if capacity is significantly larger than needed (50% threshold)
+        const shrinkThreshold = 0.5;
+        const shouldShrink = prevCapacity > outerCount && outerCount < prevCapacity * shrinkThreshold;
+        const newCapacity = shouldShrink
+          ? Math.ceil(outerCount * 1.1) // Allocate 10% extra when shrinking
+          : prevCapacity >= outerCount
+            ? prevCapacity
+            : Math.ceil(Math.max(outerCount, prevCapacity * growthFactor));
         const newOuter = createSpiralSphere(outerRadius, outerCount, state.mouse, {
           material: reuseMaterial,
           capacity: newCapacity,
         });
         try { newOuter.renderOrder = 1; } catch (_) {}
-        console.debug('[Scene] Outer sphere rebuilt', { requested: outerCount, capacity: newCapacity });
+        console.debug('[Scene] Outer sphere rebuilt', { requested: outerCount, capacity: newCapacity, shrunk: shouldShrink });
         state.outerSphere = newOuter;
         state.mainGroup.add(newOuter);
       }
