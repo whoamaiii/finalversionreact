@@ -382,6 +382,8 @@ export class AudioEngine {
         // Safari requires a user gesture to start audio, so we store contexts globally
         try {
           window.__reactiveCtxs = window.__reactiveCtxs || [];
+          // Remove closed contexts to prevent memory leak during long sessions
+          window.__reactiveCtxs = window.__reactiveCtxs.filter(ctx => ctx && ctx.state !== 'closed');
           if (!window.__reactiveCtxs.includes(this.ctx)) window.__reactiveCtxs.push(this.ctx);
         } catch(_) {}
       });
@@ -972,8 +974,8 @@ export class AudioEngine {
       }
       const avg = count ? (sum / count) : 0;
       samples.push(this._clamp(avg, 0, 1));
-      // ~50Hz sampling without blocking the UI thread
-      await new Promise(r => setTimeout(r, 20));
+      // ~50Hz sampling without blocking the UI thread - use RAF to allow animation loop to continue
+      await new Promise(r => requestAnimationFrame(r));
     }
 
     this.noiseGateEnabled = wasEnabled;
@@ -1169,6 +1171,10 @@ export class AudioEngine {
           numberOfOutputs: 1,
           outputChannelCount: [1],
         });
+        // Clear any existing handler first to prevent accumulation during audio source switches
+        if (this.workletNode?.port) {
+          this.workletNode.port.onmessage = null;
+        }
         node.port.onmessage = (event) => this._handleWorkletMessage(event);
         node.onprocessorerror = (err) => {
           console.error('Analysis processor error', err);
@@ -2548,10 +2554,21 @@ export class AudioEngine {
     return true;
   }
 
-  _detectBeat(flux, bands) {
+  _detectBeat(flux, bands, currentBpm) {
     if (this.fluxHistory.length < 5) return false;
     const now = performance.now();
-    const refractory = Number.isFinite(this.beatRefractoryMs) && this.beatRefractoryMs > 0 ? this.beatRefractoryMs : this.beatCooldownMs;
+
+    // Calculate tempo-aware cooldown to prevent missing beats at fast tempos or double-triggers at slow tempos
+    let refractory = Number.isFinite(this.beatRefractoryMs) && this.beatRefractoryMs > 0 ? this.beatRefractoryMs : this.beatCooldownMs;
+
+    // If we have valid BPM, make cooldown tempo-aware
+    if (currentBpm && Number.isFinite(currentBpm) && currentBpm >= 20 && currentBpm <= 500) {
+      const beatIntervalMs = 60000 / currentBpm;
+      // Cooldown should be 60-65% of beat interval to avoid double-triggers but not miss rapid beats
+      const dynamicRefractory = Math.max(200, Math.min(500, beatIntervalMs * 0.625));
+      refractory = dynamicRefractory;
+    }
+
     if (now - this._lastBeatMs < refractory) return false;
     // Energy gate: require sufficient bass envelope to accept any beat.
     const bassEnv = bands && bands.env ? (bands.env.bass ?? 0) : 0;
@@ -2618,7 +2635,10 @@ export class AudioEngine {
     const fluxFromWorklet = this._consumeWorkletFlux();
     const flux = fluxFromWorklet ?? this._computeFlux(this.freqData);
     const bassFlux = this._computeBassFlux(this.freqData);
-    let beat = this._detectBeat(flux, bands);
+
+    // Get current BPM for tempo-aware beat detection (prefer file BPM, fall back to tap tempo)
+    const currentBpm = this.bpmEstimate || this.tapBpm || null;
+    let beat = this._detectBeat(flux, bands, currentBpm);
 
     // Live tempo assist: prefer file BPM; else use Aubio tempo for live sources
     const now = performance.now();
