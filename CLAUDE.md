@@ -163,6 +163,155 @@ When syncing or serializing audio features, use `sanitizeFeatures()` (in `sync.j
 - `audio` instance holds all audio analysis parameters
 - `PresetManager` captures both via `capturePresetSnapshot()`
 
+### Async Lifecycle Patterns
+
+**IMPORTANT**: This codebase uses three foundational utilities to prevent race conditions, resource leaks, and initialization bugs. Always use these patterns for new async operations.
+
+#### AsyncOperationRegistry (`src/async-registry.js`)
+Use for **long-running async operations** that can be cancelled or superseded.
+
+**When to use**:
+- BPM/beat grid analysis
+- File loading operations
+- Network requests
+- Any operation that should be cancelled when a new one starts
+
+**Example**:
+```javascript
+// In constructor
+this._asyncRegistry = new AsyncOperationRegistry('MyComponent');
+
+// When starting an operation
+const token = this._asyncRegistry.register('analysis', { timeout: 10000 });
+
+// Wrap your promise
+try {
+  const result = await token.wrap(analysisPromise, 10000);
+  // Use result
+} catch (err) {
+  if (err.isTimeout) {
+    // Handle timeout - late results still processed in background
+  } else if (err.isCancelled) {
+    // Operation was superseded by a newer one
+  }
+}
+```
+
+**Benefits**:
+- Automatic cancellation of stale operations
+- Timeout handling without losing late results
+- Prevents race conditions in rapid sequential operations
+
+#### ResourceLifecycle (`src/resource-lifecycle.js`)
+Use for **resources with complex lifecycle** (audio contexts, workers, database connections).
+
+**When to use**:
+- AudioContext management
+- Web Worker lifecycle
+- WebSocket connections
+- Any resource that needs initialization, usage, and cleanup phases
+
+**Example**:
+```javascript
+// In constructor
+this._lifecycle = new ResourceLifecycle('AudioContext');
+
+// Initialize
+await this._lifecycle.initialize(async () => {
+  this.ctx = new AudioContext();
+  // ... setup
+});
+
+// Use (with state check)
+this._lifecycle.assertReady(); // Throws if not ready
+// ... use this.ctx
+
+// Cleanup
+await this._lifecycle.close(async () => {
+  await this.ctx.suspend();
+  await this.ctx.close();
+  this.ctx = null;
+});
+```
+
+**Benefits**:
+- Prevents concurrent init/close operations
+- State machine enforces valid transitions
+- Eliminates resource leaks from incomplete cleanup
+
+#### ReadinessGate (`src/readiness-gate.js`)
+Use for **coordinating initialization order** between components.
+
+**When to use**:
+- Multi-component systems with dependencies
+- Waiting for external resources before proceeding
+- Preventing null reference errors during startup
+
+**Example**:
+```javascript
+// In constructor
+this._readiness = new ReadinessGate('MyComponent');
+this._readiness.register('sceneApi');
+this._readiness.register('audioEngine');
+
+// When dependency becomes available
+this._readiness.setReady('sceneApi');
+
+// Before using dependencies
+if (!this._readiness.isReady('sceneApi')) {
+  console.warn('Scene not ready');
+  return;
+}
+
+// Or wait for dependencies
+await this._readiness.whenReady(['sceneApi', 'audioEngine'], 5000);
+// Now safe to use both
+```
+
+**Benefits**:
+- Explicit dependency declaration
+- No null reference crashes
+- Clear error messages when dependencies missing
+
+#### Combining Patterns
+
+For complex systems, combine all three:
+
+```javascript
+class MyAudioProcessor {
+  constructor() {
+    this._lifecycle = new ResourceLifecycle('Processor');
+    this._asyncRegistry = new AsyncOperationRegistry('Processor');
+    this._readiness = new ReadinessGate('Processor');
+    this._readiness.register('audioContext');
+  }
+
+  async initialize() {
+    await this._lifecycle.initialize(async () => {
+      // Initialize resources
+      this._readiness.setReady('audioContext');
+    });
+  }
+
+  async processFile(file) {
+    this._lifecycle.assertReady();
+    await this._readiness.whenReady(['audioContext']);
+
+    const token = this._asyncRegistry.register('file-processing');
+    return await token.wrap(this._doProcess(file), 10000);
+  }
+
+  async dispose() {
+    await this._lifecycle.close(async () => {
+      this._asyncRegistry.cancelCategory('file-processing');
+      this._readiness.reset();
+    });
+  }
+}
+```
+
+**Pattern enforcement**: These patterns are **mandatory** for new audio/sync code. Code reviews should verify their usage.
+
 ## Working with Presets
 
 Presets capture the entire show state and are the primary way operators switch configurations during live performances.
