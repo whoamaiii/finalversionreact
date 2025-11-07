@@ -408,6 +408,17 @@ export class PerformanceMonitor {
     this._metrics.gpu.latest = this._gpuMetric.latest;
     this._metrics.gpu.avg = this._gpuMetric.average;
 
+    // GPU query leak detection (only check every 120 frames to reduce overhead)
+    if (this._gpu.supported && this._frameId % 120 === 0) {
+      const pendingCount = this._gpu.pending.length;
+      if (pendingCount > this._gpu.maxQueries * 2) {
+        console.error('[PerformanceMonitor] GPU query leak detected:',
+          pendingCount, 'queries pending (max:', this._gpu.maxQueries * 2, ')');
+        // Emergency cleanup
+        this._releaseAllGpuQueries();
+      }
+    }
+
     this._metrics.memory = { ...this._memoryStats };
 
     this._metrics.frameBudget.targetMs = targetMs;
@@ -704,7 +715,8 @@ export class PerformanceMonitor {
       pending.shift();
 
       if (!available && timedOut) {
-        this._releaseGpuQuery(query);
+        console.warn('[PerformanceMonitor] GPU query timed out, force releasing');
+        this._forceDeleteQuery(query); // Force delete timed-out queries
         continue;
       }
 
@@ -741,21 +753,52 @@ export class PerformanceMonitor {
 
   _releaseGpuQuery(query) {
     if (!query) return;
-    if (this._gpu.pool.length < this._gpu.maxQueries) {
-      this._gpu.pool.push(query);
+
+    const { gl, ext, isWebGL2 } = this._gpu;
+    if (!gl || !ext) {
+      // Context lost - can't delete, just drop reference
       return;
     }
 
+    // If pool is at capacity, forcibly delete oldest query first
+    if (this._gpu.pool.length >= this._gpu.maxQueries) {
+      const oldest = this._gpu.pool.shift();
+      try {
+        if (isWebGL2 && typeof gl.deleteQuery === 'function') {
+          gl.deleteQuery(oldest);
+        } else if (typeof ext.deleteQueryEXT === 'function') {
+          ext.deleteQueryEXT(oldest);
+        }
+      } catch (err) {
+        console.warn('[PerformanceMonitor] Failed to delete oldest query:', err);
+      }
+    }
+
+    // Add query to pool
+    this._gpu.pool.push(query);
+  }
+
+  /**
+   * Force delete a GPU query without pooling (for timed-out queries)
+   * @private
+   */
+  _forceDeleteQuery(query) {
+    if (!query) return;
+
     const { gl, ext, isWebGL2 } = this._gpu;
+
     try {
       if (isWebGL2 && typeof gl.deleteQuery === 'function') {
         gl.deleteQuery(query);
       } else if (typeof ext.deleteQueryEXT === 'function') {
         ext.deleteQueryEXT(query);
       }
-    } catch (_) {
-      // Ignore context-loss errors
+    } catch (err) {
+      // Context might be lost, suppress error but log for debugging
+      console.debug('[PerformanceMonitor] Force delete failed (expected if context lost):', err.message);
     }
+
+    // Don't add to pool - this query is being discarded
   }
 
   _releaseAllGpuQueries() {
