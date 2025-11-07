@@ -316,6 +316,12 @@ export class PerformanceMonitor {
   }
 
   beginFrame(startMs = now()) {
+    // Assert lifecycle is ready if available
+    if (this._lifecycle && !this._lifecycle.isReady) {
+      console.warn('[PerformanceMonitor] beginFrame called before ready, skipping');
+      return 0;
+    }
+
     this._pollGpuQueries();
 
     this._frameStartMs = startMs;
@@ -329,6 +335,12 @@ export class PerformanceMonitor {
   }
 
   endFrame(options = {}) {
+    // Assert lifecycle is ready if available
+    if (this._lifecycle && !this._lifecycle.isReady) {
+      console.warn('[PerformanceMonitor] endFrame called before ready, skipping');
+      return this._metrics;
+    }
+
     const {
       timestamp = now(),
       renderBudgetMs,
@@ -522,6 +534,11 @@ export class PerformanceMonitor {
   }
 
   dispose() {
+    // Check if already closing/closed via lifecycle
+    if (this._lifecycle && (this._lifecycle.is('closing') || this._lifecycle.is('closed'))) {
+      return; // Already being disposed
+    }
+
     this._disconnectObservers();
     this._releaseAllGpuQueries();
     this._renderer = null;

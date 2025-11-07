@@ -33,6 +33,7 @@ import { openPresetLibraryWindow } from './preset-library-window.js';
 import { PerformanceController } from './performance-pads.js';
 import PerformanceMonitor from './performance-monitor.js';
 import PerformanceHud from './performance-hud.js';
+import { ResourceLifecycle } from './resource-lifecycle.js';
 import { AutoSaveCoordinator } from './state/autoSaveCoordinator.js';
 import { SessionPersistence } from './storage/sessionPersistence.js';
 import { showRecoveryModal } from './recovery-modal.js';
@@ -69,8 +70,12 @@ if (audio) {
 let performanceHud = null;
 
 // Global performance monitor for Guardian system
-const performanceMonitor = (() => {
-  try {
+// Wrapped with ResourceLifecycle for proper state management
+let performanceMonitor = null;
+const performanceMonitorPromise = (() => {
+  const lifecycle = new ResourceLifecycle('PerformanceMonitor');
+  
+  return lifecycle.initialize(async () => {
     const monitor = new PerformanceMonitor({
       renderer: sceneApi?.state?.renderer ?? null,
       autoInstrumentRenderer: true,
@@ -84,32 +89,48 @@ const performanceMonitor = (() => {
         }
       },
     });
+    
+    // Store lifecycle reference for cleanup
+    monitor._lifecycle = lifecycle;
+    
     try { window.__performanceMonitor = monitor; } catch (_) {}
     return monitor;
-  } catch (err) {
+  }).then(monitor => {
+    if (monitor) {
+      lifecycle.assertReady();
+      performanceMonitor = monitor; // Store resolved value
+    }
+    return monitor;
+  }).catch(err => {
     console.warn('[PerformanceMonitor] init failed', err);
+    performanceMonitor = null;
     return null;
-  }
+  });
 })();
 
-if (performanceMonitor) {
-  try {
-    performanceHud = new PerformanceHud({
-      targetFpsProvider: () => sceneApi.state?.params?.targetFps || 60,
-      qualityProvider: () => ({
-        pixelRatio: sceneApi.getPixelRatio?.(),
-        pixelRatioCap: sceneApi.state?.params?.pixelRatioCap,
-        minPixelRatio: sceneApi.state?.params?.minPixelRatio,
-        autoResolution: !!sceneApi.state?.params?.autoResolution,
-        profile: sceneApi.state?.params?.effectsProfile,
-      }),
-    });
-    try { window.__performanceHud = performanceHud; } catch (_) {}
-  } catch (err) {
-    console.warn('[PerformanceHud] init failed', err);
-    performanceHud = null;
+// Initialize PerformanceHud once monitor is ready
+performanceMonitorPromise.then(monitor => {
+  if (monitor) {
+    try {
+      performanceHud = new PerformanceHud({
+        targetFpsProvider: () => sceneApi.state?.params?.targetFps || 60,
+        qualityProvider: () => ({
+          pixelRatio: sceneApi.getPixelRatio?.(),
+          pixelRatioCap: sceneApi.state?.params?.pixelRatioCap,
+          minPixelRatio: sceneApi.state?.params?.minPixelRatio,
+          autoResolution: !!sceneApi.state?.params?.autoResolution,
+          profile: sceneApi.state?.params?.effectsProfile,
+        }),
+      });
+      try { window.__performanceHud = performanceHud; } catch (_) {}
+    } catch (err) {
+      console.warn('[PerformanceHud] init failed', err);
+      performanceHud = null;
+    }
   }
-}
+}).catch(err => {
+  console.warn('[PerformanceMonitor] Failed to initialize:', err);
+});
 
 async function initAudioRoutingDetection() {
   try {
@@ -1042,7 +1063,9 @@ function animate() {
   
   const frameStart = performance.now();
   const pm = performanceMonitor;
-  if (pm) pm.beginFrame(frameStart);
+  if (pm && pm._lifecycle?.isReady) {
+    pm.beginFrame(frameStart);
+  }
   const now = frameStart;
   
   // If paused, skip updating and reset timers
@@ -1385,7 +1408,7 @@ function animate() {
     if (pm) pm.markSectionEnd('auto.resolution');
   }
 
-  if (pm) {
+  if (pm && pm._lifecycle?.isReady) {
     const frameEnd = performance.now();
     const targetFps = sceneApi.state?.params?.targetFps || 60;
     const renderBudgetMs = targetFps > 0 ? 1000 / targetFps : undefined;
@@ -1472,8 +1495,31 @@ function stopAnimation() {
     try { window.__performanceHud = null; } catch (_) {}
   }
 
-  // Clean up performance monitor
-  if (performanceMonitor && typeof performanceMonitor.dispose === 'function') {
+  // Clean up performance monitor using lifecycle wrapper
+  if (performanceMonitor && performanceMonitor._lifecycle) {
+    try {
+      // Use fire-and-forget pattern since stopAnimation may be called from beforeunload
+      // which can't wait for async operations
+      performanceMonitor._lifecycle.close(async () => {
+        if (typeof performanceMonitor.dispose === 'function') {
+          performanceMonitor.dispose();
+        }
+      }).catch(err => {
+        console.warn('Error cleaning up performance monitor:', err);
+      });
+    } catch (err) {
+      console.warn('Error initiating performance monitor cleanup:', err);
+      // Fallback to direct dispose if lifecycle.close fails
+      if (typeof performanceMonitor.dispose === 'function') {
+        try {
+          performanceMonitor.dispose();
+        } catch (disposeErr) {
+          console.warn('Error disposing performance monitor:', disposeErr);
+        }
+      }
+    }
+  } else if (performanceMonitor && typeof performanceMonitor.dispose === 'function') {
+    // Fallback if lifecycle not available
     try {
       performanceMonitor.dispose();
     } catch (err) {
@@ -1614,7 +1660,20 @@ async function checkStorageQuota() {
     // Modern browsers with Storage API
     if (navigator.storage && navigator.storage.estimate) {
       const estimate = await navigator.storage.estimate();
+      
+      // Validate quota values before calculation (some browsers return inconsistent values)
+      if (!estimate.quota || !estimate.usage || estimate.quota <= 0) {
+        console.debug('[Storage] Invalid quota estimate, skipping check');
+        return;
+      }
+      
       const percentUsed = (estimate.usage / estimate.quota) * 100;
+      
+      // Check for Infinity or invalid calculation
+      if (!isFinite(percentUsed)) {
+        console.warn('[Storage] Invalid quota calculation (Infinity or NaN)');
+        return;
+      }
 
       if (percentUsed >= QUOTA_WARNING_THRESHOLD * 100 && !_quotaWarningShown) {
         _quotaWarningShown = true;

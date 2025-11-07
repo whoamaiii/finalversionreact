@@ -796,16 +796,20 @@ export class PresetManager {
   _notify(event, detail) {
     let errorCount = 0;
     const errors = [];
+    const listenersToRemove = [];
 
-    for (const listener of this._listeners) {
+    for (let i = 0; i < this._listeners.length; i++) {
+      const listener = this._listeners[i];
       if (listener.event === event || listener.event === '*') {
         try {
           listener.handler({ event, detail });
         } catch (err) {
           errorCount++;
           errors.push(err);
+          // Mark listener for removal to prevent infinite error spam
+          listenersToRemove.push(i);
           // Log with context for debugging which listener failed
-          console.error('[PresetManager] Listener error:', {
+          console.error('[PresetManager] Listener error, removing:', {
             event,
             detail,
             error: err,
@@ -815,6 +819,11 @@ export class PresetManager {
           });
         }
       }
+    }
+
+    // Remove failing listeners (iterate backwards to maintain indices)
+    for (let i = listenersToRemove.length - 1; i >= 0; i--) {
+      this._listeners.splice(listenersToRemove[i], 1);
     }
 
     // If multiple listeners failed, log summary (indicates systemic issue)

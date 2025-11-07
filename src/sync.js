@@ -8,7 +8,9 @@ const STORAGE_KEY = 'reactive_sync_bridge_v1';
 const FEATURE_INTERVAL_MS = 33;
 const PARAM_PUSH_INTERVAL_MS = 1000; // Increased from 450ms to reduce localStorage write frequency for long-runtime stability
 const HEARTBEAT_INTERVAL_MS = 5000;
-const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 2 + 800;
+// Allow 2 missed beats before marking as disconnected (more tolerant to network latency)
+const HEARTBEAT_TOLERANCE_MULTIPLIER = 3; // Allow 2 missed beats
+const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * HEARTBEAT_TOLERANCE_MULTIPLIER;
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -541,6 +543,24 @@ export class SyncCoordinator {
       sentAt: Date.now(),
     };
 
+    // Check message size before sending (BroadcastChannel limit ~5MB)
+    const MAX_MESSAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+    try {
+      const msgSize = JSON.stringify(message).length;
+      if (msgSize > MAX_MESSAGE_SIZE_BYTES) {
+        console.error('[Sync] Message too large:', msgSize, 'bytes (max:', MAX_MESSAGE_SIZE_BYTES, ')');
+        // Try to show toast notification if available
+        if (typeof window !== 'undefined') {
+          import('./toast.js').then(({ showToast }) => {
+            showToast('Sync failed: State too large', 'error', 5000);
+          }).catch(() => {});
+        }
+        return;
+      }
+    } catch (err) {
+      console.error('[Sync] Failed to calculate message size:', err);
+    }
+
     // Track transport success for fallback handling
     let sentViaBroadcast = false;
     let sentViaPostMessage = false;
@@ -550,7 +570,15 @@ export class SyncCoordinator {
       try {
         this.channel.postMessage(message);
         sentViaBroadcast = true;
-      } catch (_) {}
+      } catch (err) {
+        console.error('[Sync] Failed to post message via BroadcastChannel:', err);
+        // Try to show toast notification if available
+        if (typeof window !== 'undefined') {
+          import('./toast.js').then(({ showToast }) => {
+            showToast('Sync failed', 'error', 3000);
+          }).catch(() => {});
+        }
+      }
     }
 
     // Try postMessage to windows

@@ -180,7 +180,9 @@ export class PerformanceController {
       if (k > 1e-6) {
         const snapT = p._snapRemainMs > 0 ? (p._snapRemainMs / Math.max(1, p.releaseSnapMs)) : 0;
         const snapEnv = snapT > 0 ? 1 - Math.pow(1 - snapT, 3) : 0;
-        const bounceTotalMs = clamp(this._beatMs * (p.releaseBounceBeats || 0.6), 80, 1600);
+        // Validate beat interval before use (prevent NaN propagation when BPM unavailable)
+        const beatInterval = this._beatMs > 0 && isFinite(this._beatMs) ? this._beatMs : 500; // Fallback to 120 BPM
+        const bounceTotalMs = clamp(beatInterval * (p.releaseBounceBeats || 0.6), 80, 1600);
         const br = p._bounceRemainMs > 0 ? (p._bounceRemainMs / Math.max(1, bounceTotalMs)) : 0;
         const bounceEnv = br > 0 ? Math.pow(br, 1.5) : 0;
         const phase = (1 - br) * Math.PI * 2.2; // ~2.2 oscillations over window
@@ -425,8 +427,12 @@ export class PerformanceController {
         if (!this.pad1.latched) {
           this.pad1._snapRemainMs = this.pad1.releaseSnapMs;
           // Calculate bounce duration from beat timing and releaseBounceBeats
-          const bounceDuration = this._beatMs * (this.pad1.releaseBounceBeats || 0.6);
-          this.pad1._bounceRemainMs = bounceDuration;
+          // Validate beat interval before use (prevent NaN propagation when BPM unavailable)
+          const beatInterval = this._beatMs > 0 && isFinite(this._beatMs) ? this._beatMs : 500; // Fallback to 120 BPM
+          const bounceDuration = beatInterval * (this.pad1.releaseBounceBeats || 0.6);
+          if (bounceDuration > 0 && isFinite(bounceDuration)) {
+            this.pad1._bounceRemainMs = bounceDuration;
+          }
         }
         this._broadcast({ key: '1', action: 'release', t: this.nowMs });
       }
@@ -475,8 +481,12 @@ export class PerformanceController {
         if (!this.pad1.latched) {
           this.pad1._snapRemainMs = this.pad1.releaseSnapMs;
           // Calculate bounce duration from beat timing and releaseBounceBeats
-          const bounceDuration = this._beatMs * (this.pad1.releaseBounceBeats || 0.6);
-          this.pad1._bounceRemainMs = bounceDuration;
+          // Validate beat interval before use (prevent NaN propagation when BPM unavailable)
+          const beatInterval = this._beatMs > 0 && isFinite(this._beatMs) ? this._beatMs : 500; // Fallback to 120 BPM
+          const bounceDuration = beatInterval * (this.pad1.releaseBounceBeats || 0.6);
+          if (bounceDuration > 0 && isFinite(bounceDuration)) {
+            this.pad1._bounceRemainMs = bounceDuration;
+          }
         }
       }
     } else if (k === '2') {

@@ -41,6 +41,17 @@ wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   console.log(`[WS] client connected from ${ip}`);
   clients.add(ws);
+
+  ws.on('error', (err) => {
+    console.error('[WS] Client error:', err);
+    clients.delete(ws);
+  });
+
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log('[WS] client disconnected');
+  });
+
   ws.on('message', (data) => {
     let msg;
     try {
@@ -109,7 +120,10 @@ wss.on('connection', (ws, req) => {
       send('/reactive/beatGrid/conf', bg.confidence || 0);
     }
   });
-  ws.on('close', () => { clients.delete(ws); console.log('[WS] client disconnected'); });
+});
+
+wss.on('error', (err) => {
+  console.error('[WS] Server error:', err);
 });
 
 function send(address, ...args) {
