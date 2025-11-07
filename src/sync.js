@@ -28,8 +28,10 @@ function deepMerge(target, source, seen = new WeakSet()) {
 
   // Detect circular references to prevent stack overflow
   if (seen.has(source)) {
-    console.warn('[deepMerge] Circular reference detected, skipping');
-    return target;
+    const error = new Error('deepMerge: Circular reference detected in source object');
+    error.code = 'CIRCULAR_REFERENCE';
+    console.error('[deepMerge] Circular reference detected:', error);
+    throw error;
   }
   seen.add(source);
 
@@ -171,19 +173,38 @@ function applySceneSnapshot(sceneApi, snapshot) {
     const nextDensity = typeof snapshot.outerShell.densityScale === 'number' ? snapshot.outerShell.densityScale : prevDensity;
     const needsRebuild = (typeof snapshot.outerShell.enabled === 'boolean' && nextEnabled !== prevEnabled)
       || (typeof snapshot.outerShell.densityScale === 'number' && nextDensity !== prevDensity);
-    deepMerge(params.outerShell, snapshot.outerShell);
+    try {
+      deepMerge(params.outerShell, snapshot.outerShell);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge outerShell:', err);
+      // Use shallow copy as fallback
+      params.outerShell = { ...snapshot.outerShell };
+    }
     if (needsRebuild) shouldRebuildParticles = true;
   }
 
   if (snapshot.map && typeof snapshot.map === 'object') {
     if (!params.map || typeof params.map !== 'object') params.map = {};
     if (snapshot.map.eye && (!params.map.eye || typeof params.map.eye !== 'object')) params.map.eye = {};
-    deepMerge(params.map, snapshot.map);
+    try {
+      deepMerge(params.map, snapshot.map);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge map:', err);
+      // Use shallow copy as fallback
+      params.map = { ...snapshot.map };
+      if (snapshot.map.eye) params.map.eye = { ...snapshot.map.eye };
+    }
   }
 
   if (snapshot.explosion && typeof snapshot.explosion === 'object') {
     if (!params.explosion || typeof params.explosion !== 'object') params.explosion = {};
-    deepMerge(params.explosion, snapshot.explosion);
+    try {
+      deepMerge(params.explosion, snapshot.explosion);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge explosion:', err);
+      // Use shallow copy as fallback
+      params.explosion = { ...snapshot.explosion };
+    }
   }
 
   if (shouldRebuildParticles) {
@@ -520,10 +541,19 @@ export class SyncCoordinator {
       sentAt: Date.now(),
     };
 
+    // Track transport success for fallback handling
+    let sentViaBroadcast = false;
+    let sentViaPostMessage = false;
+
+    // Try BroadcastChannel first
     if (this.channel) {
-      try { this.channel.postMessage(message); } catch (_) {}
+      try {
+        this.channel.postMessage(message);
+        sentViaBroadcast = true;
+      } catch (_) {}
     }
 
+    // Try postMessage to windows
     const directTargets = [];
     if (this.projectorWindow && !this.projectorWindow.closed) directTargets.push(this.projectorWindow);
     if (this.controlWindow && !this.controlWindow.closed) directTargets.push(this.controlWindow);
@@ -536,22 +566,40 @@ export class SyncCoordinator {
       }
     }
     for (const win of directTargets) {
-      try { win.postMessage(message, '*'); } catch (_) {}
+      try {
+        win.postMessage(message, '*');
+        sentViaPostMessage = true;
+      } catch (_) {}
     }
 
+    // Try localStorage
     if (useStorage && typeof localStorage !== 'undefined') {
       try {
         const payloadWithNonce = { ...message, nonce: Math.random().toString(36).slice(2) };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payloadWithNonce));
       } catch (err) {
-        // Log quota errors but don't disrupt sync operations
         if (err.name === 'QuotaExceededError') {
-          console.warn('[SyncCoordinator] localStorage quota exceeded, sync message dropped');
-          // Show warning once per session (avoid dynamic import to prevent memory accumulation)
-          if (!this._quotaWarningShown) {
-            this._quotaWarningShown = true;
-            // Use console.error for visibility (toast would require dynamic import)
-            console.error('[SyncCoordinator] Storage quota exceeded! Multi-window sync may be affected. Clear localStorage or close other tabs.');
+          const isCritical = ['hello', 'requestSnapshot', 'paramsSnapshot'].includes(type);
+
+          if (isCritical) {
+            // Show user-facing warning (once per session)
+            if (!this._quotaWarningShown) {
+              this._quotaWarningShown = true;
+              console.error('[SyncCoordinator] CRITICAL: localStorage full, sync may fail!');
+
+              // Show toast to user (async, don't block)
+              import('./toast.js')
+                .then(({ showToast }) => {
+                  showToast('Storage full! Multi-window sync degraded. Clear space.', 10000);
+                })
+                .catch(() => {});
+            }
+
+            // If we didn't send via other transports, this is a failure
+            if (!sentViaBroadcast && !sentViaPostMessage) {
+              console.error('[SyncCoordinator] FAILED to send critical message:', type,
+                '- No working transports available!');
+            }
           }
         }
       }

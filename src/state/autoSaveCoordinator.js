@@ -29,7 +29,7 @@ export class AutoSaveCoordinator {
     this.context = context;
     this.persistence = new SessionPersistence(options.storage);
     this.history = new SnapshotHistory(options.storage);
-    
+
     // State tracking
     this._lastSaveTime = 0;
     this._lastActivityTime = Date.now();
@@ -37,19 +37,28 @@ export class AutoSaveCoordinator {
     this._isSaving = false;
     this._saveIntervalId = null;
     this._isIdle = false;
-    
+
     // Event listeners
     this._listeners = new Map();
-    
+
     // Performance tracking
     this._saveCount = 0;
     this._saveErrors = 0;
-    
+
     // Error throttling and circuit breaker
     this._lastErrorLogTime = new Map(); // Track when we last logged each error type
     this._consecutiveErrors = 0;
     this._circuitBreakerOpen = false;
     this._circuitBreakerOpenTime = 0;
+    this._circuitBreakerResetCount = 0; // Track how many times we've reset
+    this._circuitBreakerMaxResets = 3; // After 3 resets, permanently disable
+    this._permanentFailureShown = false; // Track if we showed permanent failure toast
+
+    // Auto-cleanup on page unload to prevent memory leaks
+    this._unloadHandler = () => this.stop();
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', this._unloadHandler);
+    }
   }
 
   /**
@@ -73,18 +82,25 @@ export class AutoSaveCoordinator {
    * Stop auto-saving
    */
   stop() {
+    // Remove unload handler first
+    if (this._unloadHandler && typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this._unloadHandler);
+      this._unloadHandler = null;
+    }
+
+    // Clear interval
     if (this._saveIntervalId) {
       clearInterval(this._saveIntervalId);
       this._saveIntervalId = null;
     }
-    
+
     // Save final snapshot before stopping
     this.saveNow('shutdown');
-    
-    // Remove event listeners
+
+    // Remove activity event listeners
     this._removeEventListeners();
-    
-    console.log('[AutoSaveCoordinator] Stopped');
+
+    console.log('[AutoSaveCoordinator] Stopped and cleaned up');
   }
 
   /**
@@ -135,15 +151,39 @@ export class AutoSaveCoordinator {
     
     const now = Date.now();
     
-    // Check circuit breaker
+    // Check circuit breaker with exponential backoff
     if (this._circuitBreakerOpen) {
-      // Try to reset circuit breaker after timeout
-      if (now - this._circuitBreakerOpenTime > CIRCUIT_BREAKER_RESET_MS) {
+      // Calculate backoff time (exponential: 60s, 120s, 240s)
+      const backoffMs = CIRCUIT_BREAKER_RESET_MS * Math.pow(2, this._circuitBreakerResetCount);
+      const timeOpen = now - this._circuitBreakerOpenTime;
+
+      if (timeOpen > backoffMs) {
+        // Check if we've reset too many times
+        if (this._circuitBreakerResetCount >= this._circuitBreakerMaxResets) {
+          console.error('[AutoSaveCoordinator] Circuit breaker permanently open after',
+            this._circuitBreakerResetCount, 'resets. Auto-save disabled.');
+
+          // Show user notification (once)
+          if (!this._permanentFailureShown) {
+            this._permanentFailureShown = true;
+            import('./toast.js')
+              .then(({ showToast }) => {
+                showToast('Auto-save permanently disabled due to repeated failures. Check storage.', 10000);
+              })
+              .catch(() => {});
+          }
+          return; // Give up permanently
+        }
+
+        // Attempt reset
         this._circuitBreakerOpen = false;
-        this._consecutiveErrors = 0;
-        this._throttledLog('info', '[AutoSaveCoordinator] Circuit breaker reset, retrying saves');
+        this._circuitBreakerResetCount++;
+        this._throttledLog('info',
+          `[AutoSaveCoordinator] Circuit breaker reset attempt ${this._circuitBreakerResetCount}/${this._circuitBreakerMaxResets}`,
+          `Next backoff: ${backoffMs / 1000}s`);
       } else {
-        return; // Circuit breaker is open, skip save
+        // Still in backoff period
+        return;
       }
     }
     
@@ -173,8 +213,9 @@ export class AutoSaveCoordinator {
       const success = this.persistence.save(compressed);
       
       if (success) {
-        // Reset error tracking on success
+        // SUCCESS: Reset all error tracking
         this._consecutiveErrors = 0;
+        this._circuitBreakerResetCount = 0; // Reset the reset counter
         this._lastSaveTime = now;
         this._saveCount++;
         
@@ -224,21 +265,46 @@ export class AutoSaveCoordinator {
 
   /**
    * Throttled logging to prevent console spam
+   * Bug fix #14: Improved key generation and throttle indicator
    * @private
    */
   _throttledLog(level, ...args) {
     const now = Date.now();
-    const key = args.join('|');
+
+    // Better key generation: handle objects, errors, and non-string values
+    const key = args.map(arg => {
+      if (arg === null) return 'null';
+      if (arg === undefined) return 'undefined';
+      if (arg instanceof Error) return `Error:${arg.name}:${arg.message}`;
+      if (typeof arg === 'object') {
+        // Use a stable stringification for objects
+        try {
+          return JSON.stringify(arg);
+        } catch {
+          return String(arg); // Fallback for circular refs
+        }
+      }
+      return String(arg);
+    }).join('|');
+
     const lastLogTime = this._lastErrorLogTime.get(key) || 0;
-    
-    if (now - lastLogTime > ERROR_LOG_THROTTLE_MS) {
+    const timeSinceLastLog = now - lastLogTime;
+
+    if (timeSinceLastLog > ERROR_LOG_THROTTLE_MS) {
       this._lastErrorLogTime.set(key, now);
+
+      // Add throttle indicator if this was recently throttled
+      const wasThrottled = lastLogTime > 0;
+      const throttleIndicator = wasThrottled
+        ? `[throttled for ${Math.floor(timeSinceLastLog / 1000)}s]`
+        : '';
+
       if (level === 'error') {
-        console.error(...args);
+        console.error(...args, throttleIndicator);
       } else if (level === 'warn') {
-        console.warn(...args);
+        console.warn(...args, throttleIndicator);
       } else {
-        console.log(...args);
+        console.log(...args, throttleIndicator);
       }
     }
   }
@@ -369,12 +435,34 @@ export class AutoSaveCoordinator {
       saveErrors: this._saveErrors,
       consecutiveErrors: this._consecutiveErrors,
       circuitBreakerOpen: this._circuitBreakerOpen,
+      circuitBreakerResetCount: this._circuitBreakerResetCount,
+      circuitBreakerBackoffMs: this._circuitBreakerOpen
+        ? CIRCUIT_BREAKER_RESET_MS * Math.pow(2, this._circuitBreakerResetCount)
+        : 0,
       isIdle: this._isIdle,
       lastSaveTime: this._lastSaveTime,
       lastActivityTime: this._lastActivityTime,
       storageSize: this.persistence.getStorageSize(),
       historyStats: this.history.getStats(),
     };
+  }
+
+  /**
+   * Dispose of all resources and clean up references
+   * Call this when the coordinator is no longer needed
+   */
+  dispose() {
+    // Stop saves and remove all listeners
+    this.stop();
+
+    // Clear all references to prevent memory leaks
+    this.context = null;
+    this.persistence = null;
+    this.history = null;
+    this._eventSource = null;
+    this._lastErrorLogTime.clear();
+
+    console.log('[AutoSaveCoordinator] Disposed');
   }
 }
 

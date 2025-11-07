@@ -245,6 +245,11 @@ export class PresetManager {
     this._activePresetId = null;
     this._compareSnapshot = null;
 
+    // Listener leak detection
+    this._maxListeners = 50; // Reasonable threshold
+    this._listenerWarningShown = false;
+    this._loadCount = 0; // Track loads for periodic cleanup
+
     this._state = this._loadState();
     if (!this._state || typeof this._state !== 'object') {
       this._state = createEmptyState();
@@ -272,6 +277,21 @@ export class PresetManager {
 
   on(event, handler) {
     if (typeof handler !== 'function') return () => {};
+
+    // Check for excessive listeners
+    if (this._listeners.size >= this._maxListeners && !this._listenerWarningShown) {
+      this._listenerWarningShown = true;
+      console.error('[PresetManager] MEMORY LEAK WARNING: Listener count exceeded',
+        this._maxListeners, 'listeners. Check for missing cleanup.');
+
+      // Log listener breakdown for debugging
+      const eventCounts = {};
+      for (const l of this._listeners) {
+        eventCounts[l.event] = (eventCounts[l.event] || 0) + 1;
+      }
+      console.table(eventCounts);
+    }
+
     const wrapped = { event, handler };
     this._listeners.add(wrapped);
     return () => this._listeners.delete(wrapped);
@@ -430,6 +450,11 @@ export class PresetManager {
   }
 
   load(identifier, options = {}) {
+    // Periodic cleanup every 10 loads
+    if ((++this._loadCount % 10) === 0) {
+      this._cleanupDuplicateListeners();
+    }
+
     const id = identifier || this.activePresetId;
     const target = this._resolvePreset(id);
     if (!target) throw new Error(`Preset not found for load: ${id}`);
@@ -821,9 +846,38 @@ export class PresetManager {
    * Cleanup method to remove all event listeners and prevent memory leaks
    * CRITICAL: Call this when disposing of the PresetManager instance
    */
+  _cleanupDuplicateListeners() {
+    // Remove duplicate event+handler pairs (can happen with HMR)
+    const seen = new Map();
+    const toRemove = [];
+
+    for (const listener of this._listeners) {
+      // Create fingerprint of handler (first 100 chars of function body)
+      const handlerStr = listener.handler.toString().slice(0, 100);
+      const key = `${listener.event}:${handlerStr}`;
+
+      if (seen.has(key)) {
+        toRemove.push(listener);
+      } else {
+        seen.set(key, listener);
+      }
+    }
+
+    for (const listener of toRemove) {
+      this._listeners.delete(listener);
+    }
+
+    if (toRemove.length > 0) {
+      console.log('[PresetManager] Cleaned up', toRemove.length, 'duplicate listeners');
+      // Reset warning flag so it can trigger again if needed
+      this._listenerWarningShown = false;
+    }
+  }
+
   cleanup() {
     // Clear all event listeners to prevent memory leaks
     this._listeners.clear();
+    this._listenerWarningShown = false;
 
     // Clear references that might prevent garbage collection
     this._previousSnapshot = null;

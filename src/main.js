@@ -47,8 +47,9 @@ if (new URLSearchParams(location.search).has('debug')) {
 const sessionRecoveryGate = new ReadinessGate('SessionRecovery');
 const SESSION_RECOVERY_DEPENDENCIES = ['sceneApi', 'audioEngine', 'presetManager'];
 const SESSION_RECOVERY_READY_TIMEOUT_MS = 5000;
-let recoveryModalRequested = false;
-let recoveryModalShown = false;
+
+// Promise-based locking for modal to prevent race conditions
+let _recoveryModalPromise = null;
 
 SESSION_RECOVERY_DEPENDENCIES.forEach((dependency) => sessionRecoveryGate.register(dependency));
 
@@ -194,44 +195,68 @@ const SESSION_START_TIME_KEY = 'cosmic_session_start_time';
 let crashedSessionDetected = false;
 let crashedSnapshot = null;
 
-function requestSessionRecoveryModal(snapshot) {
+/**
+ * Request session recovery modal (with race condition protection)
+ * Uses promise-based locking to ensure only ONE modal is ever created
+ */
+async function requestSessionRecoveryModal(snapshot) {
   if (!snapshot) return;
-  if (recoveryModalRequested) {
-    crashedSnapshot = snapshot;
-    return;
+
+  // If modal already requested, return existing promise
+  if (_recoveryModalPromise) {
+    console.log('[SessionRecovery] Modal already requested, returning existing promise');
+    return _recoveryModalPromise;
   }
 
-  recoveryModalRequested = true;
-  crashedSnapshot = snapshot;
-
-  const presentModal = () => {
-    if (recoveryModalShown) return;
-
+  // Create new modal promise with atomic locking
+  _recoveryModalPromise = (async () => {
     try {
-      recoveryModalShown = true;
-      showRecoveryModal({
+      // Wait for dependencies to be ready
+      await sessionRecoveryGate.whenReady(
+        SESSION_RECOVERY_DEPENDENCIES,
+        SESSION_RECOVERY_READY_TIMEOUT_MS
+      );
+
+      // Double-check: DOM check after async boundary to prevent duplicate modals
+      const existingModal = document.querySelector('.recovery-modal-overlay');
+      if (existingModal) {
+        console.log('[SessionRecovery] Modal already exists in DOM, skipping');
+        return;
+      }
+
+      console.log('[SessionRecovery] Presenting recovery modal');
+
+      // Show modal
+      const modal = showRecoveryModal({
         snapshot,
         context: { sceneApi, audioEngine: audio, presetManager },
         onRestore: (state, context) => {
           restoreCrashedSession(state, context);
+          // Clear promise when modal closes
+          _recoveryModalPromise = null;
         },
         onStartFresh: (_snapshot) => {
           console.log('[SessionRecovery] Starting fresh, snapshot archived');
+          // Clear promise when modal closes
+          _recoveryModalPromise = null;
         },
       });
-    } catch (err) {
-      recoveryModalShown = false;
-      recoveryModalRequested = false;
-      console.error('[SessionRecovery] Failed to present recovery modal:', err);
-    }
-  };
 
-  sessionRecoveryGate.whenReady(SESSION_RECOVERY_DEPENDENCIES, SESSION_RECOVERY_READY_TIMEOUT_MS)
-    .then(presentModal)
-    .catch((err) => {
-      console.warn('[SessionRecovery] Recovery dependencies not ready in time, showing modal anyway.', err);
-      presentModal();
-    });
+      return modal;
+    } catch (err) {
+      console.error('[SessionRecovery] Failed to present recovery modal:', err);
+
+      // Reset promise after delay to allow retry
+      setTimeout(() => {
+        _recoveryModalPromise = null;
+        console.log('[SessionRecovery] Promise reset, retry allowed after 5s');
+      }, 5000);
+
+      throw err;
+    }
+  })();
+
+  return _recoveryModalPromise;
 }
 
 try {
@@ -1447,10 +1472,19 @@ function stopAnimation() {
     try { window.__performanceHud = null; } catch (_) {}
   }
 
-  // Clean up auto-save coordinator
-  if (autoSaveCoordinator && typeof autoSaveCoordinator.stop === 'function') {
+  // Clean up performance monitor
+  if (performanceMonitor && typeof performanceMonitor.dispose === 'function') {
     try {
-      autoSaveCoordinator.stop();
+      performanceMonitor.dispose();
+    } catch (err) {
+      console.warn('Error cleaning up performance monitor:', err);
+    }
+  }
+
+  // Clean up auto-save coordinator
+  if (autoSaveCoordinator && typeof autoSaveCoordinator.dispose === 'function') {
+    try {
+      autoSaveCoordinator.dispose();
     } catch (err) {
       console.warn('Error cleaning up auto-save coordinator:', err);
     }

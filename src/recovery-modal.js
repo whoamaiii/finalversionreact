@@ -375,16 +375,18 @@ export function showRecoveryModal({ snapshot, context, onRestore, onStartFresh }
   }
 
   // Close on overlay click (outside modal)
+  // Bug fix: Just close modal without triggering an action
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) {
-      handleStartFresh(); // Default to start fresh if clicking outside
+      close(); // Just close, don't trigger action
     }
   });
 
   // Close on Escape key
+  // Bug fix: Just close modal without triggering an action
   const escapeHandler = (e) => {
     if (e.key === 'Escape') {
-      handleStartFresh();
+      close(); // Just close, don't trigger action
       document.removeEventListener('keydown', escapeHandler);
     }
   };

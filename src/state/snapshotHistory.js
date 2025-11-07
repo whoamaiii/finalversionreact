@@ -17,6 +17,7 @@ const PRUNE_RULES = {
   keepAllMinutes: 30,      // Keep all snapshots from last 30 minutes
   keepHourlyHours: 4,       // Keep 1 per hour for last 4 hours
   keepDailyDays: 7,         // Keep 1 per day for last 7 days
+  minSnapshotsToKeep: 5,   // Always keep at least N snapshots
 };
 
 export class SnapshotHistory {
@@ -213,6 +214,12 @@ export class SnapshotHistory {
       }
     }).filter(Boolean);
 
+    // Safety check: Don't prune if we don't have many snapshots
+    if (snapshots.length <= PRUNE_RULES.minSnapshotsToKeep) {
+      console.log('[SnapshotHistory] Too few snapshots to prune, skipping');
+      return;
+    }
+
     // Group by time windows
     const recent = []; // < 30 minutes
     const hourly = []; // 30 minutes - 4 hours
@@ -286,9 +293,23 @@ export class SnapshotHistory {
       }
     });
 
+    // Safety check: Don't prune if we'd drop below minimum
+    if (keep.length < PRUNE_RULES.minSnapshotsToKeep) {
+      console.warn('[SnapshotHistory] Pruning would reduce snapshots below minimum,',
+        'skipping prune. Current:', snapshots.length, 'Would keep:', keep.length);
+      return;
+    }
+
     // Update snapshots array
     const keepTimestamps = new Set(keep.map(item => item.timestamp));
+    const beforePrune = this._snapshots.length;
     this._snapshots = this._snapshots.filter(item => keepTimestamps.has(item.timestamp));
+    const afterPrune = this._snapshots.length;
+
+    if (beforePrune !== afterPrune) {
+      console.log('[SnapshotHistory] Pruned', beforePrune - afterPrune,
+        'snapshots. Remaining:', afterPrune);
+    }
   }
 
   /**
