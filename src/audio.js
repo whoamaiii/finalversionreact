@@ -261,6 +261,7 @@ export class AudioEngine {
     this._graphConnected = false;
     this._workletInitAttempted = false;
     this._workletFrameTimestamp = 0;
+    this._workletDraining = false; // Flag to allow graceful worklet message draining during stop()
 
     this._aubioPromise = null;
     this._aubioModule = null;
@@ -627,7 +628,10 @@ export class AudioEngine {
   async loadFile(file) {
     await this.ensureContext();
     this.stop(); // Stop any existing audio
-    
+
+    // Clear draining flag when starting new audio file to accept new worklet messages
+    this._workletDraining = false;
+
     // Decode the audio file into an AudioBuffer
     const arrayBuf = await file.arrayBuffer();
     const audioBuf = await this.ctx.decodeAudioData(arrayBuf);
@@ -764,14 +768,21 @@ export class AudioEngine {
     this._flushAubioQueue();
     this._disposeLiveBuffer();
 
-    // Reset worklet state and clear port handler to prevent message accumulation
+    // Gracefully drain worklet messages before clearing handler to prevent audio analysis gaps
     if (this.workletNode) {
       try {
         this.workletNode.port.postMessage({ type: 'reset' });
-        // Clear port message handler to prevent accumulation during pause/resume cycles
-        if (this.workletNode.port) {
-          this.workletNode.port.onmessage = null;
-        }
+
+        // Set draining flag to discard new messages but keep handler alive
+        this._workletDraining = true;
+
+        // Allow 200ms for in-flight messages to drain before clearing handler
+        setTimeout(() => {
+          if (this.workletNode?.port) {
+            this.workletNode.port.onmessage = null;
+          }
+          this._workletDraining = false;
+        }, 200);
       } catch (_) {}
     }
 
@@ -810,6 +821,9 @@ export class AudioEngine {
   // Webcam feature removed: startWebcam/stopWebcam et al removed
 
   _useStream(stream) {
+    // Clear draining flag when starting new audio source to accept new worklet messages
+    this._workletDraining = false;
+
     // Defensive check: ensure context exists before creating nodes
     if (!this.ctx) {
       console.error('Audio context not initialized');
@@ -1198,6 +1212,12 @@ export class AudioEngine {
   }
 
   _handleWorkletMessage(event) {
+    // Discard messages during draining to prevent audio analysis gaps during source switches
+    // Keep handler alive to allow in-flight messages to complete gracefully
+    if (this._workletDraining) {
+      return;
+    }
+
     const data = event?.data;
     if (!data || data.type !== 'frame') return;
     const frameId = typeof data.frameId === 'number' ? data.frameId : this._workletFrameId + 1;
