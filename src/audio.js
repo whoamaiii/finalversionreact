@@ -1016,7 +1016,17 @@ export class AudioEngine {
   }
 
   async _doNoiseGateCalibration(durationMs) {
-    await this.ensureContext();
+    const ENSURE_CONTEXT_TIMEOUT_MS = 10000;
+    try {
+      await Promise.race([
+        this.ensureContext(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('[AudioEngine] ensureContext timeout during noise gate calibration')), ENSURE_CONTEXT_TIMEOUT_MS)),
+      ]);
+    } catch (err) {
+      console.warn('[AudioEngine] Noise gate calibration aborted:', err);
+      return 0;
+    }
+
     if (!this.analyser || !this.sampleRate) return 0;
 
     const wasEnabled = !!this.noiseGateEnabled;

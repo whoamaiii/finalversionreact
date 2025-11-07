@@ -36,6 +36,7 @@ import PerformanceHud from './performance-hud.js';
 import { AutoSaveCoordinator } from './state/autoSaveCoordinator.js';
 import { SessionPersistence } from './storage/sessionPersistence.js';
 import { showRecoveryModal } from './recovery-modal.js';
+import { ReadinessGate } from './readiness-gate.js';
 
 // Debug mode: print browser feature support matrix when ?debug is in the URL
 // This helps developers understand what capabilities are available
@@ -43,12 +44,26 @@ if (new URLSearchParams(location.search).has('debug')) {
   printFeatureMatrix();
 }
 
+const sessionRecoveryGate = new ReadinessGate('SessionRecovery');
+const SESSION_RECOVERY_DEPENDENCIES = ['sceneApi', 'audioEngine', 'presetManager'];
+const SESSION_RECOVERY_READY_TIMEOUT_MS = 5000;
+let recoveryModalRequested = false;
+let recoveryModalShown = false;
+
+SESSION_RECOVERY_DEPENDENCIES.forEach((dependency) => sessionRecoveryGate.register(dependency));
+
 // Initialize the 3D scene and get its API
 // The scene handles all the visual rendering (particles, shaders, etc.)
 const sceneApi = initScene();
+if (sceneApi) {
+  sessionRecoveryGate.setReady('sceneApi');
+}
 
 // Create the audio engine that processes audio and extracts features
 const audio = new AudioEngine();
+if (audio) {
+  sessionRecoveryGate.setReady('audioEngine');
+}
 
 let performanceHud = null;
 
@@ -166,6 +181,9 @@ const sync = new SyncCoordinator({ role: resolveRoleFromUrl(location.search), sc
 
 // Preset manager orchestrates capture, persistence, and live preset operations
 const presetManager = new PresetManager({ sceneApi, audioEngine: audio });
+if (presetManager) {
+  sessionRecoveryGate.setReady('presetManager');
+}
 
 // Session Recovery System - Phase 1: Continuous State Snapshotting
 // =================================================================
@@ -175,6 +193,47 @@ const SESSION_START_TIME_KEY = 'cosmic_session_start_time';
 // Check for crash on startup
 let crashedSessionDetected = false;
 let crashedSnapshot = null;
+
+function requestSessionRecoveryModal(snapshot) {
+  if (!snapshot) return;
+  if (recoveryModalRequested) {
+    crashedSnapshot = snapshot;
+    return;
+  }
+
+  recoveryModalRequested = true;
+  crashedSnapshot = snapshot;
+
+  const presentModal = () => {
+    if (recoveryModalShown) return;
+
+    try {
+      recoveryModalShown = true;
+      showRecoveryModal({
+        snapshot,
+        context: { sceneApi, audioEngine: audio, presetManager },
+        onRestore: (state, context) => {
+          restoreCrashedSession(state, context);
+        },
+        onStartFresh: (_snapshot) => {
+          console.log('[SessionRecovery] Starting fresh, snapshot archived');
+        },
+      });
+    } catch (err) {
+      recoveryModalShown = false;
+      recoveryModalRequested = false;
+      console.error('[SessionRecovery] Failed to present recovery modal:', err);
+    }
+  };
+
+  sessionRecoveryGate.whenReady(SESSION_RECOVERY_DEPENDENCIES, SESSION_RECOVERY_READY_TIMEOUT_MS)
+    .then(presentModal)
+    .catch((err) => {
+      console.warn('[SessionRecovery] Recovery dependencies not ready in time, showing modal anyway.', err);
+      presentModal();
+    });
+}
+
 try {
   const wasActive = localStorage.getItem(SESSION_ACTIVE_KEY) === 'true';
   if (wasActive) {
@@ -192,21 +251,7 @@ try {
           crashedSnapshot = StateSnapshot.decompress(compressed);
           console.log('[SessionRecovery] Loaded crashed snapshot:', crashedSnapshot.getDescription());
           
-          // Show recovery modal after a brief delay to ensure UI is ready
-          setTimeout(() => {
-            showRecoveryModal({
-              snapshot: crashedSnapshot,
-              context: { sceneApi, audioEngine: audio, presetManager },
-              onRestore: (snapshot, context) => {
-                // Restore snapshot
-                restoreCrashedSession(snapshot, context);
-              },
-              onStartFresh: (snapshot) => {
-                // Archive snapshot to history (Phase 3 will handle this)
-                console.log('[SessionRecovery] Starting fresh, snapshot archived');
-              },
-            });
-          }, 500);
+          requestSessionRecoveryModal(crashedSnapshot);
         } catch (err) {
           console.error('[SessionRecovery] Failed to decompress crashed snapshot:', err);
         }
@@ -646,9 +691,10 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   featureWsLastAttemptMs = now;
   featureWsAttemptCount += 1;
 
+  let ws;
   try {
     // Create new WebSocket connection with unique instance ID
-    const ws = new WebSocket(FEATURE_WS_URL);
+    ws = new WebSocket(FEATURE_WS_URL);
     const instanceId = ++featureWsInstanceId;
     ws._instanceId = instanceId; // Tag for validation
 
@@ -688,6 +734,19 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
 
     featureWs = ws;
   } catch (_) {
+    if (ws) {
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      } catch (closeErr) {
+        // Ignore cleanup errors
+      }
+    }
     // If connection fails, reset state
     featureWsConnected = false;
     featureWsConnecting = false;
