@@ -265,21 +265,46 @@ export class AutoSaveCoordinator {
 
   /**
    * Throttled logging to prevent console spam
+   * Bug fix #14: Improved key generation and throttle indicator
    * @private
    */
   _throttledLog(level, ...args) {
     const now = Date.now();
-    const key = args.join('|');
+
+    // Better key generation: handle objects, errors, and non-string values
+    const key = args.map(arg => {
+      if (arg === null) return 'null';
+      if (arg === undefined) return 'undefined';
+      if (arg instanceof Error) return `Error:${arg.name}:${arg.message}`;
+      if (typeof arg === 'object') {
+        // Use a stable stringification for objects
+        try {
+          return JSON.stringify(arg);
+        } catch {
+          return String(arg); // Fallback for circular refs
+        }
+      }
+      return String(arg);
+    }).join('|');
+
     const lastLogTime = this._lastErrorLogTime.get(key) || 0;
-    
-    if (now - lastLogTime > ERROR_LOG_THROTTLE_MS) {
+    const timeSinceLastLog = now - lastLogTime;
+
+    if (timeSinceLastLog > ERROR_LOG_THROTTLE_MS) {
       this._lastErrorLogTime.set(key, now);
+
+      // Add throttle indicator if this was recently throttled
+      const wasThrottled = lastLogTime > 0;
+      const throttleIndicator = wasThrottled
+        ? `[throttled for ${Math.floor(timeSinceLastLog / 1000)}s]`
+        : '';
+
       if (level === 'error') {
-        console.error(...args);
+        console.error(...args, throttleIndicator);
       } else if (level === 'warn') {
-        console.warn(...args);
+        console.warn(...args, throttleIndicator);
       } else {
-        console.log(...args);
+        console.log(...args, throttleIndicator);
       }
     }
   }

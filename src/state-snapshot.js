@@ -109,26 +109,35 @@ export class StateSnapshot {
 
     // Try to determine current audio source
     const source = audioEngine.source;
-    if (!source) return null;
+    if (!source || typeof source !== 'object') return null;
 
+    // Bug fix #13: Add defensive null checks to prevent TypeErrors
     // Check if it's a MediaStream (mic/system audio)
-    if (source.mediaStream) {
+    if (source.mediaStream && typeof source.mediaStream === 'object') {
       const stream = source.mediaStream;
-      const tracks = stream.getAudioTracks();
-      const track = tracks?.[0];
-      
-      if (track) {
-        const settings = track.getSettings();
-        return {
-          type: 'mic', // Could be mic or system audio
-          deviceId: settings.deviceId || null,
-          deviceLabel: track.label || null,
-        };
+
+      // Verify stream has getAudioTracks method before calling
+      if (typeof stream.getAudioTracks === 'function') {
+        const tracks = stream.getAudioTracks();
+        const track = tracks?.[0];
+
+        if (track && typeof track.getSettings === 'function') {
+          try {
+            const settings = track.getSettings();
+            return {
+              type: 'mic', // Could be mic or system audio
+              deviceId: settings?.deviceId || null,
+              deviceLabel: track.label || null,
+            };
+          } catch (err) {
+            console.warn('[StateSnapshot] Failed to get track settings:', err);
+          }
+        }
       }
     }
 
     // Check if it's an AudioBufferSourceNode (file)
-    if (source.buffer) {
+    if (source.buffer && typeof source.buffer === 'object') {
       return {
         type: 'file',
         deviceId: null,

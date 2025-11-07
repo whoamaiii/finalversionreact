@@ -998,20 +998,27 @@ export class AudioEngine {
    * @returns {Promise<number>} resolved gate threshold (0..1)
    */
   async calibrateNoiseGate(durationMs = 5000) {
-    // Use Promise-based locking to prevent concurrent calibration loops
-    // If calibration is already running, wait for it to complete
-    if (this._noiseGateCalibrationPromise) {
-      return await this._noiseGateCalibrationPromise;
-    }
-
-    // Start new calibration and store the Promise
-    this._noiseGateCalibrationPromise = this._doNoiseGateCalibration(durationMs);
+    // Bug fix #11: Use AsyncOperationRegistry to prevent concurrent calibration
+    // Automatically cancels previous calibration if a new one starts
+    const token = this._asyncRegistry.register('noise-gate-calibration', {
+      timeout: durationMs + 10000, // Calibration duration + 10s buffer for ensureContext
+      onCancel: (reason) => {
+        console.log('[AudioEngine] Noise gate calibration cancelled:', reason);
+      }
+    });
 
     try {
-      return await this._noiseGateCalibrationPromise;
-    } finally {
-      // Always clear the Promise when done (success or failure)
-      this._noiseGateCalibrationPromise = null;
+      // Wrap the calibration operation with the token for automatic superseding
+      return await token.wrap(this._doNoiseGateCalibration(durationMs));
+    } catch (err) {
+      if (err.isCancelled) {
+        console.log('[AudioEngine] Calibration cancelled, likely superseded by newer request');
+        throw err; // Let caller handle cancellation
+      } else if (err.isTimeout) {
+        console.warn('[AudioEngine] Calibration timeout, returning previous threshold');
+        return this.noiseGateThreshold || 0;
+      }
+      throw err;
     }
   }
 
