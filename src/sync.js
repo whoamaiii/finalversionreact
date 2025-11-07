@@ -2,6 +2,7 @@
 // postMessage, and localStorage heartbeat fallbacks.
 
 import { ReadinessGate } from './readiness-gate.js';
+import { ListenerManager } from './listener-manager.js';
 
 const CHANNEL_NAME = 'reactive-sync-v1';
 const STORAGE_KEY = 'reactive_sync_bridge_v1';
@@ -225,6 +226,9 @@ export class SyncCoordinator {
       this._readiness.setReady('sceneApi');
     }
 
+    // Listener manager for guaranteed cleanup
+    this._listenerMgr = new ListenerManager('SyncCoordinator');
+
     this.channel = null;
     this.projectorWindow = null;
     this.controlWindow = null;
@@ -258,6 +262,10 @@ export class SyncCoordinator {
   }
 
   _initTransports() {
+    // Clean up ALL existing listeners first (guaranteed cleanup)
+    // This prevents listener duplication on reconnection
+    this._listenerMgr.removeAll();
+
     // Close existing BroadcastChannel if present
     if (this.channel) {
       try {
@@ -269,36 +277,38 @@ export class SyncCoordinator {
     if (typeof BroadcastChannel === 'function') {
       try {
         this.channel = new BroadcastChannel(CHANNEL_NAME);
+        // Use onmessage for BroadcastChannel (not tracked by ListenerManager since it's a property setter)
         this.channel.onmessage = (event) => this._handleMessage(event?.data, 'broadcast');
       } catch (err) {
-        console.warn('BroadcastChannel unavailable', err);
+        console.warn('[Sync] BroadcastChannel unavailable', err);
         this.channel = null;
       }
     }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      // Always attempt to remove old handlers first (safe even if undefined/null)
-      // This prevents handler duplication on re-initialization
-      window.removeEventListener('message', this._messageHandler);
-      window.removeEventListener('storage', this._storageHandler);
+      // Create bound handler references (only once per instance)
+      if (!this._messageHandler) {
+        this._messageHandler = (event) => {
+          this._handleMessage(event?.data, 'postMessage', event.source || null);
+        };
+      }
+      if (!this._storageHandler) {
+        this._storageHandler = (event) => {
+          if (event.key !== STORAGE_KEY || !event.newValue) return;
+          try {
+            const parsed = JSON.parse(event.newValue);
+            this._handleMessage(parsed, 'storage');
+          } catch (_) {
+            // ignore parse errors
+          }
+        };
+      }
 
-      // Store handler references for cleanup
-      this._messageHandler = (event) => {
-        this._handleMessage(event?.data, 'postMessage', event.source || null);
-      };
-      this._storageHandler = (event) => {
-        if (event.key !== STORAGE_KEY || !event.newValue) return;
-        try {
-          const parsed = JSON.parse(event.newValue);
-          this._handleMessage(parsed, 'storage');
-        } catch (_) {
-          // ignore
-        }
-      };
-
-      window.addEventListener('message', this._messageHandler);
-      window.addEventListener('storage', this._storageHandler);
+      // Add listeners with tracking (guaranteed cleanup)
+      this._listenerMgr.add(window, 'message', this._messageHandler);
+      this._listenerMgr.add(window, 'storage', this._storageHandler);
     }
+
     if (this.role === 'receiver' && typeof window !== 'undefined') {
       if (window.opener && !window.opener.closed) this.controlWindow = window.opener;
     }
@@ -458,8 +468,43 @@ export class SyncCoordinator {
       sentAt: Date.now(),
     };
 
+    // Validate message size before sending (prevent silent failures)
+    try {
+      const serialized = JSON.stringify(message);
+      const sizeBytes = new Blob([serialized]).size;
+      const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(2);
+
+      // BroadcastChannel has a ~5MB limit
+      if (sizeBytes > 5000000) {
+        console.error(`[Sync] Message too large: ${sizeMB}MB (limit: 5MB)`);
+        console.error(`[Sync] Message type: ${type}, target: ${target}`);
+
+        // Show user notification for large state
+        if (typeof showToast === 'function') {
+          try {
+            showToast(`Sync failed: State too large (${sizeMB}MB). Reduce particle density or simplify scene.`, 'error');
+          } catch (_) {}
+        }
+
+        return false; // Don't send
+      }
+
+      // Warn about large messages (>1MB)
+      if (sizeBytes > 1000000) {
+        console.warn(`[Sync] Large message: ${sizeMB}MB (type: ${type})`);
+      }
+    } catch (err) {
+      console.error('[Sync] Error validating message size:', err);
+      // Continue anyway - validation failure shouldn't block sync
+    }
+
+    // Send via BroadcastChannel
     if (this.channel) {
-      try { this.channel.postMessage(message); } catch (_) {}
+      try {
+        this.channel.postMessage(message);
+      } catch (err) {
+        console.error('[Sync] BroadcastChannel send error:', err.message);
+      }
     }
 
     const directTargets = [];
@@ -660,24 +705,21 @@ export class SyncCoordinator {
       this._helloTimerId = null;
     }
 
-    // Remove event listeners if they exist
-    if (this._messageHandler) {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('message', this._messageHandler);
-      }
-      this._messageHandler = null;
-    }
-    if (this._storageHandler) {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('storage', this._storageHandler);
-      }
-      this._storageHandler = null;
-    }
+    // Remove ALL event listeners (guaranteed cleanup)
+    this._listenerMgr.removeAll();
+
+    // Clear handler references
+    this._messageHandler = null;
+    this._storageHandler = null;
 
     // Close BroadcastChannel if it exists
     if (this.channel) {
       this.channel.onmessage = null;
-      this.channel.close();
+      try {
+        this.channel.close();
+      } catch (err) {
+        console.warn('[Sync] Error closing BroadcastChannel:', err);
+      }
       this.channel = null;
     }
 

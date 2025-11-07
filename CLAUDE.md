@@ -312,6 +312,113 @@ class MyAudioProcessor {
 
 **Pattern enforcement**: These patterns are **mandatory** for new audio/sync code. Code reviews should verify their usage.
 
+### Resilience Patterns
+
+**IMPORTANT**: In addition to async lifecycle management, this codebase uses resilience patterns to handle failure gracefully and prevent resource leaks.
+
+#### withRetry() (`src/with-retry.js`)
+Use for **network operations and CDN loads** that may fail transiently.
+
+**When to use**:
+- Loading external libraries from CDN
+- Network requests (API calls, asset loading)
+- Any operation that might fail due to temporary network issues
+
+**Example**:
+```javascript
+import { withRetry, RetryPresets } from './with-retry.js';
+
+// Basic usage - 3 attempts, exponential backoff
+const data = await withRetry(() => fetch('/api/data'));
+
+// Custom configuration
+const module = await withRetry(
+  () => import(/* @vite-ignore */ cdnUrl),
+  {
+    ...RetryPresets.cdn, // Use CDN preset
+    maxAttempts: 5,
+    onRetry: (attempt, err, delay) => {
+      console.log(`Retry ${attempt} after ${delay}ms...`);
+    }
+  }
+);
+
+// With specific retry conditions
+const result = await withRetry(
+  () => loadResource(),
+  {
+    shouldRetry: (err) => {
+      // Only retry network errors, not 404s
+      return err.name === 'NetworkError' || err.statusCode >= 500;
+    }
+  }
+);
+```
+
+**Benefits**:
+- Automatic exponential backoff (prevents hammering failed services)
+- Configurable retry conditions
+- Graceful degradation on complete failure
+- Pre-configured presets for common scenarios
+
+**Presets available**:
+- `RetryPresets.network` - 3 attempts, 1s base delay
+- `RetryPresets.cdn` - 5 attempts, 2s base delay
+- `RetryPresets.quick` - 2 attempts, 500ms fixed delay
+- `RetryPresets.patient` - 10 attempts, linear backoff
+
+#### ListenerManager (`src/listener-manager.js`)
+Use for **event listener lifecycle management** to guarantee cleanup.
+
+**When to use**:
+- Adding event listeners to DOM elements
+- Adding event listeners to media tracks (audio/video)
+- Any situation where listeners need guaranteed cleanup
+
+**Example**:
+```javascript
+import { ListenerManager } from './listener-manager.js';
+
+class MyComponent {
+  constructor() {
+    this._listenerMgr = new ListenerManager('MyComponent');
+  }
+
+  init() {
+    // Add listeners with tracking
+    this._listenerMgr.add(window, 'resize', this.onResize);
+    this._listenerMgr.add(document, 'click', this.onClick);
+
+    // Add to media track
+    this._listenerMgr.add(audioTrack, 'ended', this.onTrackEnded);
+  }
+
+  cleanup() {
+    // Remove ALL listeners at once (guaranteed)
+    this._listenerMgr.removeAll();
+  }
+
+  // Or remove specific listeners
+  removeResizeListener() {
+    this._listenerMgr.remove(window, 'resize', this.onResize);
+  }
+
+  // Or remove all listeners for a target
+  cleanupTrack(track) {
+    this._listenerMgr.removeAllForTarget(track);
+  }
+}
+```
+
+**Benefits**:
+- Guaranteed cleanup (no memory leaks)
+- Prevents duplicate listener registration
+- Central registry for all listeners
+- WeakMap storage prevents memory leaks from function references
+- Debugging support (getStats(), getListenerBreakdown())
+
+**Pattern enforcement**: Use ListenerManager for ALL event listeners in components with lifecycle (audio, sync, UI). Manual addEventListener/removeEventListener should only be used for one-off operations.
+
 ## Working with Presets
 
 Presets capture the entire show state and are the primary way operators switch configurations during live performances.

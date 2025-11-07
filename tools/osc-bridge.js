@@ -41,15 +41,29 @@ wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   console.log(`[WS] client connected from ${ip}`);
   clients.add(ws);
+
+  // Error handler for client connection (prevents crash)
+  ws.on('error', (err) => {
+    console.error('[WS] Client connection error:', err.message);
+    // Remove from clients on error
+    clients.delete(ws);
+  });
+
+  // Message handler with error boundaries
   ws.on('message', (data) => {
     let msg;
     try {
       msg = JSON.parse(data);
-    } catch (_) {
+    } catch (err) {
+      console.warn('[WS] Invalid JSON from client:', err.message);
       return;
     }
+
     if (!msg || msg.type !== 'features' || typeof msg.payload !== 'object') return;
-    const f = msg.payload;
+
+    // Process features with error boundary
+    try {
+      const f = msg.payload;
 
     // Scalar channels
     send('/reactive/rms', f.rms || 0);
@@ -102,14 +116,29 @@ wss.on('connection', (ws, req) => {
       }
     }
 
-    // Beat grid info (send compactly)
-    if (f.beatGrid) {
-      const bg = f.beatGrid;
-      send('/reactive/beatGrid/bpm', bg.bpm || 0);
-      send('/reactive/beatGrid/conf', bg.confidence || 0);
+      // Beat grid info (send compactly)
+      if (f.beatGrid) {
+        const bg = f.beatGrid;
+        send('/reactive/beatGrid/bpm', bg.bpm || 0);
+        send('/reactive/beatGrid/conf', bg.confidence || 0);
+      }
+    } catch (err) {
+      console.error('[WS] Error processing features:', err.message);
+      // Continue running - don't crash on feature processing error
     }
   });
-  ws.on('close', () => { clients.delete(ws); console.log('[WS] client disconnected'); });
+
+  // Close handler for client cleanup
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log('[WS] client disconnected');
+  });
+});
+
+// WebSocket server error handler (prevents crash)
+wss.on('error', (err) => {
+  console.error('[WS] Server error:', err.message);
+  // Don't crash - log and continue
 });
 
 function send(address, ...args) {
@@ -131,7 +160,58 @@ setInterval(() => {
   try {
     const connectedClients = Array.from(clients).filter(c => c.readyState === c.OPEN).length;
     console.log(`[HEARTBEAT] WS clients=${connectedClients}`);
-  } catch (_) {}
+  } catch (err) {
+    console.error('[HEARTBEAT] Error:', err.message);
+  }
 }, HEARTBEAT_MS);
+
+// Process-level error handlers (safety net)
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+  console.error(err.stack);
+  // Don't exit - try to keep bridge running
+  console.log('[RECOVERY] Continuing despite error...');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason);
+  // Don't exit - log and continue
+  console.log('[RECOVERY] Continuing despite rejection...');
+});
+
+// Graceful shutdown on SIGINT/SIGTERM
+process.on('SIGINT', () => {
+  console.log('\n[SHUTDOWN] Received SIGINT, closing connections...');
+  // Close all client connections
+  for (const client of clients) {
+    try {
+      client.close();
+    } catch (_) {}
+  }
+  // Close server
+  wss.close(() => {
+    console.log('[SHUTDOWN] WebSocket server closed');
+    udpPort.close();
+    console.log('[SHUTDOWN] OSC port closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n[SHUTDOWN] Received SIGTERM, closing connections...');
+  // Close all client connections
+  for (const client of clients) {
+    try {
+      client.close();
+    } catch (_) {}
+  }
+  // Close server
+  wss.close(() => {
+    console.log('[SHUTDOWN] WebSocket server closed');
+    udpPort.close();
+    console.log('[SHUTDOWN] OSC port closed');
+    process.exit(0);
+  });
+});
 
 

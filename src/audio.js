@@ -30,6 +30,8 @@ import { loadAubio, loadMeyda, clearModuleCache } from './lazy.js';
 import { showToast } from './toast.js';
 import { ResourceLifecycle, STATES } from './resource-lifecycle.js';
 import { AsyncOperationRegistry } from './async-registry.js';
+import { withRetry, RetryPresets } from './with-retry.js';
+import { ListenerManager } from './listener-manager.js';
 
 /**
  * Cache for the beat detector function to avoid re-loading from CDN
@@ -38,25 +40,48 @@ let _guessBpmFn = null;
 
 /**
  * Lazy-load web-audio-beat-detector at runtime with graceful fallbacks.
- * 
+ *
  * Instead of bundling this library (which can fail to load from CDNs), we load it
  * dynamically when needed. This keeps the app working even if the CDN is down.
- * 
- * We try multiple CDN sources to increase reliability.
- * 
+ *
+ * Uses intelligent retry logic with exponential backoff. Tries multiple CDN sources
+ * with retries to maximize reliability.
+ *
  * @returns {Promise<Function>} A promise that resolves to the BPM detection function
  */
 async function getBeatDetectorGuess() {
   // If we've already loaded it, return the cached function
   if (_guessBpmFn) return _guessBpmFn;
+
   const candidates = [
     'https://esm.sh/web-audio-beat-detector@6.3.2',
     'https://cdn.jsdelivr.net/npm/web-audio-beat-detector@6.3.2/+esm',
     'https://cdn.skypack.dev/web-audio-beat-detector@6.3.2',
   ];
+
+  // Try each CDN with retry logic
   for (const url of candidates) {
     try {
-      const mod = await import(/* @vite-ignore */ url);
+      // Wrap CDN load with retry - gives each CDN 3 attempts with exponential backoff
+      const mod = await withRetry(
+        () => import(/* @vite-ignore */ url),
+        {
+          ...RetryPresets.cdn,
+          maxAttempts: 3, // 3 attempts per CDN
+          baseDelay: 1000, // 1s, 2s, 4s
+          onRetry: (attempt, err, delay) => {
+            console.log(`[Audio] Retry loading BeatDetector from ${url} (attempt ${attempt}, delay ${delay}ms)`);
+          },
+          shouldRetry: (err) => {
+            // Retry on network errors or module loading failures
+            return err.name === 'TypeError' ||
+                   err.name === 'NetworkError' ||
+                   err.message?.includes('Failed to fetch') ||
+                   err.message?.includes('net::ERR_');
+          }
+        }
+      );
+
       // Support different export shapes across CDNs:
       // 1) named export: { guess }
       // 2) default export is the function itself
@@ -65,16 +90,21 @@ async function getBeatDetectorGuess() {
       if (typeof mod?.guess === 'function') fn = mod.guess;
       else if (typeof mod?.default === 'function') fn = mod.default;
       else if (mod?.default && typeof mod.default.guess === 'function') fn = mod.default.guess;
+
       if (typeof fn === 'function') {
         _guessBpmFn = fn;
+        console.log('[Audio] BeatDetector loaded successfully from', url);
         return _guessBpmFn;
       }
-    } catch (_) {
-      // try next candidate
+    } catch (err) {
+      console.warn(`[Audio] Failed to load BeatDetector from ${url} after retries:`, err.message);
+      // Continue to next CDN candidate
     }
   }
+
   // Final fallback: no-op estimator that resolves to null bpm
   // This ensures the app continues working even if all CDNs fail
+  console.warn('[Audio] All BeatDetector CDNs failed, using fallback (BPM detection disabled)');
   _guessBpmFn = async () => ({ bpm: null });
   return _guessBpmFn;
 }
@@ -130,6 +160,7 @@ export class AudioEngine {
     // Lifecycle management for AudioContext (prevents race conditions)
     this._contextLifecycle = new ResourceLifecycle('AudioContext');
     this._asyncRegistry = new AsyncOperationRegistry('AudioEngine');
+    this._trackListenerMgr = new ListenerManager('AudioTracks');
 
     // Core audio nodes (created when ensureContext() is called)
     this.ctx = null;                    // AudioContext - the audio processing environment
@@ -541,26 +572,20 @@ export class AudioEngine {
       const attachEndedHandler = (track) => {
         if (!track || typeof track.addEventListener !== 'function') return;
 
-        // Remove any existing handler first to prevent accumulation
-        // This is critical when tracks are reused across multiple audio sources
-        if (track._endedHandler) {
-          try {
-            track.removeEventListener('ended', track._endedHandler);
-          } catch (_) {
-            // Removal may fail if handler wasn't attached, ignore
-          }
-          track._endedHandler = null;
-        }
-
+        // Create handler that stops audio when track ends
         const handler = () => {
-          track.removeEventListener('ended', handler);
+          // Remove this specific listener (ListenerManager tracks it)
+          this._trackListenerMgr.remove(track, 'ended', handler);
+
+          // Stop audio if this is still the active stream
           if (this.activeStream === stream) {
+            console.log('[AudioEngine] Track ended, stopping audio');
             this.stop();
           }
         };
-        // Store handler reference on track for cleanup later
-        track._endedHandler = handler;
-        track.addEventListener('ended', handler);
+
+        // Add listener with tracking (prevents leaks)
+        this._trackListenerMgr.add(track, 'ended', handler);
       };
 
       for (const track of audioTracks) {
@@ -735,19 +760,16 @@ export class AudioEngine {
         this.source.stop();
       }
     } catch(_){}
-    
+
     // Stop media stream tracks (microphone/system audio) and clean up event listeners
     if (this.activeStream) {
+      // Remove ALL track listeners (guaranteed cleanup)
       for (const t of this.activeStream.getTracks()) {
-        // Remove ended listener to prevent memory leak
-        if (t._endedHandler) {
-          try { t.removeEventListener('ended', t._endedHandler); } catch (_) {}
-          t._endedHandler = null;
-        }
+        this._trackListenerMgr.removeAllForTarget(t);
         t.stop();
       }
     }
-    
+
     // Clear source references
     this.source = null;
     this.activeStream = null;
@@ -2981,8 +3003,12 @@ export class AudioEngine {
    * Now async to properly handle AudioContext closure
    */
   async dispose() {
-    // Stop any active streams
+    // Stop any active streams (also cleans up track listeners)
     this.stop();
+
+    // Guarantee ALL track listeners are removed
+    this._trackListenerMgr.removeAll();
+
     this._releaseWorkletFrameBuffer();
 
     // Reset graph wiring state so ensureContext() rebuilds cleanly
