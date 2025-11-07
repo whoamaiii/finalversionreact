@@ -261,6 +261,7 @@ export class AudioEngine {
     this._graphConnected = false;
     this._workletInitAttempted = false;
     this._workletFrameTimestamp = 0;
+    this._workletDraining = false; // Flag to allow graceful worklet message draining during stop()
 
     this._aubioPromise = null;
     this._aubioModule = null;
@@ -382,6 +383,8 @@ export class AudioEngine {
         // Safari requires a user gesture to start audio, so we store contexts globally
         try {
           window.__reactiveCtxs = window.__reactiveCtxs || [];
+          // Remove closed contexts to prevent memory leak during long sessions
+          window.__reactiveCtxs = window.__reactiveCtxs.filter(ctx => ctx && ctx.state !== 'closed');
           if (!window.__reactiveCtxs.includes(this.ctx)) window.__reactiveCtxs.push(this.ctx);
         } catch(_) {}
       });
@@ -625,7 +628,10 @@ export class AudioEngine {
   async loadFile(file) {
     await this.ensureContext();
     this.stop(); // Stop any existing audio
-    
+
+    // Clear draining flag when starting new audio file to accept new worklet messages
+    this._workletDraining = false;
+
     // Decode the audio file into an AudioBuffer
     const arrayBuf = await file.arrayBuffer();
     const audioBuf = await this.ctx.decodeAudioData(arrayBuf);
@@ -762,14 +768,21 @@ export class AudioEngine {
     this._flushAubioQueue();
     this._disposeLiveBuffer();
 
-    // Reset worklet state and clear port handler to prevent message accumulation
+    // Gracefully drain worklet messages before clearing handler to prevent audio analysis gaps
     if (this.workletNode) {
       try {
         this.workletNode.port.postMessage({ type: 'reset' });
-        // Clear port message handler to prevent accumulation during pause/resume cycles
-        if (this.workletNode.port) {
-          this.workletNode.port.onmessage = null;
-        }
+
+        // Set draining flag to discard new messages but keep handler alive
+        this._workletDraining = true;
+
+        // Allow 200ms for in-flight messages to drain before clearing handler
+        setTimeout(() => {
+          if (this.workletNode?.port) {
+            this.workletNode.port.onmessage = null;
+          }
+          this._workletDraining = false;
+        }, 200);
       } catch (_) {}
     }
 
@@ -808,6 +821,9 @@ export class AudioEngine {
   // Webcam feature removed: startWebcam/stopWebcam et al removed
 
   _useStream(stream) {
+    // Clear draining flag when starting new audio source to accept new worklet messages
+    this._workletDraining = false;
+
     // Defensive check: ensure context exists before creating nodes
     if (!this.ctx) {
       console.error('Audio context not initialized');
@@ -972,8 +988,8 @@ export class AudioEngine {
       }
       const avg = count ? (sum / count) : 0;
       samples.push(this._clamp(avg, 0, 1));
-      // ~50Hz sampling without blocking the UI thread
-      await new Promise(r => setTimeout(r, 20));
+      // ~50Hz sampling without blocking the UI thread - use RAF to allow animation loop to continue
+      await new Promise(r => requestAnimationFrame(r));
     }
 
     this.noiseGateEnabled = wasEnabled;
@@ -1169,6 +1185,10 @@ export class AudioEngine {
           numberOfOutputs: 1,
           outputChannelCount: [1],
         });
+        // Clear any existing handler first to prevent accumulation during audio source switches
+        if (this.workletNode?.port) {
+          this.workletNode.port.onmessage = null;
+        }
         node.port.onmessage = (event) => this._handleWorkletMessage(event);
         node.onprocessorerror = (err) => {
           console.error('Analysis processor error', err);
@@ -1192,6 +1212,12 @@ export class AudioEngine {
   }
 
   _handleWorkletMessage(event) {
+    // Discard messages during draining to prevent audio analysis gaps during source switches
+    // Keep handler alive to allow in-flight messages to complete gracefully
+    if (this._workletDraining) {
+      return;
+    }
+
     const data = event?.data;
     if (!data || data.type !== 'frame') return;
     const frameId = typeof data.frameId === 'number' ? data.frameId : this._workletFrameId + 1;
@@ -2548,10 +2574,21 @@ export class AudioEngine {
     return true;
   }
 
-  _detectBeat(flux, bands) {
+  _detectBeat(flux, bands, currentBpm) {
     if (this.fluxHistory.length < 5) return false;
     const now = performance.now();
-    const refractory = Number.isFinite(this.beatRefractoryMs) && this.beatRefractoryMs > 0 ? this.beatRefractoryMs : this.beatCooldownMs;
+
+    // Calculate tempo-aware cooldown to prevent missing beats at fast tempos or double-triggers at slow tempos
+    let refractory = Number.isFinite(this.beatRefractoryMs) && this.beatRefractoryMs > 0 ? this.beatRefractoryMs : this.beatCooldownMs;
+
+    // If we have valid BPM, make cooldown tempo-aware
+    if (currentBpm && Number.isFinite(currentBpm) && currentBpm >= 20 && currentBpm <= 500) {
+      const beatIntervalMs = 60000 / currentBpm;
+      // Cooldown should be 60-65% of beat interval to avoid double-triggers but not miss rapid beats
+      const dynamicRefractory = Math.max(200, Math.min(500, beatIntervalMs * 0.625));
+      refractory = dynamicRefractory;
+    }
+
     if (now - this._lastBeatMs < refractory) return false;
     // Energy gate: require sufficient bass envelope to accept any beat.
     const bassEnv = bands && bands.env ? (bands.env.bass ?? 0) : 0;
@@ -2618,7 +2655,10 @@ export class AudioEngine {
     const fluxFromWorklet = this._consumeWorkletFlux();
     const flux = fluxFromWorklet ?? this._computeFlux(this.freqData);
     const bassFlux = this._computeBassFlux(this.freqData);
-    let beat = this._detectBeat(flux, bands);
+
+    // Get current BPM for tempo-aware beat detection (prefer file BPM, fall back to tap tempo)
+    const currentBpm = this.bpmEstimate || this.tapBpm || null;
+    let beat = this._detectBeat(flux, bands, currentBpm);
 
     // Live tempo assist: prefer file BPM; else use Aubio tempo for live sources
     const now = performance.now();
