@@ -33,6 +33,7 @@ const DEFAULT_DROP_THRESHOLD_MULTIPLIER = 1.35;
 const DEFAULT_MEMORY_SAMPLE_INTERVAL_MS = 2000;
 const DEFAULT_TREND_WINDOW_MS = 10000; // 10 seconds
 const MAX_GPU_QUERIES_IN_FLIGHT = 4;
+const GPU_QUERY_TIMEOUT_MS = 5000;
 
 const now = () => {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -637,7 +638,7 @@ export class PerformanceMonitor {
       } else if (typeof ext.endQueryEXT === 'function') {
         ext.endQueryEXT(ext.TIME_ELAPSED_EXT);
       }
-      this._gpu.pending.push(query);
+      this._gpu.pending.push({ query, timestamp: now() });
     } catch (err) {
       this._releaseGpuQuery(query);
       console.warn('[PerformanceMonitor] GPU timer end failed:', err);
@@ -680,13 +681,32 @@ export class PerformanceMonitor {
       }
     };
 
+    const unwrapQuery = (entry) => (entry && typeof entry === 'object' && 'query' in entry ? entry.query : entry);
+    const getTimestamp = (entry) => (entry && typeof entry === 'object' && typeof entry.timestamp === 'number' ? entry.timestamp : null);
+
     while (pending.length) {
-      const query = pending[0];
-      if (!getAvailable(query)) {
+      const entry = pending[0];
+      const query = unwrapQuery(entry);
+
+      if (!query) {
+        pending.shift();
+        continue;
+      }
+
+      const enqueuedAt = getTimestamp(entry);
+      const timedOut = enqueuedAt !== null ? (now() - enqueuedAt) > GPU_QUERY_TIMEOUT_MS : false;
+      const available = getAvailable(query);
+
+      if (!available && !timedOut) {
         break; // Queries resolve in order; exit early until the first is ready
       }
 
       pending.shift();
+
+      if (!available && timedOut) {
+        this._releaseGpuQuery(query);
+        continue;
+      }
 
       const disjoint = getDisjoint();
       const result = disjoint ? null : getResult(query);
@@ -740,9 +760,10 @@ export class PerformanceMonitor {
 
   _releaseAllGpuQueries() {
     const { pending, pool } = this._gpu;
+    const unwrapQuery = (entry) => (entry && typeof entry === 'object' && 'query' in entry ? entry.query : entry);
     while (pending.length) {
-      const query = pending.pop();
-      this._releaseGpuQuery(query);
+      const entry = pending.pop();
+      this._releaseGpuQuery(unwrapQuery(entry));
     }
     while (pool.length) {
       const query = pool.pop();
