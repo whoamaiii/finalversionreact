@@ -50,6 +50,9 @@ export class AutoSaveCoordinator {
     this._consecutiveErrors = 0;
     this._circuitBreakerOpen = false;
     this._circuitBreakerOpenTime = 0;
+    this._circuitBreakerResetCount = 0; // Track how many times we've reset
+    this._circuitBreakerMaxResets = 3; // After 3 resets, permanently disable
+    this._permanentFailureShown = false; // Track if we showed permanent failure toast
 
     // Auto-cleanup on page unload to prevent memory leaks
     this._unloadHandler = () => this.stop();
@@ -148,15 +151,39 @@ export class AutoSaveCoordinator {
     
     const now = Date.now();
     
-    // Check circuit breaker
+    // Check circuit breaker with exponential backoff
     if (this._circuitBreakerOpen) {
-      // Try to reset circuit breaker after timeout
-      if (now - this._circuitBreakerOpenTime > CIRCUIT_BREAKER_RESET_MS) {
+      // Calculate backoff time (exponential: 60s, 120s, 240s)
+      const backoffMs = CIRCUIT_BREAKER_RESET_MS * Math.pow(2, this._circuitBreakerResetCount);
+      const timeOpen = now - this._circuitBreakerOpenTime;
+
+      if (timeOpen > backoffMs) {
+        // Check if we've reset too many times
+        if (this._circuitBreakerResetCount >= this._circuitBreakerMaxResets) {
+          console.error('[AutoSaveCoordinator] Circuit breaker permanently open after',
+            this._circuitBreakerResetCount, 'resets. Auto-save disabled.');
+
+          // Show user notification (once)
+          if (!this._permanentFailureShown) {
+            this._permanentFailureShown = true;
+            import('./toast.js')
+              .then(({ showToast }) => {
+                showToast('Auto-save permanently disabled due to repeated failures. Check storage.', 10000);
+              })
+              .catch(() => {});
+          }
+          return; // Give up permanently
+        }
+
+        // Attempt reset
         this._circuitBreakerOpen = false;
-        this._consecutiveErrors = 0;
-        this._throttledLog('info', '[AutoSaveCoordinator] Circuit breaker reset, retrying saves');
+        this._circuitBreakerResetCount++;
+        this._throttledLog('info',
+          `[AutoSaveCoordinator] Circuit breaker reset attempt ${this._circuitBreakerResetCount}/${this._circuitBreakerMaxResets}`,
+          `Next backoff: ${backoffMs / 1000}s`);
       } else {
-        return; // Circuit breaker is open, skip save
+        // Still in backoff period
+        return;
       }
     }
     
@@ -186,8 +213,9 @@ export class AutoSaveCoordinator {
       const success = this.persistence.save(compressed);
       
       if (success) {
-        // Reset error tracking on success
+        // SUCCESS: Reset all error tracking
         this._consecutiveErrors = 0;
+        this._circuitBreakerResetCount = 0; // Reset the reset counter
         this._lastSaveTime = now;
         this._saveCount++;
         
@@ -382,6 +410,10 @@ export class AutoSaveCoordinator {
       saveErrors: this._saveErrors,
       consecutiveErrors: this._consecutiveErrors,
       circuitBreakerOpen: this._circuitBreakerOpen,
+      circuitBreakerResetCount: this._circuitBreakerResetCount,
+      circuitBreakerBackoffMs: this._circuitBreakerOpen
+        ? CIRCUIT_BREAKER_RESET_MS * Math.pow(2, this._circuitBreakerResetCount)
+        : 0,
       isIdle: this._isIdle,
       lastSaveTime: this._lastSaveTime,
       lastActivityTime: this._lastActivityTime,

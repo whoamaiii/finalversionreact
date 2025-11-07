@@ -28,8 +28,10 @@ function deepMerge(target, source, seen = new WeakSet()) {
 
   // Detect circular references to prevent stack overflow
   if (seen.has(source)) {
-    console.warn('[deepMerge] Circular reference detected, skipping');
-    return target;
+    const error = new Error('deepMerge: Circular reference detected in source object');
+    error.code = 'CIRCULAR_REFERENCE';
+    console.error('[deepMerge] Circular reference detected:', error);
+    throw error;
   }
   seen.add(source);
 
@@ -171,19 +173,38 @@ function applySceneSnapshot(sceneApi, snapshot) {
     const nextDensity = typeof snapshot.outerShell.densityScale === 'number' ? snapshot.outerShell.densityScale : prevDensity;
     const needsRebuild = (typeof snapshot.outerShell.enabled === 'boolean' && nextEnabled !== prevEnabled)
       || (typeof snapshot.outerShell.densityScale === 'number' && nextDensity !== prevDensity);
-    deepMerge(params.outerShell, snapshot.outerShell);
+    try {
+      deepMerge(params.outerShell, snapshot.outerShell);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge outerShell:', err);
+      // Use shallow copy as fallback
+      params.outerShell = { ...snapshot.outerShell };
+    }
     if (needsRebuild) shouldRebuildParticles = true;
   }
 
   if (snapshot.map && typeof snapshot.map === 'object') {
     if (!params.map || typeof params.map !== 'object') params.map = {};
     if (snapshot.map.eye && (!params.map.eye || typeof params.map.eye !== 'object')) params.map.eye = {};
-    deepMerge(params.map, snapshot.map);
+    try {
+      deepMerge(params.map, snapshot.map);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge map:', err);
+      // Use shallow copy as fallback
+      params.map = { ...snapshot.map };
+      if (snapshot.map.eye) params.map.eye = { ...snapshot.map.eye };
+    }
   }
 
   if (snapshot.explosion && typeof snapshot.explosion === 'object') {
     if (!params.explosion || typeof params.explosion !== 'object') params.explosion = {};
-    deepMerge(params.explosion, snapshot.explosion);
+    try {
+      deepMerge(params.explosion, snapshot.explosion);
+    } catch (err) {
+      console.error('[applySceneSnapshot] Failed to merge explosion:', err);
+      // Use shallow copy as fallback
+      params.explosion = { ...snapshot.explosion };
+    }
   }
 
   if (shouldRebuildParticles) {
