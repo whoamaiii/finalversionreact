@@ -237,6 +237,24 @@ export function createDispersionLayer(initialVariant = 'classic') {
     uniform float uTwist;       // extra twist
     uniform float uTwistFalloff;// not used directly, preserved
     uniform float uTravel;      // forward travel
+    uniform float uShockRibAmount; // bass-driven ribs
+    uniform float uShockRibWidth;
+    uniform float uShockRibDecay;
+    uniform float uShockRibPhase;
+    uniform float uCausticAmount; // treble-driven veil
+    uniform float uCausticScale;
+    uniform float uCausticHueShift;
+    uniform float uFractalBloomAmount;
+    uniform float uFractalBloomDecay;
+    uniform float uFractalBloomRadius;
+    uniform float uRippleAmount;
+    uniform float uRippleSpeed;
+    uniform float uRippleDensity;
+    uniform float uRipplePhase;
+    uniform float uPrismAmount;
+    uniform float uPrismSlices;
+    uniform float uPrismBreath;
+    uniform float uPrismHue;
     // Variant-specific controls (hooked from params)
     uniform float uDrillBox;    // half-size of tunnel box
     uniform float uDrillRadius; // radius of drill hole
@@ -299,6 +317,61 @@ export function createDispersionLayer(initialVariant = 'classic') {
       }
 
       vec3 col = Tanh(o / steps).rgb;
+      vec2 normCoord = (FC - 0.5 * r) / max(1.0, 0.5 * min(r.x, r.y));
+      if (uShockRibAmount > 0.0001) {
+        float ribCenter = clamp(uShockRibPhase, 0.0, 2.0);
+        float ribWidth = max(0.0005, uShockRibWidth);
+        float sqDist = max(abs(normCoord.x), abs(normCoord.y));
+        float band = 1.0 - smoothstep(ribWidth, ribWidth * 1.8, abs(sqDist - ribCenter));
+        float fade = exp(-ribCenter * max(0.0, uShockRibDecay));
+        float ribWave = band * fade * clamp(uShockRibAmount, 0.0, 3.0);
+        col += vec3(ribWave * 0.6, ribWave * 0.45, ribWave * 0.25);
+      }
+      if (uCausticAmount > 0.0001) {
+        float causticA = sin((normCoord.x * 6.0 + normCoord.y * 5.0) * uCausticScale + t * 2.0);
+        float causticB = cos((normCoord.x * 4.0 - normCoord.y * 6.0) * (uCausticScale * 0.85) + t * 1.6);
+        float veil = pow(max(0.0, causticA * causticB), 2.2);
+        float amount = clamp(uCausticAmount, 0.0, 2.5) * veil;
+        float mixWeight = clamp(uCausticAmount * 0.6, 0.0, 1.0);
+        vec3 causticColor = vec3(
+          0.55 + 0.45 * sin(uCausticHueShift + 2.094),
+          0.55 + 0.45 * sin(uCausticHueShift + 0.0),
+          0.55 + 0.45 * sin(uCausticHueShift - 2.094)
+        );
+        col = clamp(mix(col, col + causticColor * amount, mixWeight), 0.0, 1.5);
+      }
+      if (uFractalBloomAmount > 0.0001) {
+        float dist = length(normCoord);
+        float radius = clamp(uFractalBloomRadius, 0.05, 2.0);
+        float ring = exp(-pow(dist / max(radius, 0.001), 1.8)) * exp(-uFractalBloomDecay * dist * 2.0);
+        vec2 polar = vec2(dist, atan(normCoord.y, normCoord.x));
+        float fractal = sin(polar.y * 6.0 + t * 1.8) * 0.5 + sin(polar.y * 10.0 - t * 2.6) * 0.3;
+        fractal += sin(polar.x * 18.0 + t * 3.2);
+        float bloom = clamp(uFractalBloomAmount, 0.0, 4.0) * ring * (0.5 + 0.5 * fractal);
+        col += vec3(bloom * 0.8, bloom * 0.65, bloom * 0.9);
+      }
+      if (uRippleAmount > 0.0001) {
+        float rippleAngle = normCoord.y * uRippleDensity * 6.2831853 + t * uRippleSpeed + uRipplePhase;
+        float ripple = sin(rippleAngle);
+        float rippleMask = exp(-abs(normCoord.x) * 2.2);
+        float rippleStrength = clamp(uRippleAmount, 0.0, 3.0) * ripple * rippleMask;
+        normCoord.x += rippleStrength * 0.05;
+        col += vec3(rippleStrength * 0.25, rippleStrength * 0.18, rippleStrength * 0.32);
+      }
+      if (uPrismAmount > 0.0001) {
+        float slices = max(1.0, uPrismSlices);
+        float angle = atan(normCoord.y, normCoord.x);
+        float sector = floor((angle + 3.14159265) / (6.2831853 / slices));
+        float breathing = 0.5 + 0.5 * sin(t * (0.6 + uPrismBreath));
+        float prismWeight = clamp(uPrismAmount * breathing * (1.0 - clamp(length(normCoord), 0.0, 1.0) * 0.35), 0.0, 1.5);
+        float hueShift = uPrismHue + sector / slices;
+        vec3 prismColor = vec3(
+          0.5 + 0.5 * sin(6.2831853 * hueShift + 0.0),
+          0.5 + 0.5 * sin(6.2831853 * hueShift + 2.094),
+          0.5 + 0.5 * sin(6.2831853 * hueShift - 2.094)
+        );
+        col = mix(col, col * (1.0 + prismWeight * 0.35) + prismColor * prismWeight * 0.45, clamp(prismWeight, 0.0, 1.0));
+      }
       // Tone & tint controls
       col = (col - 0.5) * max(0.0, uContrast) + 0.5;
       col *= max(0.0, uBrightness);
@@ -337,6 +410,24 @@ export function createDispersionLayer(initialVariant = 'classic') {
       uRepPeriod: { value: 4.0 },
       uRotDepth: { value: 0.10 },
       uSteps: { value: 300.0 },
+      uShockRibAmount: { value: 0.0 },
+      uShockRibWidth: { value: 0.35 },
+      uShockRibDecay: { value: 0.6 },
+      uShockRibPhase: { value: 0.0 },
+      uCausticAmount: { value: 0.0 },
+      uCausticScale: { value: 1.0 },
+      uCausticHueShift: { value: 0.0 },
+      uFractalBloomAmount: { value: 0.0 },
+      uFractalBloomDecay: { value: 0.6 },
+      uFractalBloomRadius: { value: 0.4 },
+      uRippleAmount: { value: 0.0 },
+      uRippleSpeed: { value: 1.2 },
+      uRippleDensity: { value: 3.0 },
+      uRipplePhase: { value: 0.0 },
+      uPrismAmount: { value: 0.0 },
+      uPrismSlices: { value: 4.0 },
+      uPrismBreath: { value: 0.4 },
+      uPrismHue: { value: 0.0 },
     },
     vertexShader,
     fragmentShader: getFragmentShader(initialVariant),

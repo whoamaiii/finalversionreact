@@ -385,11 +385,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     zoom: 'Depth zoom amount of the overlay. Higher gain = more dramatic in/out pulses.',
     warp: 'Audio-driven distortion. Choose band with Warp Source; Gain controls intensity.',
     parallax: 'Screen parallax offset from spectral centroid and flux (motion).',
-    color: 'Color tinting and how much to mix with detected chroma (key/notes).',
-    tone: 'Brightness/contrast shaping plus reactive gain.',
+  color: 'Color tinting, caustics, and chroma-driven prism breathing.',
+  tone: 'Brightness/contrast shaping plus reactive gain and fractal bloom pulses.',
     twist: 'Vortex rotation energy from bass/beat/onsets/flux; attack/release shape it.',
     stutter: 'Flip/toggle behaviors and pulse decay for rhythmic effects.',
-    travel: 'Forward motion through the field; boost on beats/drops.',
+  travel: 'Forward motion through the field; boost on beats/drops with flux-driven ripples.',
+  drill: 'Tunnel geometry controls plus bass shock ribs for the vortex variant.',
   };
 
   const notifyRenderAll = () => {

@@ -682,7 +682,27 @@ export function initScene() {
     explosionDuration: 2000,
     mainGroup: new THREE.Group(),
     shockwave: { mesh: null, material: null, active: false, startTime: 0, duration: 1.2, intensity: 1, progress: 0, opacity: 0 },
-    dispersion: { layer: null, zoom: 0, offsetX: 0, offsetY: 0, opacity: 0.3, twist: 0, twistDir: 1, stutterTimes: [], travel: 0, _flipBeatAccumulator: 0, _flipSetting: 0, _downbeatEnv: 0 },
+    dispersion: {
+      layer: null,
+      zoom: 0,
+      offsetX: 0,
+      offsetY: 0,
+      opacity: 0.3,
+      twist: 0,
+      twistDir: 1,
+      stutterTimes: [],
+      travel: 0,
+      _flipBeatAccumulator: 0,
+      _flipSetting: 0,
+      _downbeatEnv: 0,
+      shockRibPhase: 0,
+      shockRibAmount: 0,
+      causticAmount: 0,
+      fractalBloomAmount: 0,
+      rippleAmount: 0,
+      ripplePhase: 0,
+      prismAmount: 0,
+    },
     metrics: {
       coreScale: 1,
       outerScale: 1,
@@ -2287,6 +2307,105 @@ export function initScene() {
             stepsVal = state.dispersion.steps;
           }
           // Push variant-specific uniforms
+          const shockRibGain = Math.max(0, dcfg.shockRibGain ?? 0);
+          const shockRibWidth = THREE.MathUtils.clamp(dcfg.shockRibWidth ?? 0.35, 0.05, 1.5);
+          const shockRibDecay = THREE.MathUtils.clamp(dcfg.shockRibDecay ?? 0.6, 0.1, 2.5);
+          let shockRibAmount = 0;
+          let shockRibPhase = 0;
+          if (shockRibGain > 0 && isFinite(dt)) {
+            const ribTargetRaw = (isBeat ? (bass * 0.7 + rms * 0.3) : 0) + (isDrop ? 0.5 : 0);
+            const ribTarget = Math.max(0, ribTargetRaw) * shockRibGain;
+            const current = state.dispersion.shockRibAmount || 0;
+            const riseLerp = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / 45);
+            const fallLerp = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / Math.max(80, shockRibDecay * 400));
+            const lerpFactor = ribTarget > current ? riseLerp : fallLerp;
+            state.dispersion.shockRibAmount = THREE.MathUtils.lerp(current, ribTarget, THREE.MathUtils.clamp(lerpFactor, 0, 1));
+            if (isBeat || features?.aubioOnset) {
+              state.dispersion.shockRibPhase = 0;
+            } else {
+              const phaseAdvance = Math.max(0, dt) * (0.8 + state.dispersion.shockRibAmount * 1.5 + bass * 0.4);
+              state.dispersion.shockRibPhase = (state.dispersion.shockRibPhase || 0) + phaseAdvance;
+              if (state.dispersion.shockRibPhase > 2.0) {
+                state.dispersion.shockRibPhase = state.dispersion.shockRibPhase % 2.0;
+              }
+            }
+            shockRibAmount = state.dispersion.shockRibAmount;
+            shockRibPhase = state.dispersion.shockRibPhase || 0;
+          } else {
+            state.dispersion.shockRibAmount = 0;
+            state.dispersion.shockRibPhase = 0;
+          }
+
+          const causticMix = Math.max(0, dcfg.causticMix ?? 0);
+          const causticScale = THREE.MathUtils.clamp(dcfg.causticScale ?? 1.0, 0.2, 5.0);
+          const causticHueShift = dcfg.causticHueShift ?? 0.0;
+          let causticAmount = 0;
+          if (causticMix > 0) {
+            const trebleEnergy = Math.max(0, treble * wTreble + centroid * 0.2 + fluxZ * 0.05);
+            const targetCaustic = trebleEnergy * causticMix;
+            const currentCaustic = state.dispersion.causticAmount || 0;
+            state.dispersion.causticAmount = THREE.MathUtils.lerp(currentCaustic, targetCaustic, 0.12);
+            causticAmount = state.dispersion.causticAmount;
+          } else {
+            state.dispersion.causticAmount = 0;
+          }
+
+          const fractalBloomGain = Math.max(0, dcfg.fractalBloomGain ?? 0);
+          const fractalBloomDecay = THREE.MathUtils.clamp(dcfg.fractalBloomDecay ?? 0.6, 0.1, 2.5);
+          const fractalBloomRadius = THREE.MathUtils.clamp(dcfg.fractalBloomRadius ?? 0.4, 0.1, 1.2);
+          let fractalBloomAmount = 0;
+          if (fractalBloomGain > 0 && isFinite(dt)) {
+            const bloomPulse = downbeatPulse ? (0.6 + bass * 0.5 + rms * 0.4) : 0;
+            const targetBloom = Math.max(0, bloomPulse) * fractalBloomGain;
+            const currentBloom = state.dispersion.fractalBloomAmount || 0;
+            const bloomRise = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / 30);
+            const bloomFall = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / Math.max(80, fractalBloomDecay * 500));
+            const bloomLerp = targetBloom > currentBloom ? bloomRise : bloomFall;
+            state.dispersion.fractalBloomAmount = THREE.MathUtils.lerp(currentBloom, targetBloom, THREE.MathUtils.clamp(bloomLerp, 0, 1));
+            fractalBloomAmount = state.dispersion.fractalBloomAmount;
+          } else {
+            state.dispersion.fractalBloomAmount = 0;
+          }
+
+          const rippleGain = Math.max(0, dcfg.rippleGain ?? 0);
+          const rippleSpeed = THREE.MathUtils.clamp(dcfg.rippleSpeed ?? 1.2, 0.1, 6.0);
+          const rippleDensity = THREE.MathUtils.clamp(dcfg.rippleDensity ?? 3.0, 0.5, 12.0);
+          let rippleAmount = 0;
+          let ripplePhase = state.dispersion.ripplePhase || 0;
+          if (rippleGain > 0 && isFinite(dt)) {
+            const fluxEnergy = Math.max(0, state.dispersion._fluxEnv || 0);
+            const targetRipple = fluxEnergy * rippleGain;
+            const currentRipple = state.dispersion.rippleAmount || 0;
+            const rippleRise = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / 60);
+            const rippleFall = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / 400);
+            const rippleLerp = targetRipple > currentRipple ? rippleRise : rippleFall;
+            state.dispersion.rippleAmount = THREE.MathUtils.lerp(currentRipple, targetRipple, THREE.MathUtils.clamp(rippleLerp, 0, 1));
+            rippleAmount = state.dispersion.rippleAmount;
+            ripplePhase += rippleSpeed * dt;
+            if (ripplePhase > 1000.0) ripplePhase = ripplePhase % 1000.0;
+            state.dispersion.ripplePhase = ripplePhase;
+          } else {
+            state.dispersion.rippleAmount = 0;
+            state.dispersion.ripplePhase = 0;
+            ripplePhase = 0;
+          }
+
+          const prismIntensity = Math.max(0, dcfg.prismIntensity ?? 0);
+          const prismSlices = THREE.MathUtils.clamp(dcfg.prismSlices ?? 4, 2, 12);
+          const prismBreath = THREE.MathUtils.clamp(dcfg.prismBreath ?? 0.4, 0.0, 2.0);
+          let prismAmount = 0;
+          const chromaEnergy = Math.max(0, state.metrics.chromaEnergy ?? dominantChromaEnergy ?? 0);
+          const prismHue = ((state.metrics.chromaHue ?? chromaHue ?? 0) % 1 + 1) % 1;
+          if (prismIntensity > 0) {
+            const breathWave = 0.5 + 0.5 * Math.sin(t * (0.6 + prismBreath));
+            const targetPrism = chromaEnergy * prismIntensity * breathWave;
+            const currentPrism = state.dispersion.prismAmount || 0;
+            state.dispersion.prismAmount = THREE.MathUtils.lerp(currentPrism, targetPrism, 0.12);
+            prismAmount = state.dispersion.prismAmount;
+          } else {
+            state.dispersion.prismAmount = 0;
+          }
+
           if (state.dispersion?.layer?.material?.uniforms) {
             const u = state.dispersion.layer.material.uniforms;
             if (u.uDrillBox) u.uDrillBox.value = THREE.MathUtils.clamp(drillBoxVal, 0.5, 4.0);
@@ -2294,6 +2413,34 @@ export function initScene() {
             if (u.uRepPeriod) u.uRepPeriod.value = THREE.MathUtils.clamp(repPeriodVal, 1.0, 12.0);
             if (u.uRotDepth) u.uRotDepth.value = THREE.MathUtils.clamp(rotDepthVal, 0.0, 0.4);
             if (u.uSteps) u.uSteps.value = THREE.MathUtils.clamp(stepsVal, 60, 450);
+            if (u.uShockRibAmount) {
+              u.uShockRibAmount.value = shockRibAmount;
+              if (u.uShockRibWidth) u.uShockRibWidth.value = shockRibWidth;
+              if (u.uShockRibDecay) u.uShockRibDecay.value = shockRibDecay;
+              if (u.uShockRibPhase) u.uShockRibPhase.value = shockRibPhase;
+            }
+            if (u.uCausticAmount) {
+              u.uCausticAmount.value = causticAmount;
+              if (u.uCausticScale) u.uCausticScale.value = causticScale;
+              if (u.uCausticHueShift) u.uCausticHueShift.value = causticHueShift;
+            }
+            if (u.uFractalBloomAmount) {
+              u.uFractalBloomAmount.value = fractalBloomAmount;
+              if (u.uFractalBloomDecay) u.uFractalBloomDecay.value = fractalBloomDecay;
+              if (u.uFractalBloomRadius) u.uFractalBloomRadius.value = fractalBloomRadius;
+            }
+            if (u.uRippleAmount) {
+              u.uRippleAmount.value = rippleAmount;
+              if (u.uRippleSpeed) u.uRippleSpeed.value = rippleSpeed;
+              if (u.uRippleDensity) u.uRippleDensity.value = rippleDensity;
+              if (u.uRipplePhase) u.uRipplePhase.value = ripplePhase;
+            }
+            if (u.uPrismAmount) {
+              u.uPrismAmount.value = prismAmount;
+              if (u.uPrismSlices) u.uPrismSlices.value = prismSlices;
+              if (u.uPrismBreath) u.uPrismBreath.value = prismBreath;
+              if (u.uPrismHue) u.uPrismHue.value = prismHue;
+            }
           }
           state.dispersion.layer.update({
             time: t,
