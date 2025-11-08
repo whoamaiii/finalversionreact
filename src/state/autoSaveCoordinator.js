@@ -166,7 +166,7 @@ export class AutoSaveCoordinator {
           // Show user notification (once)
           if (!this._permanentFailureShown) {
             this._permanentFailureShown = true;
-            import('./toast.js')
+            import('../toast.js')
               .then(({ showToast }) => {
                 showToast('Auto-save permanently disabled due to repeated failures. Check storage.', 10000);
               })

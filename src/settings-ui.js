@@ -2432,6 +2432,12 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   };
 
   function render(tabId = 'quick') {
+    // Validate tabId is a string
+    if (typeof tabId !== 'string') {
+      console.error('[SettingsUI] Invalid tabId:', tabId);
+      tabId = 'quick';
+    }
+    
     currentTab = tabId;
     const mode = sceneApi.state.params.visualMode || 'overlay';
     const visibleTabs = tabs.filter((t) => {
@@ -2441,17 +2447,44 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       return true;
     });
     if (!visibleTabs.some(t => t.id === tabId)) tabId = visibleTabs[0]?.id || 'quick';
+    
+    // Update currentTab to match the final validated tabId
+    currentTab = tabId;
+    
     tabsEl.replaceChildren();
     for (const t of visibleTabs) {
       const b = h('button', { class: 'tab' + (t.id === tabId ? ' active' : ''), onClick: ()=> render(t.id) }, t.label);
       tabsEl.appendChild(b);
     }
+    
+    // Clear content completely before rendering new tab
     content.replaceChildren();
+    
+    // Verify we have a builder for this tab
     const builder = builders[tabId];
+    if (!builder || typeof builder !== 'function') {
+      console.error(`[SettingsUI] No builder found for tab '${tabId}'`);
+      content.appendChild(h('div', { class: 'error' }, `Tab '${tabId}' not found`));
+      return;
+    }
+    
+    // Call the builder and append its result
     Promise.resolve(builder())
-      .then((node) => { content.appendChild(node); })
+      .then((node) => {
+        // Defensive check: ensure content is still clear before appending
+        if (content.children.length > 0) {
+          console.warn(`[SettingsUI] Content was not empty when appending tab '${tabId}', clearing again`);
+          content.replaceChildren();
+        }
+        // Verify we're still on the same tab (prevent race conditions)
+        if (currentTab !== tabId) {
+          console.warn(`[SettingsUI] Tab changed from '${tabId}' to '${currentTab}' during render, discarding result`);
+          return;
+        }
+        content.appendChild(node);
+      })
       .catch((err) => {
-        console.error(`Failed to render tab '${tabId}':`, err);
+        console.error(`[SettingsUI] Failed to render tab '${tabId}':`, err);
         content.appendChild(h('div', { class: 'error' }, 'Failed to load content'));
       });
   }

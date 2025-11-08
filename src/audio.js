@@ -325,6 +325,8 @@ export class AudioEngine {
     this.aubioMetrics = { queueDepth: 0, highWater: 0, dropped: 0, maxDepth: this._aubioQueueMax };
     this._aubioLastFrameId = -1;
     this._aubioConfiguredSampleRate = null;
+    this._aubioDirectFrameId = 0;
+    this._aubioDirectFrameThrottle = 0;
     this.aubioFeatures = {
       pitchHz: 0,
       pitchConf: 0,
@@ -337,6 +339,10 @@ export class AudioEngine {
     this._lastLiveTempoFallbackMs = 0;
     this._lastLiveTempoSource = null;
     this._lastLiveTempoSourceAt = 0;
+    this._fallbackBeatTimes = [];
+    this._fallbackTempoBpm = 0;
+    this._fallbackTempoConfidence = 0;
+    this._fallbackTempoLastBeatMs = 0;
 
     this._essentiaWorker = null;
     this._essentiaReady = false;
@@ -362,7 +368,7 @@ export class AudioEngine {
     this.bpmEstimate = null; // number | null
     this.bpmEstimateConfidence = 0;
     this.bpmEstimateSource = null;
-    this.tempoAssistEnabled = false;
+    this.tempoAssistEnabled = true;
     this.tempoIntervalMs = 0;
     this._lastTempoMs = 0;
     this._lastMonoBuffer = null;
@@ -2067,6 +2073,7 @@ export class AudioEngine {
         this._aubioModule = null;
         this._aubioPromise = null;
         this._aubioLoadFailedAt = performance.now();
+        this._flushAubioQueue();
         return null;
       });
     return this._aubioPromise;
@@ -2192,6 +2199,12 @@ export class AudioEngine {
       return;
     }
 
+    // If Aubio recently failed and we're in backoff, drop quietly
+    if (this._aubioLoadFailedAt && !this._aubioPromise) {
+      this._releaseAubioScratch(buffer);
+      return;
+    }
+
     const maxDepth = Math.max(1, Math.floor(this._aubioQueueMax || 1));
     if (this._aubioQueue.length >= maxDepth) {
       const dropped = this._aubioQueue.shift();
@@ -2202,7 +2215,9 @@ export class AudioEngine {
       const now = performance.now();
       if (!this._aubioQueueLastWarningAt || now - this._aubioQueueLastWarningAt > 5000) {
         this._aubioQueueLastWarningAt = now;
-        console.warn('[AudioEngine] Aubio processing backlog — dropping oldest frame');
+        if (!this._aubioLoadFailedAt) {
+          console.warn('[AudioEngine] Aubio processing backlog — dropping oldest frame');
+        }
       }
     }
     this._aubioQueue.push({ buffer, frameId });
@@ -2613,6 +2628,82 @@ export class AudioEngine {
     return target;
   }
 
+  _updateFallbackTempo(beat, nowMs) {
+    const aubioHasTempo = !!(this._aubioModule && this._aubio && this._aubio.tempo);
+    if (aubioHasTempo) {
+      this._fallbackBeatTimes.length = 0;
+      return;
+    }
+
+    if (this._fallbackBeatTimes.length) {
+      const lastBeat = this._fallbackBeatTimes[this._fallbackBeatTimes.length - 1];
+      if (nowMs - lastBeat > 6000) {
+        this._fallbackBeatTimes.length = 0;
+        this._fallbackTempoConfidence = 0;
+        this.aubioFeatures.tempoConf = 0;
+        if (!this._aubioModule || !this._aubio?.tempo) {
+          this.aubioFeatures.tempoBpm = 0;
+        }
+      }
+    }
+
+    if (!beat) return;
+
+    if (this._fallbackBeatTimes.length) {
+      const lastBeat = this._fallbackBeatTimes[this._fallbackBeatTimes.length - 1];
+      if (nowMs - lastBeat < 180) return;
+    }
+
+    this._fallbackBeatTimes.push(nowMs);
+    if (this._fallbackBeatTimes.length > 12) {
+      this._fallbackBeatTimes.shift();
+    }
+
+    if (this._fallbackBeatTimes.length < 3) return;
+
+    const intervals = [];
+    for (let i = 1; i < this._fallbackBeatTimes.length; i++) {
+      const delta = this._fallbackBeatTimes[i] - this._fallbackBeatTimes[i - 1];
+      if (Number.isFinite(delta) && delta > 120 && delta < 2500) {
+        intervals.push(delta);
+      }
+    }
+    if (!intervals.length) return;
+
+    const sorted = intervals.slice().sort((a, b) => a - b);
+    const trimCount = Math.max(0, Math.floor(sorted.length * 0.15));
+    const trimmed = sorted.slice(trimCount, sorted.length - trimCount);
+    const sample = trimmed.length ? trimmed : sorted;
+    if (!sample.length) return;
+
+    const avg = sample.reduce((sum, val) => sum + val, 0) / sample.length;
+    if (!Number.isFinite(avg) || avg <= 0) return;
+
+    const bpm = this._clamp(60000 / avg, 30, 300);
+    if (!Number.isFinite(bpm)) return;
+
+    let variance = 0;
+    for (const val of sample) {
+      const diff = val - avg;
+      variance += diff * diff;
+    }
+    variance = variance / sample.length;
+    const std = Math.sqrt(Math.max(variance, 0));
+    const jitter = Math.min(1, (std / avg) * 2);
+    const coverage = Math.min(1, sample.length / 6);
+    const confidence = this._clamp(coverage * (1 - jitter), 0, 1);
+
+    this._fallbackTempoBpm = bpm;
+    this._fallbackTempoConfidence = confidence;
+    this._fallbackTempoLastBeatMs = nowMs;
+    this.aubioFeatures.tempoBpm = bpm;
+    this.aubioFeatures.tempoConf = confidence;
+    this.aubioFeatures.lastOnsetMs = nowMs;
+    this._lastAubioTempoAt = nowMs;
+    this._lastLiveTempoSource = 'fallback-live';
+    this._lastLiveTempoSourceAt = nowMs;
+  }
+
   _computeRMS(timeData) {
     // timeData 0..255, center ~128
     let sumSq = 0; const N = timeData.length;
@@ -2869,35 +2960,84 @@ export class AudioEngine {
     const flux = fluxFromWorklet ?? this._computeFlux(this.freqData);
     const bassFlux = this._computeBassFlux(this.freqData);
 
+    // Fallback: Send analyser data to Aubio when worklet isn't available
+    // This ensures live BPM detection works with any audio source (mic, system audio, etc.)
+    // Meyda already sends data to Aubio, but only periodically. This ensures more frequent updates.
+    if (!this.workletEnabled && this.analyser && this.timeDataFloat) {
+      // Ensure Aubio is initialized
+      this._ensureAubioLoaded();
+      
+      // Send data more frequently than Meyda (which runs at ~50-75Hz)
+      // We'll send every frame to ensure Aubio gets continuous data for tempo detection
+      if (!this._aubioDirectFrameThrottle) this._aubioDirectFrameThrottle = 0;
+      this._aubioDirectFrameThrottle++;
+      
+      // Send every frame (60fps) for responsive tempo detection
+      if (this._aubioDirectFrameThrottle >= 1) {
+        this._aubioDirectFrameThrottle = 0;
+        try {
+          if (!this.timeDataFloat || this.timeDataFloat.length !== this.analyser.fftSize) {
+            this.timeDataFloat = new Float32Array(this.analyser.fftSize);
+          }
+          this.analyser.getFloatTimeDomainData(this.timeDataFloat);
+          const samples = this.timeDataFloat;
+          if (samples && samples.length >= 512) {
+            // Aubio expects 512-sample frames
+            const frameSize = 512;
+            // Send the most recent 512 samples
+            const frameStart = Math.max(0, samples.length - frameSize);
+            const aubioBuffer = this._acquireAubioScratch(frameSize);
+            aubioBuffer.set(samples.subarray(frameStart, frameStart + frameSize));
+            this._appendToLiveBuffer(aubioBuffer);
+            this._aubioDirectFrameId = (this._aubioDirectFrameId || 0) + 1;
+            this._enqueueAubioFrame(aubioBuffer, this._aubioDirectFrameId);
+          }
+        } catch (err) {
+          // Ignore errors - Aubio might not be ready yet or buffer issues
+        }
+      }
+    }
+
     // Get current BPM for tempo-aware beat detection (prefer file BPM, fall back to tap tempo)
     const currentBpm = this.bpmEstimate || this.tapBpm || null;
     let beat = this._detectBeat(flux, bands, currentBpm);
+    const detectedBeat = beat;
 
     // Live tempo assist: prefer file BPM; else use Aubio tempo for live sources
     const now = performance.now();
-    if (this.tempoAssistEnabled) {
-      if (this.isPlayingFile) {
-        // keep bpmEstimate from file analysis if available
-        if (this.bpmEstimate && this.bpmEstimate > 0) {
-          this.tempoIntervalMs = safeBpmToInterval(this.bpmEstimate);
-        }
-      } else {
-        const liveBpm = this.aubioFeatures.tempoBpm;
-        const liveConf = this.aubioFeatures.tempoConf;
-        if (typeof liveBpm === 'number' && isFinite(liveBpm) && liveBpm > 30 && liveBpm < 300 && (liveConf ?? 0) >= 0.05) {
-          const rounded = Math.round(liveBpm);
-          const intervalMs = safeBpmToInterval(rounded);
-          if (!this.bpmEstimate || Math.abs(rounded - this.bpmEstimate) >= 1) {
-            this.bpmEstimate = rounded;
-          }
-          if (intervalMs > 0) {
-            this.tempoIntervalMs = intervalMs;
-          }
-          this._lastTempoMs = now;
-          this.bpmEstimateSource = 'aubio-live';
-          this.bpmEstimateConfidence = this._clamp(liveConf || 0, 1e-3, 1);
+    const liveBpm = this.aubioFeatures.tempoBpm;
+    const liveConf = this.aubioFeatures.tempoConf;
+    const liveTempoValid = typeof liveBpm === 'number' && isFinite(liveBpm) &&
+      liveBpm > 30 && liveBpm < 300;
+
+    if (this.isPlayingFile) {
+      // keep bpmEstimate from file analysis if available
+      if (this.tempoAssistEnabled && this.bpmEstimate && this.bpmEstimate > 0) {
+        const intervalMs = safeBpmToInterval(this.bpmEstimate);
+        if (intervalMs > 0) {
+          this.tempoIntervalMs = intervalMs;
         }
       }
+    } else if (liveTempoValid) {
+      const confNorm = this._clamp(liveConf ?? 0, 0, 1);
+      const prevBpm = (this.bpmEstimate && isFinite(this.bpmEstimate) && this.bpmEstimate > 0)
+        ? this.bpmEstimate
+        : liveBpm;
+      const smoothingFactor = confNorm > 0 ? Math.min(0.85, Math.max(0.2, confNorm * 0.75)) : 0.15;
+      const blended = prevBpm + (liveBpm - prevBpm) * smoothingFactor;
+      const targetBpm = Math.round(blended * 10) / 10;
+      this.bpmEstimate = targetBpm;
+      if (this.tempoAssistEnabled) {
+        const intervalMs = safeBpmToInterval(targetBpm);
+        if (intervalMs > 0) {
+          this.tempoIntervalMs = intervalMs;
+        }
+      }
+      this._lastTempoMs = now;
+      this.bpmEstimateSource = 'aubio-live';
+      this.bpmEstimateConfidence = Math.max(this._clamp(confNorm, 0, 1), 0.05);
+      this._lastLiveTempoSource = 'aubio-live';
+      this._lastLiveTempoSourceAt = now;
     }
 
     // Tempo-assist beat pulse (file playback or live) and/or Tap-Quantized grid
@@ -2922,6 +3062,10 @@ export class AudioEngine {
     const aubioOnsetPulse = this.aubioFeatures.lastOnsetMs > 0 && (now - this.aubioFeatures.lastOnsetMs) < 150;
 
     beat = beat || quantBeat || aubioOnsetPulse;
+
+    if (!this._aubioModule || !this._aubio || !this._aubio.tempo) {
+      this._updateFallbackTempo(beat, now);
+    }
 
     // Smooth
     const a = this.smoothing; const inv = 1 - a;

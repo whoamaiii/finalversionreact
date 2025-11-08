@@ -108,7 +108,7 @@ export class PerformanceController {
       twistBoost: 0.28,
     };
 
-    this._installHud();
+    // this._installHud(); // Disabled: HUD overlay removed
     this._installKeyHandlers();
     try { this.sync?.setPadEventHandler?.((evt) => this._handleRemotePadEvent(evt)); } catch (_) {}
   }

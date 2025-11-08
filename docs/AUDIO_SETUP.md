@@ -59,3 +59,6 @@ This guide walks through configuring reliable system-audio routing for VJ shows 
 
 Refer back to this guide whenever you add new hardware or reinstall the OS to make sure the virtual routing stays locked in.
 
+
+
+
