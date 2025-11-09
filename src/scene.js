@@ -690,6 +690,9 @@ export function initScene() {
       opacity: 0.3,
       twist: 0,
       twistDir: 1,
+      flipValue: 1,
+      _flipTarget: 1,
+      _flipCooldownBeats: 0,
       stutterTimes: [],
       travel: 0,
       _flipBeatAccumulator: 0,
@@ -2176,18 +2179,42 @@ export function initScene() {
         const flipOnStutter = d.flipOnStutter !== false;
         const downbeatTwistBoost = typeof d.downbeatTwistBoost === 'number' ? d.downbeatTwistBoost : 0.3;
         const flipEveryNBeats = Math.max(0, Math.floor(typeof d.flipEveryNBeats === 'number' ? d.flipEveryNBeats : 0));
+        const flipRiseMs = THREE.MathUtils.clamp(typeof d.flipRiseMs === 'number' ? d.flipRiseMs : 120, 10, 4000);
+        const flipFallMs = THREE.MathUtils.clamp(typeof d.flipFallMs === 'number' ? d.flipFallMs : 180, 10, 4000);
+        const flipHoldBeats = Math.max(0, Math.floor(typeof d.flipHoldBeats === 'number' ? d.flipHoldBeats : 0));
+        const flipAmount = THREE.MathUtils.clamp(typeof d.flipAmount === 'number' ? d.flipAmount : 1.0, 0, 1);
         if (state.dispersion._flipSetting !== flipEveryNBeats) {
           state.dispersion._flipSetting = flipEveryNBeats;
           state.dispersion._flipBeatAccumulator = 0;
         }
+        if (!Number.isFinite(state.dispersion._flipTarget)) state.dispersion._flipTarget = 1;
+        if (!Number.isFinite(state.dispersion.flipValue)) state.dispersion.flipValue = state.dispersion._flipTarget;
+        if (!Number.isFinite(state.dispersion._flipCooldownBeats)) state.dispersion._flipCooldownBeats = 0;
         if (flipEveryNBeats <= 0) {
           state.dispersion._flipBeatAccumulator = 0;
         } else if (isBeat) {
           state.dispersion._flipBeatAccumulator = (state.dispersion._flipBeatAccumulator || 0) + 1;
+        }
+        if (isBeat && state.dispersion._flipCooldownBeats > 0) {
+          state.dispersion._flipCooldownBeats = Math.max(0, state.dispersion._flipCooldownBeats - 1);
+        }
+
+        const requestFlip = () => {
+          if (flipHoldBeats > 0 && state.dispersion._flipCooldownBeats > 0) return false;
+          const currentTarget = state.dispersion._flipTarget ?? 1;
+          const nextTarget = currentTarget >= 0 ? -1 : 1;
+          state.dispersion._flipTarget = nextTarget;
+          state.dispersion._flipCooldownBeats = flipHoldBeats;
+          state.dispersion.twistDir = nextTarget;
+          return true;
+        };
+
+        if (flipEveryNBeats > 0 && isBeat) {
           if (downbeatPulse && state.dispersion._flipBeatAccumulator >= flipEveryNBeats) {
-            state.dispersion.twistDir = (state.dispersion.twistDir || 1) * -1;
-            state.dispersion._flipBeatAccumulator = 0;
-            twistFlippedThisFrame = true;
+            if (requestFlip()) {
+              state.dispersion._flipBeatAccumulator = 0;
+              twistFlippedThisFrame = true;
+            }
           }
         }
 
@@ -2210,8 +2237,9 @@ export function initScene() {
         }
         const stutterCount = (Array.isArray(state.dispersion.stutterTimes) && state.dispersion.stutterTimes.length >= 2) ? 1 : 0;
         if (stutterCount && flipOnStutter && !twistFlippedThisFrame) {
-          state.dispersion.twistDir = (state.dispersion.twistDir || 1) * -1;
-          twistFlippedThisFrame = true;
+          if (requestFlip()) {
+            twistFlippedThisFrame = true;
+          }
         }
 
         const fluxZ = (features && typeof features.fluxStd === 'number' && features.fluxStd > 1e-6)
@@ -2237,6 +2265,19 @@ export function initScene() {
           const current = state.dispersion.twist || 0;
           const lerpRate = twistTarget > current ? twistAttack : twistRelease;
           state.dispersion.twist = THREE.MathUtils.lerp(current, twistTarget, THREE.MathUtils.clamp(lerpRate, 0, 1));
+        }
+
+        {
+          const currentFlip = Number.isFinite(state.dispersion.flipValue) ? state.dispersion.flipValue : (state.dispersion._flipTarget || 1);
+          const targetFlip = state.dispersion._flipTarget || 1;
+          const dtMs = Math.max(1e-3, dt) * 1000;
+          const riseAlpha = 1 - Math.exp(-dtMs / Math.max(10, flipRiseMs));
+          const fallAlpha = 1 - Math.exp(-dtMs / Math.max(10, flipFallMs));
+          const useAlpha = Math.sign(targetFlip) !== Math.sign(currentFlip) ? riseAlpha : fallAlpha;
+          state.dispersion.flipValue = THREE.MathUtils.lerp(currentFlip, targetFlip, THREE.MathUtils.clamp(useAlpha, 0, 1));
+          const flipMultiplier = THREE.MathUtils.lerp(1, state.dispersion.flipValue, flipAmount);
+          state.dispersion.twistMultiplier = flipMultiplier;
+          state.dispersion.twistDir = Math.sign(flipMultiplier) || 1;
         }
 
         // Travel accumulation (forward motion)
@@ -2355,7 +2396,9 @@ export function initScene() {
           const fractalBloomRadius = THREE.MathUtils.clamp(dcfg.fractalBloomRadius ?? 0.4, 0.1, 1.2);
           let fractalBloomAmount = 0;
           if (fractalBloomGain > 0 && isFinite(dt)) {
-            const bloomPulse = downbeatPulse ? (0.6 + bass * 0.5 + rms * 0.4) : 0;
+            const beatEnv = state.dispersion._beatEnv || 0;
+            const downbeatEnv = state.dispersion._downbeatEnv || 0;
+            const bloomPulse = (0.6 * beatEnv) + (1.1 * downbeatEnv) + (isDrop ? 0.9 : 0) + Math.max(0, bass * 0.45 + rms * 0.35);
             const targetBloom = Math.max(0, bloomPulse) * fractalBloomGain;
             const currentBloom = state.dispersion.fractalBloomAmount || 0;
             const bloomRise = 1 - Math.exp(-Math.max(1e-3, dt) * 1000 / 30);
@@ -2453,7 +2496,7 @@ export function initScene() {
             tintMix,
             brightness,
             contrast,
-            twist: (state.dispersion.twist || 0) * (state.dispersion.twistDir || 1),
+            twist: (state.dispersion.twist || 0) * (state.dispersion.twistMultiplier ?? state.dispersion.twistDir ?? 1),
             twistFalloff,
             travel: state.dispersion.travel || 0,
             width: dbSize.x || state.renderer.domElement.width,

@@ -347,8 +347,11 @@ export function createDispersionLayer(initialVariant = 'classic') {
         vec2 polar = vec2(dist, atan(normCoord.y, normCoord.x));
         float fractal = sin(polar.y * 6.0 + t * 1.8) * 0.5 + sin(polar.y * 10.0 - t * 2.6) * 0.3;
         fractal += sin(polar.x * 18.0 + t * 3.2);
-        float bloom = clamp(uFractalBloomAmount, 0.0, 4.0) * ring * (0.5 + 0.5 * fractal);
-        col += vec3(bloom * 0.8, bloom * 0.65, bloom * 0.9);
+        float bloomStrength = clamp(uFractalBloomAmount, 0.0, 4.0);
+        float bloom = bloomStrength * ring * (0.5 + 0.5 * fractal);
+        vec3 bloomColor = vec3(bloom * 0.95, bloom * 0.75, bloom * 1.15);
+        float bloomMix = clamp(bloomStrength * 0.4, 0.0, 1.0);
+        col = mix(col, clamp(col + bloomColor, 0.0, 2.2), bloomMix);
       }
       if (uRippleAmount > 0.0001) {
         float rippleAngle = normCoord.y * uRippleDensity * 6.2831853 + t * uRippleSpeed + uRipplePhase;
@@ -478,6 +481,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
 
   let _pendingVariant = null;
   let _variantDebounceTimer = null;
+  let _compilationTimer = null;
   let _isCompiling = false;
 
   function setVariant(variant) {
@@ -493,6 +497,7 @@ export function createDispersionLayer(initialVariant = 'classic') {
     // Debounce rapid variant changes
     if (_variantDebounceTimer) {
       clearTimeout(_variantDebounceTimer);
+      _variantDebounceTimer = null;
     }
 
     _variantDebounceTimer = setTimeout(() => {
@@ -502,8 +507,14 @@ export function createDispersionLayer(initialVariant = 'classic') {
         material.fragmentShader = src;
         material.needsUpdate = true;
 
+        // Clear any existing compilation timer
+        if (_compilationTimer) {
+          clearTimeout(_compilationTimer);
+        }
+
         // Allow GPU time to compile, then check for pending changes
-        setTimeout(() => {
+        _compilationTimer = setTimeout(() => {
+          _compilationTimer = null;
           _isCompiling = false;
           if (_pendingVariant && _pendingVariant !== next) {
             const queued = _pendingVariant;
@@ -524,6 +535,11 @@ export function createDispersionLayer(initialVariant = 'classic') {
     if (_variantDebounceTimer) {
       clearTimeout(_variantDebounceTimer);
       _variantDebounceTimer = null;
+    }
+    // Clear compilation timer
+    if (_compilationTimer) {
+      clearTimeout(_compilationTimer);
+      _compilationTimer = null;
     }
     _pendingVariant = null;
     _isCompiling = false;

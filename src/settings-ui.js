@@ -43,6 +43,29 @@ const _trackedTimeouts = new Set();
 const _trackedDomListeners = [];
 const _trackedCleanupFns = [];
 
+const KEY9_TONE_COLOR_MACRO = Object.freeze({
+  tone: Object.freeze({
+    brightness: 1.65,
+    brightnessGain: 1.05,
+    contrast: 1.75,
+    contrastGain: 0.85,
+    fractalBloomGain: 1.2,
+    fractalBloomDecay: 0.5,
+    fractalBloomRadius: 0.42,
+  }),
+  color: Object.freeze({
+    tintHue: 0.08,
+    tintSat: 0.78,
+    tintMixBase: 0.33,
+    tintMixChromaGain: 0.92,
+    tintMixMax: 0.95,
+    causticMix: 1.1,
+    causticHueShift: 0.4,
+    prismIntensity: 0.9,
+    prismBreath: 0.6,
+  }),
+});
+
 function trackTimeout(handler, delay = 0, ...args) {
   if (typeof handler !== 'function') return window.setTimeout(handler, delay, ...args);
   const id = window.setTimeout(() => {
@@ -247,6 +270,13 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     activeSnapshotSlot: '1',
   };
 
+  shaderState.momentary = {
+    key9: {
+      active: false,
+      snapshot: null,
+    },
+  };
+
   shaderState.pinnedKeys = Array.isArray(shaderState.pinnedKeys)
     ? Array.from(new Set(shaderState.pinnedKeys)).filter((key) => !!getParamSchema(key))
     : [];
@@ -375,6 +405,35 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     }).filter(Boolean);
     pinnedHudNode.textContent = lines.join('\n');
     pinnedHudNode.style.opacity = '1';
+  };
+
+  const applyToneColorHoldMacro = ({ showHud = true } = {}) => {
+    const macroSlot = shaderState.momentary?.key9;
+    if (!macroSlot || macroSlot.active) return;
+    const params = ensureDispersionParams();
+    macroSlot.snapshot = {
+      tone: pickSection(params, 'tone'),
+      color: pickSection(params, 'color'),
+    };
+    assignSection(params, KEY9_TONE_COLOR_MACRO.tone, 'tone');
+    assignSection(params, KEY9_TONE_COLOR_MACRO.color, 'color');
+    macroSlot.active = true;
+    updatePinnedHudOverlay();
+    notifyRenderAll();
+    if (showHud) showShaderHud('Tone Macro', 'Held');
+  };
+
+  const releaseToneColorHoldMacro = ({ showHud = true } = {}) => {
+    const macroSlot = shaderState.momentary?.key9;
+    if (!macroSlot || !macroSlot.active) return;
+    const params = ensureDispersionParams();
+    if (macroSlot.snapshot?.tone) assignSection(params, macroSlot.snapshot.tone, 'tone');
+    if (macroSlot.snapshot?.color) assignSection(params, macroSlot.snapshot.color, 'color');
+    macroSlot.active = false;
+    macroSlot.snapshot = null;
+    updatePinnedHudOverlay();
+    notifyRenderAll();
+    if (showHud) showShaderHud('Tone Macro', 'Restored');
   };
 
   let shaderRenderContext = null;
@@ -2280,6 +2339,43 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
     return el;
   }
 
+  const isTextEntryTarget = (event) => {
+    const tag = (event?.target?.tagName || '').toLowerCase();
+    if (['input', 'textarea', 'select', 'button'].includes(tag)) return true;
+    return !!event?.target?.isContentEditable;
+  };
+
+  const handleMacroKeydown = (event) => {
+    if (!event) return;
+    if (event.repeat) return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!shaderState.hotkeysEnabled) return;
+    if (isTextEntryTarget(event)) return;
+    if ((event.key || '') !== '9') return;
+    event.preventDefault();
+    event.stopPropagation();
+    applyToneColorHoldMacro({ showHud: true });
+  };
+
+  const handleMacroKeyup = (event) => {
+    if (!event) return;
+    if ((event.key || '') !== '9') return;
+    const macroActive = !!shaderState.momentary?.key9?.active;
+    if (!macroActive) {
+      if (isTextEntryTarget(event)) return;
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    releaseToneColorHoldMacro({ showHud: true });
+  };
+
+  const handleMacroBlur = () => {
+    if (shaderState.momentary?.key9?.active) {
+      releaseToneColorHoldMacro({ showHud: false });
+    }
+  };
+
   function handleShaderHotkeys(event) {
     if (!shaderState.hotkeysEnabled) return;
     const isDrawerOpen = root.style.display === 'block' && root.classList.contains('open');
@@ -2573,6 +2669,10 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
 
   // Store reference for cleanup
   _shaderHotkeysHandler = handleShaderHotkeys;
+
+  trackDomListener(window, 'keydown', handleMacroKeydown, true);
+  trackDomListener(window, 'keyup', handleMacroKeyup, true);
+  trackDomListener(window, 'blur', handleMacroBlur);
 
   // Track handler for cleanup (prevents duplicates on re-initialization)
   trackDomListener(window, 'keydown', _shaderHotkeysHandler, true);
