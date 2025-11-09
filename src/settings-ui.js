@@ -305,7 +305,174 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
   if (!sectionPresetStore || typeof sectionPresetStore !== 'object' || Array.isArray(sectionPresetStore) || sectionPresetStore === null) {
     sectionPresetStore = {};
   }
-  const persistSectionPresets = () => writeJson(DISPERSION_STORAGE_KEYS.sectionPresets, sectionPresetStore);
+
+  // localStorage quota monitoring constants
+  const SECTION_PRESET_LIMIT_PER_SECTION = 20; // Max presets per section
+  const SECTION_PRESET_LIMIT_GLOBAL = 100; // Max total presets across all sections
+  const QUOTA_THRESHOLD_PERCENT = 0.9; // Warn/evict when >90% full
+
+  /**
+   * Check localStorage quota usage
+   * @returns {Promise<Object>} { used: number, quota: number, percentUsed: number }
+   */
+  const checkStorageQuota = async () => {
+    try {
+      if (!navigator.storage || !navigator.storage.estimate) {
+        // Fallback: estimate based on localStorage size
+        let totalSize = 0;
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          const value = localStorage.getItem(key);
+          totalSize += (key?.length || 0) + (value?.length || 0);
+        }
+        // Assume 5MB quota (typical browser default)
+        return Promise.resolve({ used: totalSize, quota: 5 * 1024 * 1024, percentUsed: totalSize / (5 * 1024 * 1024) });
+      }
+
+      const estimate = await navigator.storage.estimate();
+      const used = estimate.usage || 0;
+      const quota = estimate.quota || 5 * 1024 * 1024; // Fallback to 5MB
+      return { used, quota, percentUsed: used / quota };
+    } catch (err) {
+      console.warn('[Settings] Failed to check storage quota:', err);
+      return Promise.resolve({ used: 0, quota: 5 * 1024 * 1024, percentUsed: 0 });
+    }
+  };
+
+  /**
+   * Enforce preset limits and evict oldest if needed
+   * @param {string} sectionId - Section ID being saved to
+   * @returns {boolean} true if eviction occurred
+   */
+  const enforcePresetLimits = async (sectionId) => {
+    let evicted = false;
+
+    // Enforce per-section limit
+    if (sectionPresetStore[sectionId] && Object.keys(sectionPresetStore[sectionId]).length >= SECTION_PRESET_LIMIT_PER_SECTION) {
+      const presets = sectionPresetStore[sectionId];
+      const entries = Object.entries(presets);
+      
+      // Sort by key (preset name) and remove oldest (first in object)
+      // Note: In practice, we'd want to track last-used timestamps, but for now
+      // we'll remove the first entry alphabetically
+      const sorted = entries.sort((a, b) => a[0].localeCompare(b[0]));
+      const toRemove = sorted[0][0];
+      delete presets[toRemove];
+      evicted = true;
+      console.log(`[Settings] Evicted preset "${toRemove}" from section "${sectionId}" (per-section limit)`);
+    }
+
+    // Count total presets across all sections
+    let totalPresets = 0;
+    for (const sectionId in sectionPresetStore) {
+      totalPresets += Object.keys(sectionPresetStore[sectionId] || {}).length;
+    }
+
+    // Enforce global limit
+    if (totalPresets >= SECTION_PRESET_LIMIT_GLOBAL) {
+      // Find section with most presets and remove oldest from it
+      let maxSection = null;
+      let maxCount = 0;
+      for (const sid in sectionPresetStore) {
+        const count = Object.keys(sectionPresetStore[sid] || {}).length;
+        if (count > maxCount) {
+          maxCount = count;
+          maxSection = sid;
+        }
+      }
+
+      if (maxSection && sectionPresetStore[maxSection]) {
+        const presets = sectionPresetStore[maxSection];
+        const entries = Object.entries(presets);
+        if (entries.length > 0) {
+          const sorted = entries.sort((a, b) => a[0].localeCompare(b[0]));
+          const toRemove = sorted[0][0];
+          delete presets[toRemove];
+          evicted = true;
+          console.log(`[Settings] Evicted preset "${toRemove}" from section "${maxSection}" (global limit)`);
+        }
+      }
+    }
+
+    // Check quota and evict if needed
+    const quotaInfo = await checkStorageQuota();
+    if (quotaInfo.percentUsed > QUOTA_THRESHOLD_PERCENT) {
+      // Find section with most presets and remove oldest
+      let maxSection = null;
+      let maxCount = 0;
+      for (const sid in sectionPresetStore) {
+        const count = Object.keys(sectionPresetStore[sid] || {}).length;
+        if (count > maxCount) {
+          maxCount = count;
+          maxSection = sid;
+        }
+      }
+
+      if (maxSection && sectionPresetStore[maxSection]) {
+        const presets = sectionPresetStore[maxSection];
+        const entries = Object.entries(presets);
+        if (entries.length > 0) {
+          const sorted = entries.sort((a, b) => a[0].localeCompare(b[0]));
+          const toRemove = sorted[0][0];
+          delete presets[toRemove];
+          evicted = true;
+          const percentUsed = (quotaInfo.percentUsed * 100).toFixed(1);
+          console.warn(`[Settings] Storage quota exceeded ${percentUsed}%, evicted preset "${toRemove}"`);
+          showToast(`Storage nearly full (${percentUsed}%). Removed oldest preset.`, 4000);
+        }
+      }
+    }
+
+    return evicted;
+  };
+
+  const persistSectionPresets = async () => {
+    try {
+      // Enforce limits before saving
+      const sectionId = shaderState.activeSection;
+      if (sectionId) {
+        const evicted = await enforcePresetLimits(sectionId);
+        if (evicted) {
+          // Re-check after eviction
+          await enforcePresetLimits(sectionId);
+        }
+      }
+
+      // Attempt to save
+      writeJson(DISPERSION_STORAGE_KEYS.sectionPresets, sectionPresetStore);
+    } catch (err) {
+      if (err.name === 'QuotaExceededError') {
+        console.warn('[Settings] localStorage quota exceeded after eviction attempts');
+        showToast('Storage full! Some presets may not be saved.', 3000);
+        
+        // Last resort: remove oldest preset from any section
+        let removed = false;
+        for (const sid in sectionPresetStore) {
+          if (sectionPresetStore[sid] && Object.keys(sectionPresetStore[sid]).length > 0) {
+            const presets = sectionPresetStore[sid];
+            const entries = Object.entries(presets);
+            const sorted = entries.sort((a, b) => a[0].localeCompare(b[0]));
+            const toRemove = sorted[0][0];
+            delete presets[toRemove];
+            removed = true;
+            console.warn(`[Settings] Emergency eviction: removed "${toRemove}" from "${sid}"`);
+            break;
+          }
+        }
+        
+        if (removed) {
+          // Retry save after emergency eviction
+          try {
+            writeJson(DISPERSION_STORAGE_KEYS.sectionPresets, sectionPresetStore);
+          } catch (retryErr) {
+            console.error('[Settings] Failed to save after emergency eviction:', retryErr);
+          }
+        }
+      } else {
+        throw err;
+      }
+    }
+  };
 
   let shaderPresetStore = readJson(DISPERSION_STORAGE_KEYS.shaderPresets, {});
   if (!shaderPresetStore || typeof shaderPresetStore !== 'object' || Array.isArray(shaderPresetStore) || shaderPresetStore === null) {
@@ -1691,13 +1858,13 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
           resetSectionToDefaults(section.id);
           renderSections(true); // Force rebuild on section change
         }, { class: 'ghost' }));
-        menu.appendChild(button('Save', () => {
+        menu.appendChild(button('Save', async () => {
           shaderState.activeSection = section.id; persistActiveSection();
           const name = prompt(`Save preset name for ${section.label}`);
           if (!name) return;
           if (!sectionPresetStore[section.id]) sectionPresetStore[section.id] = {};
           sectionPresetStore[section.id][name] = pickSection(ensureDispersionParams(), section.id);
-          persistSectionPresets();
+          await persistSectionPresets();
           showToast('Section preset saved');
         }, { class: 'ghost' }));
         menu.appendChild(button('Load', () => {

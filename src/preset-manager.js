@@ -278,18 +278,27 @@ export class PresetManager {
   on(event, handler) {
     if (typeof handler !== 'function') return () => {};
 
-    // Check for excessive listeners
-    if (this._listeners.size >= this._maxListeners && !this._listenerWarningShown) {
-      this._listenerWarningShown = true;
-      console.error('[PresetManager] MEMORY LEAK WARNING: Listener count exceeded',
-        this._maxListeners, 'listeners. Check for missing cleanup.');
+    // Hard limit enforcement - prevent unbounded growth
+    if (this._listeners.size >= this._maxListeners) {
+      // Try to clean up duplicates first
+      this._cleanupDuplicateListeners();
 
-      // Log listener breakdown for debugging
-      const eventCounts = {};
-      for (const l of this._listeners) {
-        eventCounts[l.event] = (eventCounts[l.event] || 0) + 1;
+      // If still at limit after cleanup, reject new listener
+      if (this._listeners.size >= this._maxListeners) {
+        console.error('[PresetManager] LISTENER LIMIT ENFORCED: Cannot add more listeners.',
+          `Current: ${this._listeners.size}, Max: ${this._maxListeners}`);
+        console.error('This is likely a memory leak. Check for missing cleanup in components.');
+
+        // Log listener breakdown for debugging
+        const eventCounts = {};
+        for (const l of this._listeners) {
+          eventCounts[l.event] = (eventCounts[l.event] || 0) + 1;
+        }
+        console.table(eventCounts);
+
+        // Return a no-op cleanup function
+        return () => {};
       }
-      console.table(eventCounts);
     }
 
     const wrapped = { event, handler };

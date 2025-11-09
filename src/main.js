@@ -195,6 +195,9 @@ if (diagnosticsEnabled) {
 const autoStutterUpdateIntervalMs = 500; // Recalculate every 500ms (smooth without being too reactive)
 let autoStutterLastUpdate = 0;
 let autoStutterCurrentValue = 180; // Start with default value, will sync with actual on first update
+const autoPulseUpdateIntervalMs = 600;
+let autoPulseLastUpdate = 0;
+let autoPulseCurrentValue = 160;
 
 // Create the sync coordinator for multi-window synchronization
 // This allows multiple browser windows to stay in sync (control + projector mode)
@@ -725,12 +728,17 @@ function ensureFeatureWs(nowMs, { force = false } = {}) {
   // Rate limit: don't try too often (respect backoff delay)
   if (!force && now - featureWsLastAttemptMs < featureWsBackoffMs) return;
 
+  // CRITICAL: Set connecting flag BEFORE cleanup to prevent race condition
+  // This ensures multiple rapid calls don't create duplicate WebSocket connections
+  // Must be BEFORE closeFeatureWs() to claim the connection slot atomically
+  featureWsConnecting = true;
+
   // Clean up any existing connection before creating new one
+  // Note: closeFeatureWs will reset featureWsConnecting to false,
+  // but we'll set it back to true immediately after
   closeFeatureWs();
 
-  // CRITICAL: Set connecting flag AFTER cleanup to prevent race condition
-  // This ensures multiple rapid calls don't create duplicate WebSocket connections
-  // Must be AFTER closeFeatureWs() which resets this flag
+  // Re-set the connecting flag since closeFeatureWs cleared it
   featureWsConnecting = true;
 
   // Record this attempt
@@ -1157,6 +1165,25 @@ function animate() {
     if (pm) pm.markSectionEnd('auto.stutter');
   }
 
+  // Auto pulse decay: adjust pulse half-life dynamically to follow tempo and intensity
+  if (pm) pm.markSectionStart('auto.pulseDecay');
+  try {
+    if (features && sceneApi.state?.params?.visuals?.dispersion?.autoPulseDecay) {
+      if (now - autoPulseLastUpdate > autoPulseUpdateIntervalMs) {
+        autoPulseLastUpdate = now;
+        const optimalHalfLife = audio.calculateOptimalPulseHalfLife(features);
+        const lerpFactor = 0.18;
+        autoPulseCurrentValue = autoPulseCurrentValue * (1 - lerpFactor) + optimalHalfLife * lerpFactor;
+        const roundedValue = Math.round(autoPulseCurrentValue / 10) * 10;
+        sceneApi.state.params.visuals.dispersion.pulseHalfLifeMs = roundedValue;
+      }
+    } else if (sceneApi.state?.params?.visuals?.dispersion?.pulseHalfLifeMs) {
+      autoPulseCurrentValue = sceneApi.state.params.visuals.dispersion.pulseHalfLifeMs;
+    }
+  } finally {
+    if (pm) pm.markSectionEnd('auto.pulseDecay');
+  }
+
   // Auto-disable diagnostics after time/count limits to prevent memory accumulation
   if (diagnosticsActive) {
     const diagnosticsElapsed = now - diagnosticsStartTime;
@@ -1391,17 +1418,13 @@ function animate() {
             now,
             autoLast
           });
-          // Force reset to recover from invalid state
-          autoFrames = 0;
-          autoElapsedMs = 0;
-          autoLast = now;
         }
 
-        // Reset counters (always reset even if calculation succeeded)
-        if (Number.isFinite(fpsApprox)) {
-          autoFrames = 0;
-          autoElapsedMs = 0;
-        }
+        // Always reset counters after calculation attempt (whether valid or invalid)
+        // This ensures clean state for next measurement period
+        autoFrames = 0;
+        autoElapsedMs = 0;
+        // Note: autoLast is already updated every frame on line 1355
       }
     }
   } finally {

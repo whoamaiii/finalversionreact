@@ -277,6 +277,11 @@ export class SyncCoordinator {
     this._projectorHealthCheck = null; // Health check timer for projector window
     this._lastProjectorResponse = 0; // Last time projector responded to ping
 
+    // Message chunking support for large messages
+    this._chunkBuffers = new Map(); // Store incomplete chunked messages
+    this._chunkCleanupTimer = null;
+    this.MAX_CHUNK_SIZE = 1 * 1024 * 1024; // 1MB per chunk (well below 5MB limit)
+
     this._initTransports();
 
     // Clear any existing hello timer before setting new one (prevents overlap)
@@ -341,10 +346,135 @@ export class SyncCoordinator {
     }
   }
 
+  _handleChunk(chunkPayload) {
+    const { chunkId, chunkIndex, totalChunks, originalType, originalTarget, data } = chunkPayload;
+
+    // Initialize buffer for this chunk set if needed
+    if (!this._chunkBuffers.has(chunkId)) {
+      this._chunkBuffers.set(chunkId, {
+        chunks: new Array(totalChunks),
+        receivedCount: 0,
+        originalType,
+        originalTarget,
+        firstReceivedAt: Date.now(),
+      });
+
+      // Set up cleanup timer for stale chunks (30 seconds)
+      this._scheduleChunkCleanup();
+    }
+
+    const buffer = this._chunkBuffers.get(chunkId);
+
+    // Store this chunk
+    if (!buffer.chunks[chunkIndex]) {
+      buffer.chunks[chunkIndex] = data;
+      buffer.receivedCount++;
+
+      // Check if all chunks received
+      if (buffer.receivedCount === totalChunks) {
+        // Reassemble the message
+        const fullMessage = buffer.chunks.join('');
+
+        try {
+          const originalMessage = JSON.parse(fullMessage);
+
+          // Clean up the buffer
+          this._chunkBuffers.delete(chunkId);
+
+          // Process the reassembled message normally
+          this._handleMessage(originalMessage, 'chunk-reassembled', null);
+
+          console.log('[Sync] Successfully reassembled chunked message:', originalType);
+        } catch (err) {
+          console.error('[Sync] Failed to reassemble chunked message:', err);
+          this._chunkBuffers.delete(chunkId);
+        }
+      }
+    }
+  }
+
+  _scheduleChunkCleanup() {
+    // Clear existing timer if any
+    if (this._chunkCleanupTimer) {
+      clearTimeout(this._chunkCleanupTimer);
+    }
+
+    // Schedule cleanup in 30 seconds
+    this._chunkCleanupTimer = setTimeout(() => {
+      const now = Date.now();
+      const STALE_THRESHOLD = 30000; // 30 seconds
+
+      for (const [chunkId, buffer] of this._chunkBuffers.entries()) {
+        if (now - buffer.firstReceivedAt > STALE_THRESHOLD) {
+          console.warn('[Sync] Cleaning up stale chunk buffer:', chunkId,
+            `(received ${buffer.receivedCount}/${buffer.chunks.length})`);
+          this._chunkBuffers.delete(chunkId);
+        }
+      }
+
+      // Reschedule if there are still buffers
+      if (this._chunkBuffers.size > 0) {
+        this._scheduleChunkCleanup();
+      }
+    }, 30000);
+  }
+
+  _sendChunk(chunkMessage, { useStorage = false } = {}) {
+    // Send chunk using normal transport mechanisms
+    // Track transport success for fallback handling
+    let sentViaBroadcast = false;
+    let sentViaPostMessage = false;
+
+    // Try BroadcastChannel first
+    if (this.channel) {
+      try {
+        this.channel.postMessage(chunkMessage);
+        sentViaBroadcast = true;
+      } catch (err) {
+        console.error('[Sync] Failed to post chunk via BroadcastChannel:', err);
+      }
+    }
+
+    // Try postMessage to windows
+    const directTargets = [];
+    if (this.projectorWindow && !this.projectorWindow.closed) directTargets.push(this.projectorWindow);
+    if (this.controlWindow && !this.controlWindow.closed) directTargets.push(this.controlWindow);
+    if (typeof window !== 'undefined' && window.opener && this.role === 'control') {
+      try {
+        const opener = window.opener;
+        if (opener && !directTargets.includes(opener) && !opener.closed) directTargets.push(opener);
+      } catch (_) {}
+    }
+    for (const win of directTargets) {
+      try {
+        win.postMessage(chunkMessage, '*');
+        sentViaPostMessage = true;
+      } catch (_) {}
+    }
+
+    // Try localStorage for critical chunks
+    if (useStorage && typeof localStorage !== 'undefined') {
+      try {
+        const payloadWithNonce = { ...chunkMessage, nonce: Math.random().toString(36).slice(2) };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payloadWithNonce));
+      } catch (err) {
+        if (err.name === 'QuotaExceededError') {
+          console.error('[Sync] localStorage quota exceeded for chunk');
+        }
+      }
+    }
+  }
+
   _handleMessage(raw, via, sourceWindow) {
     if (!raw || typeof raw !== 'object') return;
     if (raw.senderId === this.id) return;
     if (raw.target && raw.target !== 'any' && raw.target !== this.role) return;
+
+    // Handle chunked messages
+    if (raw.type === '__chunk') {
+      this._handleChunk(raw.payload);
+      return;
+    }
 
     if (via === 'postMessage') {
       if (this.role === 'control' && sourceWindow) this.projectorWindow = sourceWindow;
@@ -543,13 +673,54 @@ export class SyncCoordinator {
       sentAt: Date.now(),
     };
 
-    // Check message size before sending (BroadcastChannel limit ~5MB)
-    const MAX_MESSAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+    // Check message size and chunk if needed
+    const MAX_MESSAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB total limit
+    let messageStr;
     try {
-      const msgSize = JSON.stringify(message).length;
+      messageStr = JSON.stringify(message);
+      const msgSize = messageStr.length;
+
+      // If message exceeds chunk size, split into chunks
+      if (msgSize > this.MAX_CHUNK_SIZE) {
+        console.log('[Sync] Large message detected, chunking:', type,
+          Math.ceil(msgSize / this.MAX_CHUNK_SIZE), 'chunks');
+
+        const chunkId = Math.random().toString(36).slice(2);
+        const chunks = [];
+
+        // Split message into chunks
+        for (let i = 0; i < messageStr.length; i += this.MAX_CHUNK_SIZE) {
+          chunks.push(messageStr.slice(i, i + this.MAX_CHUNK_SIZE));
+        }
+
+        // Send each chunk
+        chunks.forEach((chunk, index) => {
+          const chunkMessage = {
+            version: 1,
+            type: '__chunk',
+            payload: {
+              chunkId,
+              chunkIndex: index,
+              totalChunks: chunks.length,
+              originalType: type,
+              originalTarget: target,
+              data: chunk,
+            },
+            target,
+            senderId: this.id,
+            sentAt: Date.now(),
+          };
+
+          // Send the chunk using the normal transport mechanisms
+          this._sendChunk(chunkMessage, { useStorage });
+        });
+
+        return; // Exit after sending chunks
+      }
+
+      // Check if even a single message is too large for transport
       if (msgSize > MAX_MESSAGE_SIZE_BYTES) {
-        console.error('[Sync] Message too large:', msgSize, 'bytes (max:', MAX_MESSAGE_SIZE_BYTES, ')');
-        // Try to show toast notification if available
+        console.error('[Sync] Message too large even after chunking:', msgSize, 'bytes');
         if (typeof window !== 'undefined') {
           import('./toast.js').then(({ showToast }) => {
             showToast('Sync failed: State too large', 'error', 5000);
@@ -558,7 +729,8 @@ export class SyncCoordinator {
         return;
       }
     } catch (err) {
-      console.error('[Sync] Failed to calculate message size:', err);
+      console.error('[Sync] Failed to process message:', err);
+      return;
     }
 
     // Track transport success for fallback handling
@@ -873,6 +1045,15 @@ export class SyncCoordinator {
       clearTimeout(this._helloTimerId);
       this._helloTimerId = null;
     }
+
+    // Clear chunk cleanup timer
+    if (this._chunkCleanupTimer) {
+      clearTimeout(this._chunkCleanupTimer);
+      this._chunkCleanupTimer = null;
+    }
+
+    // Clear any pending chunk buffers
+    this._chunkBuffers.clear();
 
     // Remove event listeners if they exist
     if (this._messageHandler) {

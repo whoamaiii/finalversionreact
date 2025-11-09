@@ -3379,6 +3379,44 @@ export class AudioEngine {
   }
 
   /**
+   * Calculate optimal pulse decay half-life based on tempo and spectral motion
+   * Used by auto pulse decay mode to keep pulses feeling musical across BPMs
+   *
+   * @param {Object} features - Current audio features (must include bpm)
+   * @returns {number} Recommended pulse half-life in milliseconds (60-400ms range)
+   */
+  calculateOptimalPulseHalfLife(features) {
+    if (!features) return 160;
+
+    const bpm = features.bpm || features.tapBpm || 128;
+    const beatMs = 60000 / Math.max(60, Math.min(200, bpm));
+
+    // Base decay around ~1/3 of the beat duration
+    let halfLife = beatMs * 0.35;
+
+    // Faster tempos benefit from snappier decay, slow tempos from longer trails
+    if (bpm > 160) {
+      halfLife = beatMs * 0.25;
+    } else if (bpm < 90) {
+      halfLife = beatMs * 0.45;
+    }
+
+    // Adjust based on spectral flux (more motion -> shorter decay)
+    if (Number.isFinite(features.flux) &&
+        Number.isFinite(features.fluxMean) &&
+        Number.isFinite(features.fluxStd) &&
+        features.fluxStd > 1e-6) {
+      const fluxZ = (features.flux - features.fluxMean) / Math.max(features.fluxStd, 1e-3);
+      const fluxNorm = Math.max(0, Math.min(1, (fluxZ + 3) / 6)); // map -3..3 to 0..1
+      const fluxScale = 1.1 - fluxNorm * 0.4; // 1.1 → 0.7
+      halfLife *= fluxScale;
+    }
+
+    halfLife = Math.max(60, Math.min(400, halfLife));
+    return Math.round(halfLife);
+  }
+
+  /**
    * Dispose method to clean up all resources and prevent memory leaks
    * Now async to properly handle AudioContext closure
    */

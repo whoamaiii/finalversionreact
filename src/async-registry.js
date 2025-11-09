@@ -11,11 +11,58 @@
  */
 
 export class AsyncOperationRegistry {
-  constructor(name = 'AsyncRegistry') {
+  constructor(name = 'AsyncRegistry', autoCleanupInterval = 60000) {
     this.name = name;
     this._operations = new Map(); // tokenId -> operation metadata
     this._nextId = 1;
     this._activeCategory = new Map(); // category -> current tokenId
+    this._autoCleanupInterval = autoCleanupInterval;
+    this._cleanupTimer = null;
+
+    // Start automatic cleanup if interval is provided
+    if (autoCleanupInterval > 0) {
+      this._startAutoCleanup();
+    }
+  }
+
+  /**
+   * Start automatic cleanup timer
+   */
+  _startAutoCleanup() {
+    // Clear existing timer if any
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+    }
+
+    // Run cleanup periodically
+    this._cleanupTimer = setInterval(() => {
+      const before = this._operations.size;
+      this.cleanup(this._autoCleanupInterval * 2); // Keep operations for 2x the interval
+      const after = this._operations.size;
+
+      if (before > after) {
+        console.log(`[${this.name}] Auto-cleanup removed ${before - after} stale operations`);
+      }
+    }, this._autoCleanupInterval);
+  }
+
+  /**
+   * Stop automatic cleanup timer
+   */
+  stopAutoCleanup() {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
+  }
+
+  /**
+   * Dispose the registry and clean up resources
+   */
+  dispose() {
+    this.stopAutoCleanup();
+    this._operations.clear();
+    this._activeCategory.clear();
   }
 
   /**

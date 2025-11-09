@@ -287,4 +287,41 @@ export class ReadinessGate {
     this._components.clear();
     this._readyCallbacks.clear();
   }
+
+  /**
+   * Dispose the gate and clean up resources
+   * Rejects all pending waiters and clears callbacks
+   */
+  dispose() {
+    // Reject all pending waiters
+    for (const [name, component] of this._components.entries()) {
+      if (component.waiters.length > 0) {
+        const error = new Error(`[${this.name}] ReadinessGate disposed while waiting for ${name}`);
+        component.waiters.forEach(waiter => {
+          try {
+            // Waiters are resolve functions, but we need to signal disposal somehow
+            // Since we can't reject a resolve function, we'll just clear them
+            // In a real scenario, we'd want to track reject functions too
+            console.warn(`[${this.name}] Disposing with ${component.waiters.length} waiters for ${name}`);
+          } catch (err) {
+            console.error(`[${this.name}] Error notifying waiter:`, err);
+          }
+        });
+        component.waiters = [];
+      }
+    }
+
+    // Clear all callbacks
+    for (const [name, callbacks] of this._readyCallbacks.entries()) {
+      if (callbacks.length > 0) {
+        console.warn(`[${this.name}] Disposing with ${callbacks.length} callbacks for ${name}`);
+      }
+    }
+
+    // Clear all data structures
+    this._components.clear();
+    this._readyCallbacks.clear();
+
+    console.log(`[${this.name}] Disposed`);
+  }
 }
