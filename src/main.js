@@ -51,6 +51,8 @@ const SESSION_RECOVERY_READY_TIMEOUT_MS = 5000;
 
 // Promise-based locking for modal to prevent race conditions
 let _recoveryModalPromise = null;
+let _recoveryModalResetTimeoutId = null; // Store timeout ID for cleanup
+let _syncRecoveryRequestTimeoutId = null; // Store timeout ID for cleanup
 
 SESSION_RECOVERY_DEPENDENCIES.forEach((dependency) => sessionRecoveryGate.register(dependency));
 
@@ -271,8 +273,13 @@ async function requestSessionRecoveryModal(snapshot) {
       console.error('[SessionRecovery] Failed to present recovery modal:', err);
 
       // Reset promise after delay to allow retry
-      setTimeout(() => {
+      // Store timeout ID for cleanup to prevent memory leak
+      if (_recoveryModalResetTimeoutId) {
+        clearTimeout(_recoveryModalResetTimeoutId);
+      }
+      _recoveryModalResetTimeoutId = setTimeout(() => {
         _recoveryModalPromise = null;
+        _recoveryModalResetTimeoutId = null;
         console.log('[SessionRecovery] Promise reset, retry allowed after 5s');
       }, 5000);
 
@@ -429,8 +436,13 @@ try {
     });
     
     // Request recovery on startup if control window is available
-    setTimeout(() => {
+    // Store timeout ID for cleanup to prevent memory leak
+    if (_syncRecoveryRequestTimeoutId) {
+      clearTimeout(_syncRecoveryRequestTimeoutId);
+    }
+    _syncRecoveryRequestTimeoutId = setTimeout(() => {
       sync.requestRecovery();
+      _syncRecoveryRequestTimeoutId = null;
     }, 1000);
   }
 } catch (err) {
@@ -1487,6 +1499,18 @@ function stopAnimation() {
     _quotaCheckIntervalId = null;
   }
 
+  // Clean up recovery modal promise reset timeout
+  if (_recoveryModalResetTimeoutId !== null) {
+    clearTimeout(_recoveryModalResetTimeoutId);
+    _recoveryModalResetTimeoutId = null;
+  }
+
+  // Clean up sync recovery request timeout
+  if (_syncRecoveryRequestTimeoutId !== null) {
+    clearTimeout(_syncRecoveryRequestTimeoutId);
+    _syncRecoveryRequestTimeoutId = null;
+  }
+
   // Clean up WebSocket connection
   closeFeatureWs({ resetState: true });
 
@@ -1598,6 +1622,20 @@ function stopAnimation() {
     cleanupSettingsUI();
   } catch (err) {
     console.warn('Error cleaning up settings UI:', err);
+  }
+
+  // Clean up recovery modal styles
+  try {
+    // Use dynamic import with fire-and-forget pattern since stopAnimation is synchronous
+    import('./recovery-modal.js').then(({ cleanupRecoveryModalStyles }) => {
+      if (typeof cleanupRecoveryModalStyles === 'function') {
+        cleanupRecoveryModalStyles();
+      }
+    }).catch(() => {
+      // Ignore if module not available or cleanup fails
+    });
+  } catch (err) {
+    // Ignore if import fails
   }
 
   // Remove all event listeners
