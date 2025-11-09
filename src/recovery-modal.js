@@ -449,3 +449,19 @@ function restoreSnapshot(snapshot, context) {
   console.log('[RecoveryModal] Session restored successfully');
 }
 
+/**
+ * Clean up recovery modal styles to prevent memory leaks
+ * Should be called during application shutdown
+ */
+export function cleanupRecoveryModalStyles() {
+  if (typeof document === 'undefined') return;
+  try {
+    const styleEl = document.getElementById(STYLE_ID);
+    if (styleEl && styleEl.parentNode) {
+      styleEl.parentNode.removeChild(styleEl);
+    }
+  } catch (err) {
+    // Ignore cleanup errors - element may already be removed
+  }
+}
+
