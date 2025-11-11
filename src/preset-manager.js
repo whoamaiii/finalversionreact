@@ -256,10 +256,27 @@ export class PresetManager {
       this._state = createEmptyState();
     }
 
-    // Versioned reset to delete existing presets and bootstrap only the new default set
+    // Version migration to preserve user presets across schema changes
     const EXPECTED_VERSION = 2;
     if ((this._state.version || 0) !== EXPECTED_VERSION) {
-      this._state = createEmptyState();
+      console.warn(`[PresetManager] Version mismatch: ${this._state.version || 0} -> ${EXPECTED_VERSION}`);
+
+      // Backup old state before migration
+      try {
+        const backupKey = `cosmicPresetLibrary.v${this._state.version || 0}.backup.${Date.now()}`;
+        this.storage.setItem(backupKey, JSON.stringify(this._state));
+        console.log(`[PresetManager] Backed up old state to ${backupKey}`);
+      } catch (err) {
+        console.error('[PresetManager] Failed to backup old state:', err);
+        // Continue with migration even if backup fails
+      }
+
+      // Migrate data structure to new version
+      this._state = this._migrateState(this._state, EXPECTED_VERSION);
+      console.log(`[PresetManager] Migration complete to v${EXPECTED_VERSION}`);
+
+      // Persist migrated state
+      this._persist();
     }
 
     if (Object.keys(this._state.presets).length === 0) {
@@ -811,6 +828,68 @@ export class PresetManager {
         console.error('[PresetManager] CRITICAL: localStorage quota exceeded. User notification failed.');
       }
     }
+  }
+
+  /**
+   * Migrate preset library state to a new version
+   * @param {Object} state - Current state
+   * @param {number} targetVersion - Target version number
+   * @returns {Object} Migrated state
+   */
+  _migrateState(state, targetVersion) {
+    const currentVersion = state.version || 0;
+
+    // Define migration functions for each version transition
+    const migrations = {
+      // v0 -> v1: Initial structure (add version field if missing)
+      0: (s) => {
+        console.log('[PresetManager] Migrating v0 -> v1: Adding version field');
+        return {
+          version: 1,
+          presets: s.presets || {},
+          order: s.order || [],
+          recent: s.recent || [],
+          favorites: s.favorites || [],
+          activePresetId: s.activePresetId || null,
+          lastPresetId: s.lastPresetId || null,
+          lockedParams: s.lockedParams || {},
+          audioModulation: s.audioModulation || {}
+        };
+      },
+
+      // v1 -> v2: Add audioModulation tracking for opacity/color parameters
+      1: (s) => {
+        console.log('[PresetManager] Migrating v1 -> v2: Adding audioModulation defaults');
+        return {
+          ...s,
+          version: 2,
+          audioModulation: {
+            ...s.audioModulation,
+            // Ensure opacity and color modulation defaults exist
+            'visuals.dispersion.opacityBase': s.audioModulation?.['visuals.dispersion.opacityBase'] ?? false,
+            'visuals.dispersion.tintHue': s.audioModulation?.['visuals.dispersion.tintHue'] ?? false,
+            'visuals.dispersion.tintSat': s.audioModulation?.['visuals.dispersion.tintSat'] ?? false
+          }
+        };
+      }
+
+      // Add future migrations here as needed:
+      // 2: (s) => { /* v2 -> v3 logic */ },
+      // 3: (s) => { /* v3 -> v4 logic */ }
+    };
+
+    // Apply migrations sequentially
+    let migratedState = state;
+    for (let v = currentVersion; v < targetVersion; v++) {
+      if (migrations[v]) {
+        migratedState = migrations[v](migratedState);
+        console.log(`[PresetManager] Applied migration v${v} -> v${v + 1}`);
+      } else {
+        console.warn(`[PresetManager] No migration defined for v${v} -> v${v + 1}, skipping`);
+      }
+    }
+
+    return migratedState;
   }
 
   _notify(event, detail) {
