@@ -61,8 +61,12 @@ export class ReadinessGate {
     });
     this._readyCallbacks.set(componentName, []);
 
-    // Resolve any pending waiters
-    component.waiters.forEach(resolve => resolve());
+    // FIX: Resolve any pending waiters (now stored as objects with resolve/reject)
+    component.waiters.forEach(waiter => {
+      if (waiter && typeof waiter.resolve === 'function') {
+        waiter.resolve();
+      }
+    });
     component.waiters = [];
   }
 
@@ -116,9 +120,12 @@ export class ReadinessGate {
     return new Promise((resolve, reject) => {
       let timeoutId = null;
 
+      // FIX: Store waiter object for proper cleanup
+      const waiter = { resolve: null, reject };
+
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
-        const idx = component.waiters.indexOf(resolve);
+        const idx = component.waiters.findIndex(w => w === waiter);
         if (idx >= 0) component.waiters.splice(idx, 1);
       };
 
@@ -133,12 +140,12 @@ export class ReadinessGate {
       }
 
       // Wrapper to clean up on resolve
-      const wrappedResolve = () => {
+      waiter.resolve = () => {
         cleanup();
         resolve();
       };
 
-      component.waiters.push(wrappedResolve);
+      component.waiters.push(waiter);
     });
   }
 
@@ -293,18 +300,19 @@ export class ReadinessGate {
    * Rejects all pending waiters and clears callbacks
    */
   dispose() {
-    // Reject all pending waiters
+    // FIX: Reject all pending waiters with proper error
     for (const [name, component] of this._components.entries()) {
       if (component.waiters.length > 0) {
+        console.warn(`[${this.name}] Disposing with ${component.waiters.length} waiters for ${name}`);
         const error = new Error(`[${this.name}] ReadinessGate disposed while waiting for ${name}`);
         component.waiters.forEach(waiter => {
           try {
-            // Waiters are resolve functions, but we need to signal disposal somehow
-            // Since we can't reject a resolve function, we'll just clear them
-            // In a real scenario, we'd want to track reject functions too
-            console.warn(`[${this.name}] Disposing with ${component.waiters.length} waiters for ${name}`);
+            // Now we can properly reject the promise
+            if (waiter && typeof waiter.reject === 'function') {
+              waiter.reject(error);
+            }
           } catch (err) {
-            console.error(`[${this.name}] Error notifying waiter:`, err);
+            console.error(`[${this.name}] Error rejecting waiter:`, err);
           }
         });
         component.waiters = [];
