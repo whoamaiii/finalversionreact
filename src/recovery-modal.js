@@ -292,33 +292,45 @@ export function showRecoveryModal({ snapshot, context, onRestore, onStartFresh }
     Tags: ${snapshot.tags.size > 0 ? Array.from(snapshot.tags).join(', ') : 'None'}
   `;
 
+  // Track event handlers and timers for cleanup
+  let closeTimeoutId = null;
+  const restoreBtnHandler = () => { handleRestore(); };
+  const startFreshBtnHandler = () => { handleStartFresh(); };
+  const viewDetailsBtnHandler = () => {
+    modal.classList.toggle('is-expanded');
+    viewDetailsBtn.textContent = modal.classList.contains('is-expanded')
+      ? 'Hide Details'
+      : 'View Details';
+  };
+  const overlayClickHandler = (e) => {
+    if (e.target === overlay) {
+      close(); // Just close, don't trigger action
+    }
+  };
+  const escapeHandler = (e) => {
+    if (e.key === 'Escape') {
+      close(); // Just close, don't trigger action
+    }
+  };
+
   // Actions
   const actions = document.createElement('div');
   actions.className = 'recovery-modal__actions';
-  
+
   const restoreBtn = document.createElement('button');
   restoreBtn.className = 'recovery-modal__btn recovery-modal__btn--primary';
   restoreBtn.textContent = 'Restore Session';
-  restoreBtn.addEventListener('click', () => {
-    handleRestore();
-  });
-  
+  restoreBtn.addEventListener('click', restoreBtnHandler);
+
   const startFreshBtn = document.createElement('button');
   startFreshBtn.className = 'recovery-modal__btn recovery-modal__btn--secondary';
   startFreshBtn.textContent = 'Start Fresh';
-  startFreshBtn.addEventListener('click', () => {
-    handleStartFresh();
-  });
-  
+  startFreshBtn.addEventListener('click', startFreshBtnHandler);
+
   const viewDetailsBtn = document.createElement('button');
   viewDetailsBtn.className = 'recovery-modal__btn recovery-modal__btn--ghost';
   viewDetailsBtn.textContent = 'View Details';
-  viewDetailsBtn.addEventListener('click', () => {
-    modal.classList.toggle('is-expanded');
-    viewDetailsBtn.textContent = modal.classList.contains('is-expanded') 
-      ? 'Hide Details' 
-      : 'View Details';
-  });
+  viewDetailsBtn.addEventListener('click', viewDetailsBtnHandler);
 
   actions.appendChild(restoreBtn);
   actions.appendChild(startFreshBtn);
@@ -364,32 +376,44 @@ export function showRecoveryModal({ snapshot, context, onRestore, onStartFresh }
     }
   }
 
+  // Cleanup function to remove all event listeners and timers
+  function cleanup() {
+    // Remove all event listeners
+    try {
+      restoreBtn.removeEventListener('click', restoreBtnHandler);
+      startFreshBtn.removeEventListener('click', startFreshBtnHandler);
+      viewDetailsBtn.removeEventListener('click', viewDetailsBtnHandler);
+      overlay.removeEventListener('click', overlayClickHandler);
+      document.removeEventListener('keydown', escapeHandler);
+    } catch (err) {
+      console.warn('[RecoveryModal] Error removing event listeners:', err);
+    }
+
+    // Clear close timeout if it exists
+    if (closeTimeoutId) {
+      clearTimeout(closeTimeoutId);
+      closeTimeoutId = null;
+    }
+  }
+
   // Close modal
   function close() {
+    // Clean up event listeners first
+    cleanup();
+
     overlay.style.animation = 'fadeOut 200ms ease';
-    setTimeout(() => {
+    closeTimeoutId = setTimeout(() => {
       if (overlay.parentNode) {
         overlay.parentNode.removeChild(overlay);
       }
+      closeTimeoutId = null;
     }, 200);
   }
 
   // Close on overlay click (outside modal)
-  // Bug fix: Just close modal without triggering an action
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) {
-      close(); // Just close, don't trigger action
-    }
-  });
+  overlay.addEventListener('click', overlayClickHandler);
 
   // Close on Escape key
-  // Bug fix: Just close modal without triggering an action
-  const escapeHandler = (e) => {
-    if (e.key === 'Escape') {
-      close(); // Just close, don't trigger action
-      document.removeEventListener('keydown', escapeHandler);
-    }
-  };
   document.addEventListener('keydown', escapeHandler);
 
   return {
