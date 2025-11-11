@@ -11,6 +11,7 @@
 
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
 import { showToast } from './toast.js';
+import { storageMutex } from './storage/localStorage-mutex.js';
 
 const STORAGE_KEYS = {
   primary: 'cosmicPresetLibrary.v1',
@@ -738,57 +739,67 @@ export class PresetManager {
 
   _persist() {
     if (!this.storage) return false;
-    const payload = JSON.stringify(this._state, null, 2);
 
-    try {
-      // Step 1: Write to temporary key first to validate we have space
-      // This prevents corrupting backup if quota is exceeded
-      this.storage.setItem(STORAGE_KEYS.working, payload);
-    } catch (err) {
-      console.error('[PresetManager] Failed to write temp copy:', err);
-      this._handleQuotaError(err);
-      return false;
-    }
+    // Use mutex to prevent concurrent writes from corrupting data
+    // Fire-and-forget to maintain synchronous API for callers
+    storageMutex.withLock(STORAGE_KEYS.primary, async () => {
+      const payload = JSON.stringify(this._state, null, 2);
 
-    try {
-      // Step 2: Get current primary before overwriting
-      const previous = this.storage.getItem(STORAGE_KEYS.primary);
+      try {
+        // Step 1: Write to temporary key first to validate we have space
+        // This prevents corrupting backup if quota is exceeded
+        this.storage.setItem(STORAGE_KEYS.working, payload);
+      } catch (err) {
+        console.error('[PresetManager] Failed to write temp copy:', err);
+        this._handleQuotaError(err);
+        throw err; // Propagate to mutex handler
+      }
 
-      // Step 3: Write new data to primary key
-      // If this fails, we still have the backup intact
-      this.storage.setItem(STORAGE_KEYS.primary, payload);
+      try {
+        // Step 2: Get current primary before overwriting
+        const previous = this.storage.getItem(STORAGE_KEYS.primary);
 
-      // Step 4: Only NOW that primary succeeded, backup the old primary
-      // This ensures we always have valid data in either primary or backup
-      if (previous) {
-        try {
-          this.storage.setItem(STORAGE_KEYS.backup, previous);
-        } catch (backupErr) {
-          // Backup write failed, but primary succeeded
-          // This is non-critical - log and continue
-          console.warn('[PresetManager] Backup write failed, but primary succeeded:', backupErr);
+        // Step 3: Write new data to primary key
+        // If this fails, we still have the backup intact
+        this.storage.setItem(STORAGE_KEYS.primary, payload);
+
+        // Step 4: Only NOW that primary succeeded, backup the old primary
+        // This ensures we always have valid data in either primary or backup
+        if (previous) {
+          try {
+            this.storage.setItem(STORAGE_KEYS.backup, previous);
+          } catch (backupErr) {
+            // Backup write failed, but primary succeeded
+            // This is non-critical - log and continue
+            console.warn('[PresetManager] Backup write failed, but primary succeeded:', backupErr);
+          }
         }
+
+        // Step 5: Clean up temporary copy
+        try {
+          this.storage.removeItem(STORAGE_KEYS.working);
+        } catch (_) {
+          // Cleanup failure is non-critical
+        }
+
+        return true; // Success
+      } catch (err) {
+        console.error('[PresetManager] Persist failed:', err);
+        this._handleQuotaError(err);
+
+        // Try to clean up working copy
+        try {
+          this.storage.removeItem(STORAGE_KEYS.working);
+        } catch (_) {}
+
+        throw err; // Propagate to mutex handler
       }
+    }).catch(err => {
+      console.error('[PresetManager] Mutex-wrapped persist failed:', err);
+    });
 
-      // Step 5: Clean up temporary copy
-      try {
-        this.storage.removeItem(STORAGE_KEYS.working);
-      } catch (_) {
-        // Cleanup failure is non-critical
-      }
-
-      return true; // Success
-    } catch (err) {
-      console.error('[PresetManager] Persist failed:', err);
-      this._handleQuotaError(err);
-
-      // Try to clean up working copy
-      try {
-        this.storage.removeItem(STORAGE_KEYS.working);
-      } catch (_) {}
-
-      return false; // Failed
-    }
+    // Return immediately (fire-and-forget with mutex protection)
+    return true;
   }
 
   _handleQuotaError(err) {
