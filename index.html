@@ -37,8 +37,12 @@
     <!-- Load the Inter font family from Google Fonts -->
     <!-- Inter is a modern, readable sans-serif font that looks good on screens -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    
-    <!-- 
+
+    <!-- FIX: ES Module Shims for browser compatibility (Safari/Firefox support) -->
+    <!-- Provides polyfill for import maps and module features in older browsers -->
+    <script async src="https://ga.jspm.io/npm:es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+
+    <!--
       Embedded CSS Styles
       ===================
       
@@ -189,6 +193,12 @@
         border-radius: 16px;                   /* Slightly larger radius than toast */
         filter: blur(10px);                    /* Blur creates soft glow effect */
         opacity: 0.45;                        /* Semi-transparent */
+        /* FIX: Pause animation when toast is hidden to save CPU/GPU cycles */
+        animation-play-state: paused;
+      }
+      /* FIX: Resume animation when toast is visible */
+      #toast.visible::before {
+        animation-play-state: running;
       }
 
 
