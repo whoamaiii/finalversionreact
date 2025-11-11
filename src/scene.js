@@ -892,6 +892,49 @@ export function initScene() {
   state.renderer.setPixelRatio(state.params.pixelRatioCap);
   document.body.appendChild(state.renderer.domElement);
 
+  // WebGL Context Loss/Restore Handlers
+  // ====================================
+  // Handle GPU context loss gracefully (driver issues, mobile backgrounding, etc.)
+  const canvas = state.renderer.domElement;
+
+  canvas.addEventListener('webglcontextlost', (event) => {
+    event.preventDefault();
+    console.warn('[Scene] WebGL context lost, attempting recovery...');
+
+    // Import showToast dynamically to avoid circular dependency
+    import('./toast.js').then(({ showToast }) => {
+      showToast('Graphics context lost. Reloading in 3 seconds...', 5000);
+    }).catch(() => {
+      console.error('[Scene] Failed to show context lost notification');
+    });
+
+    // Stop animation loop if available
+    try {
+      if (typeof window.stopAnimation === 'function') {
+        window.stopAnimation();
+      }
+    } catch (err) {
+      console.error('[Scene] Error stopping animation during context loss:', err);
+    }
+
+    // Schedule page reload as recovery (safest approach)
+    setTimeout(() => {
+      console.log('[Scene] Reloading page to recover from context loss...');
+      window.location.reload();
+    }, 3000);
+  }, false);
+
+  canvas.addEventListener('webglcontextrestored', (event) => {
+    console.log('[Scene] WebGL context restored');
+
+    // Show success notification
+    import('./toast.js').then(({ showToast }) => {
+      showToast('Graphics context restored', 3000);
+    }).catch(() => {});
+
+    // Note: Page reload handles reinitialization, so this handler mainly logs
+  }, false);
+
   state.controls = new CameraControls(state.camera, state.renderer.domElement);
   // camera-controls API updates: use smoothTime/draggingSmoothTime instead of deprecated *dampingFactor
   state.controls.smoothTime = 0.12; state.controls.minDistance = 10; state.controls.maxDistance = 50; state.controls.draggingSmoothTime = 0.15;
