@@ -14,8 +14,17 @@
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
+// FIX: Track active instances to detect singleton violations
+let _activeInstance = null;
+
 export class PerformanceController {
   constructor({ sceneApi, sync } = {}) {
+    // FIX: Warn if multiple instances are created (should be singleton)
+    if (_activeInstance) {
+      console.warn('[PerformanceController] Multiple instances detected! This should be a singleton to prevent duplicate event listeners and memory leaks.');
+    }
+    _activeInstance = this;
+
     this.sceneApi = sceneApi;
     this.sync = sync || null;
     this.enabled = false; // performance mode off by default
@@ -590,6 +599,11 @@ export class PerformanceController {
       }
     } catch (_) {
       // Style removal is optional; continue if it fails
+    }
+
+    // FIX: Clear singleton instance reference
+    if (_activeInstance === this) {
+      _activeInstance = null;
     }
 
     // Clear any remaining state
