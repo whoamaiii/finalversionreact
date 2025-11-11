@@ -141,11 +141,84 @@ function toOscArg(v) {
 }
 
 // Periodic heartbeat / health summary
-setInterval(() => {
+const heartbeatInterval = setInterval(() => {
   try {
     const connectedClients = Array.from(clients).filter(c => c.readyState === c.OPEN).length;
     console.log(`[HEARTBEAT] WS clients=${connectedClients}`);
   } catch (_) {}
 }, HEARTBEAT_MS);
+
+// Graceful Shutdown Handlers
+// ===========================
+// Clean up all resources when process terminates (SIGTERM from PM2, SIGINT from Ctrl+C)
+
+function gracefulShutdown(signal) {
+  console.log(`\n[Shutdown] Received ${signal}, cleaning up resources...`);
+
+  // Clear heartbeat interval
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    console.log('[Shutdown] Heartbeat interval cleared');
+  }
+
+  // Close all WebSocket clients
+  try {
+    console.log(`[Shutdown] Closing ${clients.size} WebSocket client(s)...`);
+    clients.forEach(ws => {
+      try {
+        ws.close(1001, 'Server shutting down');
+      } catch (err) {
+        console.warn('[Shutdown] Error closing WebSocket client:', err.message);
+      }
+    });
+    clients.clear();
+  } catch (err) {
+    console.error('[Shutdown] Error closing WebSocket clients:', err);
+  }
+
+  // Close WebSocket server
+  try {
+    console.log('[Shutdown] Closing WebSocket server...');
+    wss.close((err) => {
+      if (err) {
+        console.error('[Shutdown] Error closing WebSocket server:', err);
+      } else {
+        console.log('[Shutdown] WebSocket server closed');
+      }
+    });
+  } catch (err) {
+    console.error('[Shutdown] Error closing WebSocket server:', err);
+  }
+
+  // Close OSC UDP port
+  try {
+    console.log('[Shutdown] Closing OSC UDP port...');
+    udpPort.close();
+    console.log('[Shutdown] OSC UDP port closed');
+  } catch (err) {
+    console.error('[Shutdown] Error closing OSC port:', err);
+  }
+
+  // Exit cleanly after allowing time for cleanup
+  setTimeout(() => {
+    console.log('[Shutdown] Cleanup complete, exiting');
+    process.exit(0);
+  }, 1000);
+}
+
+// Register shutdown handlers for SIGTERM (PM2 stop) and SIGINT (Ctrl+C)
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions and unhandled promise rejections
+process.on('uncaughtException', (err) => {
+  console.error('[Fatal] Uncaught exception:', err);
+  gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Fatal] Unhandled promise rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('unhandledRejection');
+});
 
 

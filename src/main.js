@@ -39,6 +39,45 @@ import { SessionPersistence } from './storage/sessionPersistence.js';
 import { showRecoveryModal } from './recovery-modal.js';
 import { ReadinessGate } from './readiness-gate.js';
 
+// Global Error Handlers
+// ======================
+// Catch uncaught errors and unhandled promise rejections to prevent silent failures
+
+window.onerror = (msg, source, lineno, colno, error) => {
+  console.error('[Global Error]', {
+    message: msg,
+    source: source,
+    line: lineno,
+    column: colno,
+    error: error
+  });
+
+  try {
+    // Show user-friendly error message (non-blocking)
+    showToast('An unexpected error occurred. Check console for details.', 8000);
+  } catch (_) {
+    // If toast fails, at least we logged the error
+  }
+
+  // Return false to let browser handle the error too (show in console)
+  return false;
+};
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('[Unhandled Promise Rejection]', event.reason);
+
+  try {
+    // Show user-friendly error message (non-blocking)
+    const message = event.reason?.message || String(event.reason) || 'Unknown error';
+    showToast(`Promise error: ${message.substring(0, 100)}`, 8000);
+  } catch (_) {
+    // If toast fails, at least we logged the error
+  }
+
+  // Prevent default to avoid "Uncaught (in promise)" console spam
+  event.preventDefault();
+});
+
 // Debug mode: print browser feature support matrix when ?debug is in the URL
 // This helps developers understand what capabilities are available
 if (new URLSearchParams(location.search).has('debug')) {
@@ -1636,6 +1675,19 @@ function stopAnimation() {
     });
   } catch (err) {
     // Ignore if import fails
+  }
+
+  // Clear all window globals to prevent memory leaks on hot reload
+  try {
+    window.__performanceMonitor = null;
+    window.__performanceHud = null;
+    window.__audioRoutingCapabilities = null;
+    window.__audioDiagnostics = null;
+    window.__autoSaveCoordinator = null;
+    window.__dragDropListenersAdded = false;
+    // Note: window.stopAnimation and window.startAnimation are kept for external control
+  } catch (err) {
+    console.warn('[Cleanup] Error clearing window globals:', err);
   }
 
   // Remove all event listeners

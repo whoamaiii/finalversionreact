@@ -11,6 +11,7 @@
 
 import { capturePresetSnapshot, applyPresetSnapshot } from './preset-io.js';
 import { showToast } from './toast.js';
+import { storageMutex } from './storage/localStorage-mutex.js';
 
 const STORAGE_KEYS = {
   primary: 'cosmicPresetLibrary.v1',
@@ -193,12 +194,34 @@ const DEFAULT_PRESETS = [
 
 function deepClone(value) {
   if (value === null || value === undefined) return value;
+
+  // Try structuredClone first (handles more types)
   try {
-    if (typeof structuredClone === 'function') return structuredClone(value);
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value);
+    }
   } catch (_) {
     // structuredClone not available or failed, fall back to JSON
   }
-  return JSON.parse(JSON.stringify(value));
+
+  // FIX: Add circular reference detection for JSON fallback
+  const seen = new WeakSet();
+
+  try {
+    return JSON.parse(JSON.stringify(value, (key, val) => {
+      if (typeof val === 'object' && val !== null) {
+        if (seen.has(val)) {
+          return '[Circular]';
+        }
+        seen.add(val);
+      }
+      return val;
+    }));
+  } catch (err) {
+    console.error('[PresetManager] Deep clone failed:', err);
+    // Fallback to shallow copy
+    return { ...value };
+  }
 }
 
 function createEmptyState() {
@@ -255,10 +278,27 @@ export class PresetManager {
       this._state = createEmptyState();
     }
 
-    // Versioned reset to delete existing presets and bootstrap only the new default set
+    // Version migration to preserve user presets across schema changes
     const EXPECTED_VERSION = 2;
     if ((this._state.version || 0) !== EXPECTED_VERSION) {
-      this._state = createEmptyState();
+      console.warn(`[PresetManager] Version mismatch: ${this._state.version || 0} -> ${EXPECTED_VERSION}`);
+
+      // Backup old state before migration
+      try {
+        const backupKey = `cosmicPresetLibrary.v${this._state.version || 0}.backup.${Date.now()}`;
+        this.storage.setItem(backupKey, JSON.stringify(this._state));
+        console.log(`[PresetManager] Backed up old state to ${backupKey}`);
+      } catch (err) {
+        console.error('[PresetManager] Failed to backup old state:', err);
+        // Continue with migration even if backup fails
+      }
+
+      // Migrate data structure to new version
+      this._state = this._migrateState(this._state, EXPECTED_VERSION);
+      console.log(`[PresetManager] Migration complete to v${EXPECTED_VERSION}`);
+
+      // Persist migrated state
+      this._persist();
     }
 
     if (Object.keys(this._state.presets).length === 0) {
@@ -738,57 +778,67 @@ export class PresetManager {
 
   _persist() {
     if (!this.storage) return false;
-    const payload = JSON.stringify(this._state, null, 2);
 
-    try {
-      // Step 1: Write to temporary key first to validate we have space
-      // This prevents corrupting backup if quota is exceeded
-      this.storage.setItem(STORAGE_KEYS.working, payload);
-    } catch (err) {
-      console.error('[PresetManager] Failed to write temp copy:', err);
-      this._handleQuotaError(err);
-      return false;
-    }
+    // Use mutex to prevent concurrent writes from corrupting data
+    // Fire-and-forget to maintain synchronous API for callers
+    storageMutex.withLock(STORAGE_KEYS.primary, async () => {
+      const payload = JSON.stringify(this._state, null, 2);
 
-    try {
-      // Step 2: Get current primary before overwriting
-      const previous = this.storage.getItem(STORAGE_KEYS.primary);
+      try {
+        // Step 1: Write to temporary key first to validate we have space
+        // This prevents corrupting backup if quota is exceeded
+        this.storage.setItem(STORAGE_KEYS.working, payload);
+      } catch (err) {
+        console.error('[PresetManager] Failed to write temp copy:', err);
+        this._handleQuotaError(err);
+        throw err; // Propagate to mutex handler
+      }
 
-      // Step 3: Write new data to primary key
-      // If this fails, we still have the backup intact
-      this.storage.setItem(STORAGE_KEYS.primary, payload);
+      try {
+        // Step 2: Get current primary before overwriting
+        const previous = this.storage.getItem(STORAGE_KEYS.primary);
 
-      // Step 4: Only NOW that primary succeeded, backup the old primary
-      // This ensures we always have valid data in either primary or backup
-      if (previous) {
-        try {
-          this.storage.setItem(STORAGE_KEYS.backup, previous);
-        } catch (backupErr) {
-          // Backup write failed, but primary succeeded
-          // This is non-critical - log and continue
-          console.warn('[PresetManager] Backup write failed, but primary succeeded:', backupErr);
+        // Step 3: Write new data to primary key
+        // If this fails, we still have the backup intact
+        this.storage.setItem(STORAGE_KEYS.primary, payload);
+
+        // Step 4: Only NOW that primary succeeded, backup the old primary
+        // This ensures we always have valid data in either primary or backup
+        if (previous) {
+          try {
+            this.storage.setItem(STORAGE_KEYS.backup, previous);
+          } catch (backupErr) {
+            // Backup write failed, but primary succeeded
+            // This is non-critical - log and continue
+            console.warn('[PresetManager] Backup write failed, but primary succeeded:', backupErr);
+          }
         }
+
+        // Step 5: Clean up temporary copy
+        try {
+          this.storage.removeItem(STORAGE_KEYS.working);
+        } catch (_) {
+          // Cleanup failure is non-critical
+        }
+
+        return true; // Success
+      } catch (err) {
+        console.error('[PresetManager] Persist failed:', err);
+        this._handleQuotaError(err);
+
+        // Try to clean up working copy
+        try {
+          this.storage.removeItem(STORAGE_KEYS.working);
+        } catch (_) {}
+
+        throw err; // Propagate to mutex handler
       }
+    }).catch(err => {
+      console.error('[PresetManager] Mutex-wrapped persist failed:', err);
+    });
 
-      // Step 5: Clean up temporary copy
-      try {
-        this.storage.removeItem(STORAGE_KEYS.working);
-      } catch (_) {
-        // Cleanup failure is non-critical
-      }
-
-      return true; // Success
-    } catch (err) {
-      console.error('[PresetManager] Persist failed:', err);
-      this._handleQuotaError(err);
-
-      // Try to clean up working copy
-      try {
-        this.storage.removeItem(STORAGE_KEYS.working);
-      } catch (_) {}
-
-      return false; // Failed
-    }
+    // Return immediately (fire-and-forget with mutex protection)
+    return true;
   }
 
   _handleQuotaError(err) {
@@ -800,6 +850,68 @@ export class PresetManager {
         console.error('[PresetManager] CRITICAL: localStorage quota exceeded. User notification failed.');
       }
     }
+  }
+
+  /**
+   * Migrate preset library state to a new version
+   * @param {Object} state - Current state
+   * @param {number} targetVersion - Target version number
+   * @returns {Object} Migrated state
+   */
+  _migrateState(state, targetVersion) {
+    const currentVersion = state.version || 0;
+
+    // Define migration functions for each version transition
+    const migrations = {
+      // v0 -> v1: Initial structure (add version field if missing)
+      0: (s) => {
+        console.log('[PresetManager] Migrating v0 -> v1: Adding version field');
+        return {
+          version: 1,
+          presets: s.presets || {},
+          order: s.order || [],
+          recent: s.recent || [],
+          favorites: s.favorites || [],
+          activePresetId: s.activePresetId || null,
+          lastPresetId: s.lastPresetId || null,
+          lockedParams: s.lockedParams || {},
+          audioModulation: s.audioModulation || {}
+        };
+      },
+
+      // v1 -> v2: Add audioModulation tracking for opacity/color parameters
+      1: (s) => {
+        console.log('[PresetManager] Migrating v1 -> v2: Adding audioModulation defaults');
+        return {
+          ...s,
+          version: 2,
+          audioModulation: {
+            ...s.audioModulation,
+            // Ensure opacity and color modulation defaults exist
+            'visuals.dispersion.opacityBase': s.audioModulation?.['visuals.dispersion.opacityBase'] ?? false,
+            'visuals.dispersion.tintHue': s.audioModulation?.['visuals.dispersion.tintHue'] ?? false,
+            'visuals.dispersion.tintSat': s.audioModulation?.['visuals.dispersion.tintSat'] ?? false
+          }
+        };
+      }
+
+      // Add future migrations here as needed:
+      // 2: (s) => { /* v2 -> v3 logic */ },
+      // 3: (s) => { /* v3 -> v4 logic */ }
+    };
+
+    // Apply migrations sequentially
+    let migratedState = state;
+    for (let v = currentVersion; v < targetVersion; v++) {
+      if (migrations[v]) {
+        migratedState = migrations[v](migratedState);
+        console.log(`[PresetManager] Applied migration v${v} -> v${v + 1}`);
+      } else {
+        console.warn(`[PresetManager] No migration defined for v${v} -> v${v + 1}, skipping`);
+      }
+    }
+
+    return migratedState;
   }
 
   _notify(event, detail) {

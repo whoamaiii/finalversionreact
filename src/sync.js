@@ -282,6 +282,9 @@ export class SyncCoordinator {
     this._chunkCleanupTimer = null;
     this.MAX_CHUNK_SIZE = 1 * 1024 * 1024; // 1MB per chunk (well below 5MB limit)
 
+    // FIX: Message deduplication support to prevent duplicate processing
+    this._processedNonces = new Set();
+
     this._initTransports();
 
     // Clear any existing hello timer before setting new one (prevents overlap)
@@ -469,6 +472,21 @@ export class SyncCoordinator {
     if (!raw || typeof raw !== 'object') return;
     if (raw.senderId === this.id) return;
     if (raw.target && raw.target !== 'any' && raw.target !== this.role) return;
+
+    // FIX: Message deduplication - check nonce to prevent duplicate processing
+    if (raw.nonce) {
+      if (this._processedNonces.has(raw.nonce)) {
+        return; // Already processed this message
+      }
+
+      this._processedNonces.add(raw.nonce);
+
+      // Limit nonce cache size to prevent unbounded growth
+      if (this._processedNonces.size > 100) {
+        const firstNonce = this._processedNonces.values().next().value;
+        this._processedNonces.delete(firstNonce);
+      }
+    }
 
     // Handle chunked messages
     if (raw.type === '__chunk') {
@@ -1026,14 +1044,17 @@ export class SyncCoordinator {
 
   resetAllWindows() {
     if (this.role !== 'control') return null;
-    
+
     // Close existing projector window
     if (this.projectorWindow && !this.projectorWindow.closed) {
       try {
         this.projectorWindow.close();
       } catch (_) {}
     }
-    
+
+    // FIX: Explicitly null the reference to allow garbage collection
+    this.projectorWindow = null;
+
     // Open new projector window
     return this.openProjectorWindow();
   }
@@ -1080,6 +1101,20 @@ export class SyncCoordinator {
     if (this._projectorHealthCheck) {
       clearInterval(this._projectorHealthCheck);
       this._projectorHealthCheck = null;
+    }
+
+    // FIX: Clear localStorage sync messages to prevent accumulation
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (err) {
+      console.warn('[Sync] Error clearing localStorage:', err);
+    }
+
+    // Clear processed nonces
+    if (this._processedNonces) {
+      this._processedNonces.clear();
     }
 
     // Clear any references

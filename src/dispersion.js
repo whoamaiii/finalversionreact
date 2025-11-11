@@ -456,20 +456,31 @@ export function createDispersionLayer(initialVariant = 'classic') {
 
   function update({ time, zoom = 0, offsetX = 0, offsetY = 0, opacity = 0.5, width, height, warp = 0, tint = null, tintMix = 0, brightness = 1, contrast = 1, twist = 0, twistFalloff = 1.2, travel = 0 }) {
     if (!material || !material.uniforms) return;
-    material.uniforms.t.value = time || 0;
-    material.uniforms.zoom.value = zoom;
-    material.uniforms.offset.value.set(offsetX, offsetY);
-    material.uniforms.uOpacity.value = THREE.MathUtils.clamp(opacity, 0.0, 1.0);
-    material.uniforms.uWarp.value = warp;
-    material.uniforms.uTintMix.value = THREE.MathUtils.clamp(tintMix, 0.0, 1.0);
-    material.uniforms.uBrightness.value = Math.max(0, brightness);
-    material.uniforms.uContrast.value = Math.max(0, contrast);
-    material.uniforms.uTwist.value = twist;
-    material.uniforms.uTwistFalloff.value = twistFalloff;
-    material.uniforms.uTravel.value = travel;
-    if (tint && material.uniforms.uTint?.value?.set) {
-      material.uniforms.uTint.value.set(tint.r, tint.g, tint.b);
+
+    // FIX: Validate all numeric inputs before setting uniforms to prevent NaN/Infinity corruption
+    material.uniforms.t.value = isFinite(time) ? time : 0;
+    material.uniforms.zoom.value = isFinite(zoom) ? zoom : 0;
+
+    if (isFinite(offsetX) && isFinite(offsetY)) {
+      material.uniforms.offset.value.set(offsetX, offsetY);
     }
+
+    material.uniforms.uOpacity.value = isFinite(opacity) ? THREE.MathUtils.clamp(opacity, 0.0, 1.0) : 0.5;
+    material.uniforms.uWarp.value = isFinite(warp) ? warp : 0;
+    material.uniforms.uTintMix.value = isFinite(tintMix) ? THREE.MathUtils.clamp(tintMix, 0.0, 1.0) : 0;
+    material.uniforms.uBrightness.value = isFinite(brightness) ? Math.max(0, brightness) : 1;
+    material.uniforms.uContrast.value = isFinite(contrast) ? Math.max(0, contrast) : 1;
+    material.uniforms.uTwist.value = isFinite(twist) ? twist : 0;
+    material.uniforms.uTwistFalloff.value = isFinite(twistFalloff) ? twistFalloff : 1.2;
+    material.uniforms.uTravel.value = isFinite(travel) ? travel : 0;
+
+    if (tint && material.uniforms.uTint?.value?.set) {
+      const r = isFinite(tint.r) ? tint.r : 0;
+      const g = isFinite(tint.g) ? tint.g : 0;
+      const b = isFinite(tint.b) ? tint.b : 0;
+      material.uniforms.uTint.value.set(r, g, b);
+    }
+
     if (typeof width === 'number' && typeof height === 'number' && isFinite(width) && isFinite(height)) {
       material.uniforms.r.value.set(width, height);
     }

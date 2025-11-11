@@ -2031,6 +2031,8 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
         const next = value !== undefined ? value : params[key];
         refreshValue(key, next);
       },
+      // FIX: Expose method to clear control instances when switching tabs
+      clearInstances: () => controlInstances.clear(),
     };
 
     refreshAll();
@@ -2309,6 +2311,15 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'application/json';
+
+      // Track cleanup to prevent memory leak
+      trackCleanup(() => {
+        if (input) {
+          input.onchange = null;
+          input.remove();
+        }
+      });
+
       input.onchange = async () => {
         const file = input.files?.[0];
         if (!file) return;
@@ -2321,6 +2332,9 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
           console.error(err);
           showToast('Import failed');
         }
+        // Clean up immediately after use
+        input.onchange = null;
+        input.remove();
       };
       input.click();
     }, { class: 'ghost' });
@@ -2701,7 +2715,14 @@ export function initSettingsUI({ sceneApi, audioEngine, presetManager, onScreens
       console.error('[SettingsUI] Invalid tabId:', tabId);
       tabId = 'quick';
     }
-    
+
+    // FIX: Clear shader control instances when switching away from shader tab to prevent memory accumulation
+    if (currentTab === 'shader' && tabId !== 'shader') {
+      if (shaderRenderContext && typeof shaderRenderContext.clearInstances === 'function') {
+        shaderRenderContext.clearInstances();
+      }
+    }
+
     currentTab = tabId;
     const mode = sceneApi.state.params.visualMode || 'overlay';
     const visibleTabs = tabs.filter((t) => {

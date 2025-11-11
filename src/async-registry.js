@@ -222,6 +222,8 @@ export class AsyncOperationToken {
           if (isResolved) {
             // Operation completed but we already timed out/cancelled
             console.warn(`[${this._registry.name}] Late result for ${this.category}:${this.id} (already resolved)`);
+            // FIX: Clear result reference to allow garbage collection
+            result = null;
             return;
           }
           isResolved = true;

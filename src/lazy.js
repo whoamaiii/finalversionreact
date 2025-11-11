@@ -65,8 +65,14 @@ function loadOnce(key, importer, transform = (value) => value) {
 
   // If we've already loaded this library, return the cached version
   if (!cache.has(key)) {
+    // FIX: Add timeout wrapper to prevent hanging loads
+    const loadPromise = importer();
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`Module '${key}' load timeout after 30s`)), 30000);
+    });
+
     // Load it and transform it, then store in cache
-    cache.set(key, importer()
+    cache.set(key, Promise.race([loadPromise, timeoutPromise])
       .then(mod => {
         // Wrap transform in try-catch for defensive error handling
         try {
@@ -85,6 +91,13 @@ function loadOnce(key, importer, transform = (value) => value) {
         cache.delete(key);
         // Cache the failure to prevent repeated attempts
         failureCache.set(key, Date.now());
+
+        // FIX: Limit cache size to prevent unbounded growth
+        if (failureCache.size > 20) {
+          const oldestKey = failureCache.keys().next().value;
+          failureCache.delete(oldestKey);
+        }
+
         console.error(`[LazyLoader] Failed to load/initialize module '${key}':`, err);
         throw err; // Re-throw to propagate the error
       })

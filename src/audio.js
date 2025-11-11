@@ -351,6 +351,7 @@ export class AudioEngine {
     this._essentiaCurrentJobId = 0;
     this._essentiaPendingJobId = 0;
     this._essentiaWorkerTerminationTimer = null; // Track timeout for worker termination
+    this._workletDrainTimeout = null; // Track timeout for worklet message draining
     this.beatGrid = {
       bpm: 0,
       confidence: 0,
@@ -691,7 +692,14 @@ export class AudioEngine {
     // Decode the audio file into an AudioBuffer
     const arrayBuf = await file.arrayBuffer();
     const audioBuf = await this.ctx.decodeAudioData(arrayBuf);
-    
+
+    // Disconnect old source to prevent memory leak
+    try {
+      if (this.source && this.source.disconnect) {
+        this.source.disconnect();
+      }
+    } catch(_){}
+
     // Create a buffer source node and start looping playback
     const src = this.ctx.createBufferSource();
     src.buffer = audioBuf;
@@ -797,7 +805,14 @@ export class AudioEngine {
         this.source.stop();
       }
     } catch(_){}
-    
+
+    // Disconnect source node to prevent memory leak
+    try {
+      if (this.source && this.source.disconnect) {
+        this.source.disconnect();
+      }
+    } catch(_){}
+
     // Stop media stream tracks (microphone/system audio) and clean up event listeners
     if (this.activeStream) {
       for (const t of this.activeStream.getTracks()) {
@@ -809,7 +824,7 @@ export class AudioEngine {
         t.stop();
       }
     }
-    
+
     // Clear source references
     this.source = null;
     this.activeStream = null;
@@ -834,12 +849,19 @@ export class AudioEngine {
         // Set draining flag to discard new messages but keep handler alive
         this._workletDraining = true;
 
+        // Clear any existing drain timeout to prevent race conditions
+        if (this._workletDrainTimeout) {
+          clearTimeout(this._workletDrainTimeout);
+          this._workletDrainTimeout = null;
+        }
+
         // Allow 200ms for in-flight messages to drain before clearing handler
-        setTimeout(() => {
+        this._workletDrainTimeout = setTimeout(() => {
           if (this.workletNode?.port) {
             this.workletNode.port.onmessage = null;
           }
           this._workletDraining = false;
+          this._workletDrainTimeout = null;
         }, 200);
       } catch (_) {}
     }
@@ -1279,6 +1301,7 @@ export class AudioEngine {
     if (!this.gainNode || !this.analyser) return;
     this._teardownMonitorRouting();
     try { this.gainNode.disconnect(); } catch (_) {}
+    try { this.analyser.disconnect(); } catch (_) {}
     if (this.workletNode) {
       try { this.workletNode.disconnect(); } catch (_) {}
       this.gainNode.connect(this.workletNode);
@@ -3435,6 +3458,12 @@ export class AudioEngine {
     }
     this._monitorConnected = false;
 
+    // Clear worklet drain timeout to prevent stale callbacks
+    if (this._workletDrainTimeout) {
+      clearTimeout(this._workletDrainTimeout);
+      this._workletDrainTimeout = null;
+    }
+
     // Clean up Worklet Node
     if (this.workletNode) {
       try {
@@ -3517,6 +3546,7 @@ export class AudioEngine {
     this._aubioQueue = [];
     if (this._aubioBufferPool) {
       this._aubioBufferPool.clear();
+      this._aubioBufferPool = null;
     }
     this._aubioConfiguredSampleRate = null;
 
@@ -3571,6 +3601,11 @@ export class AudioEngine {
           }
         });
 
+        // Remove context from global array to prevent memory leak
+        if (typeof window !== 'undefined' && Array.isArray(window.__reactiveCtxs)) {
+          window.__reactiveCtxs = window.__reactiveCtxs.filter(c => c !== ctx && c !== this.ctx);
+        }
+
         // NOW it's safe to clear state (after context is fully closed)
         this.ctx = null;
         this.sampleRate = 48000;
@@ -3623,14 +3658,35 @@ export class AudioEngine {
     this.bassFlux = 0;
     this.beatGrid = 0;
 
-    // Clear meyda instances with proper cleanup
+    // Clear meyda module reference and instances with proper cleanup
+    if (this.meyda) {
+      try {
+        // Meyda module may have cleanup methods
+        if (typeof this.meyda.stop === 'function') {
+          this.meyda.stop();
+        }
+        // Break circular references
+        if (this.meyda.source) {
+          this.meyda.source = null;
+        }
+        if (this.meyda.audioContext) {
+          this.meyda.audioContext = null;
+        }
+      } catch (err) {
+        console.warn('[AudioEngine] Error disposing Meyda module:', err);
+      }
+      this.meyda = null;
+    }
+
+    // Clear Meyda promise to allow garbage collection
+    this._meydaPromise = null;
+
+    // Clear any leftover instance references (legacy)
     if (this._meydaInstance) {
       try {
-        // Meyda instances may have stop() method
         if (typeof this._meydaInstance.stop === 'function') {
           this._meydaInstance.stop();
         }
-        // Break circular references to audio context and source
         if (this._meydaInstance.source) {
           this._meydaInstance.source = null;
         }
@@ -3638,7 +3694,7 @@ export class AudioEngine {
           this._meydaInstance.audioContext = null;
         }
       } catch (err) {
-        console.warn('Error disposing Meyda instance:', err);
+        console.warn('[AudioEngine] Error disposing Meyda instance:', err);
       }
       this._meydaInstance = null;
     }
@@ -3655,7 +3711,7 @@ export class AudioEngine {
           this._meydaInstanceStereo.audioContext = null;
         }
       } catch (err) {
-        console.warn('Error disposing Meyda stereo instance:', err);
+        console.warn('[AudioEngine] Error disposing Meyda stereo instance:', err);
       }
       this._meydaInstanceStereo = null;
     }

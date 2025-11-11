@@ -892,6 +892,49 @@ export function initScene() {
   state.renderer.setPixelRatio(state.params.pixelRatioCap);
   document.body.appendChild(state.renderer.domElement);
 
+  // WebGL Context Loss/Restore Handlers
+  // ====================================
+  // Handle GPU context loss gracefully (driver issues, mobile backgrounding, etc.)
+  const canvas = state.renderer.domElement;
+
+  canvas.addEventListener('webglcontextlost', (event) => {
+    event.preventDefault();
+    console.warn('[Scene] WebGL context lost, attempting recovery...');
+
+    // Import showToast dynamically to avoid circular dependency
+    import('./toast.js').then(({ showToast }) => {
+      showToast('Graphics context lost. Reloading in 3 seconds...', 5000);
+    }).catch(() => {
+      console.error('[Scene] Failed to show context lost notification');
+    });
+
+    // Stop animation loop if available
+    try {
+      if (typeof window.stopAnimation === 'function') {
+        window.stopAnimation();
+      }
+    } catch (err) {
+      console.error('[Scene] Error stopping animation during context loss:', err);
+    }
+
+    // Schedule page reload as recovery (safest approach)
+    setTimeout(() => {
+      console.log('[Scene] Reloading page to recover from context loss...');
+      window.location.reload();
+    }, 3000);
+  }, false);
+
+  canvas.addEventListener('webglcontextrestored', (event) => {
+    console.log('[Scene] WebGL context restored');
+
+    // Show success notification
+    import('./toast.js').then(({ showToast }) => {
+      showToast('Graphics context restored', 3000);
+    }).catch(() => {});
+
+    // Note: Page reload handles reinitialization, so this handler mainly logs
+  }, false);
+
   state.controls = new CameraControls(state.camera, state.renderer.domElement);
   // camera-controls API updates: use smoothTime/draggingSmoothTime instead of deprecated *dampingFactor
   state.controls.smoothTime = 0.12; state.controls.minDistance = 10; state.controls.maxDistance = 50; state.controls.draggingSmoothTime = 0.15;
@@ -2582,11 +2625,75 @@ export function initScene() {
       console.error('Error disposing RGBE loader:', err);
     }
 
+    // Dispose of shockwave layer
+    try {
+      if (state.shockwave?.mesh) {
+        state.scene.remove(state.shockwave.mesh);
+        if (state.shockwave.mesh.geometry) state.shockwave.mesh.geometry.dispose();
+        state.shockwave.mesh = null;
+      }
+      if (state.shockwave?.material) {
+        state.shockwave.material.dispose();
+        state.shockwave.material = null;
+      }
+    } catch(err) {
+      console.error('Error disposing shockwave:', err);
+    }
+
+    // Dispose of eye layer
+    try {
+      if (state.eye?.mesh) {
+        state.scene.remove(state.eye.mesh);
+        if (state.eye.mesh.geometry) state.eye.mesh.geometry.dispose();
+        if (state.eye.mesh.material) state.eye.mesh.material.dispose();
+        state.eye.mesh = null;
+      }
+      if (state.eye?.cornea) {
+        state.scene.remove(state.eye.cornea);
+        if (state.eye.cornea.geometry) state.eye.cornea.geometry.dispose();
+        if (state.eye.cornea.material) state.eye.cornea.material.dispose();
+        state.eye.cornea = null;
+      }
+    } catch(err) {
+      console.error('Error disposing eye:', err);
+    }
+
+    // Dispose of webcam texture and stop media stream
+    try {
+      if (state.webcamTexture) {
+        // Stop media stream if it exists
+        if (state.webcamTexture.image && state.webcamTexture.image.srcObject) {
+          const stream = state.webcamTexture.image.srcObject;
+          stream.getTracks().forEach(track => track.stop());
+          state.webcamTexture.image.srcObject = null;
+        }
+        state.webcamTexture.dispose();
+        state.webcamTexture = null;
+      }
+      state.webcamReady = false;
+    } catch(err) {
+      console.error('Error disposing webcam:', err);
+    }
+
     // Dispose of lights
     try {
+      // Dispose central glow sprite first (must be before light removal)
+      if (state.centralGlow) {
+        try {
+          state.centralLight?.remove(state.centralGlow);
+        } catch(_) {}
+        try {
+          if (state.centralGlow.userData?.dispose) {
+            state.centralGlow.userData.dispose();
+          }
+        } catch(_) {}
+        state.centralGlow = null;
+      }
+
       if (state.centralLight) {
         state.scene.remove(state.centralLight);
         if (state.centralLight.dispose) state.centralLight.dispose();
+        state.centralLight = null;
       }
     } catch(err) {
       console.error('Error disposing lights:', err);
