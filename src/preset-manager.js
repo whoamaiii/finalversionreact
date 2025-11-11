@@ -194,12 +194,34 @@ const DEFAULT_PRESETS = [
 
 function deepClone(value) {
   if (value === null || value === undefined) return value;
+
+  // Try structuredClone first (handles more types)
   try {
-    if (typeof structuredClone === 'function') return structuredClone(value);
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value);
+    }
   } catch (_) {
     // structuredClone not available or failed, fall back to JSON
   }
-  return JSON.parse(JSON.stringify(value));
+
+  // FIX: Add circular reference detection for JSON fallback
+  const seen = new WeakSet();
+
+  try {
+    return JSON.parse(JSON.stringify(value, (key, val) => {
+      if (typeof val === 'object' && val !== null) {
+        if (seen.has(val)) {
+          return '[Circular]';
+        }
+        seen.add(val);
+      }
+      return val;
+    }));
+  } catch (err) {
+    console.error('[PresetManager] Deep clone failed:', err);
+    // Fallback to shallow copy
+    return { ...value };
+  }
 }
 
 function createEmptyState() {
