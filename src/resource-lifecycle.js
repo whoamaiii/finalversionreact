@@ -156,7 +156,10 @@ export class ResourceLifecycle {
     }
 
     if (this._state === STATES.UNINITIALIZED) {
+      // FIX: Use proper state transition instead of direct assignment
+      const previousState = this._state;
       this._state = STATES.CLOSED;
+      this._notifyListeners(previousState, STATES.CLOSED);
       return;
     }
 
@@ -166,9 +169,10 @@ export class ResourceLifecycle {
       await this.transition(STATES.CLOSED);
     } catch (err) {
       console.error(`[${this.resourceName}] Close error:`, err);
-      // Force to closed state even on error
+      // FIX: Force to closed state even on error, tracking previous state
+      const previousState = this._state;
       this._state = STATES.CLOSED;
-      this._notifyListeners(STATES.CLOSING, STATES.CLOSED);
+      this._notifyListeners(previousState, STATES.CLOSED);
       throw err;
     }
   }
@@ -264,6 +268,9 @@ export class ResourceLifecycle {
     this._state = STATES.UNINITIALIZED;
     this._error = null;
     this._transitionPromise = null;
+
+    // FIX: Clear state listeners to prevent memory leaks
+    this._stateListeners = [];
   }
 }
 
