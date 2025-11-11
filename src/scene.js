@@ -2582,11 +2582,75 @@ export function initScene() {
       console.error('Error disposing RGBE loader:', err);
     }
 
+    // Dispose of shockwave layer
+    try {
+      if (state.shockwave?.mesh) {
+        state.scene.remove(state.shockwave.mesh);
+        if (state.shockwave.mesh.geometry) state.shockwave.mesh.geometry.dispose();
+        state.shockwave.mesh = null;
+      }
+      if (state.shockwave?.material) {
+        state.shockwave.material.dispose();
+        state.shockwave.material = null;
+      }
+    } catch(err) {
+      console.error('Error disposing shockwave:', err);
+    }
+
+    // Dispose of eye layer
+    try {
+      if (state.eye?.mesh) {
+        state.scene.remove(state.eye.mesh);
+        if (state.eye.mesh.geometry) state.eye.mesh.geometry.dispose();
+        if (state.eye.mesh.material) state.eye.mesh.material.dispose();
+        state.eye.mesh = null;
+      }
+      if (state.eye?.cornea) {
+        state.scene.remove(state.eye.cornea);
+        if (state.eye.cornea.geometry) state.eye.cornea.geometry.dispose();
+        if (state.eye.cornea.material) state.eye.cornea.material.dispose();
+        state.eye.cornea = null;
+      }
+    } catch(err) {
+      console.error('Error disposing eye:', err);
+    }
+
+    // Dispose of webcam texture and stop media stream
+    try {
+      if (state.webcamTexture) {
+        // Stop media stream if it exists
+        if (state.webcamTexture.image && state.webcamTexture.image.srcObject) {
+          const stream = state.webcamTexture.image.srcObject;
+          stream.getTracks().forEach(track => track.stop());
+          state.webcamTexture.image.srcObject = null;
+        }
+        state.webcamTexture.dispose();
+        state.webcamTexture = null;
+      }
+      state.webcamReady = false;
+    } catch(err) {
+      console.error('Error disposing webcam:', err);
+    }
+
     // Dispose of lights
     try {
+      // Dispose central glow sprite first (must be before light removal)
+      if (state.centralGlow) {
+        try {
+          state.centralLight?.remove(state.centralGlow);
+        } catch(_) {}
+        try {
+          if (state.centralGlow.userData?.dispose) {
+            state.centralGlow.userData.dispose();
+          }
+        } catch(_) {}
+        state.centralGlow = null;
+      }
+
       if (state.centralLight) {
         state.scene.remove(state.centralLight);
         if (state.centralLight.dispose) state.centralLight.dispose();
+        state.centralLight = null;
       }
     } catch(err) {
       console.error('Error disposing lights:', err);
